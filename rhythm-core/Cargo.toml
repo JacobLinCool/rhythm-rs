@@ -1,0 +1,21 @@
+[package]
+name = "rhythm-core"
+description = "Core library for the rhythm games."
+version = "0.1.0"
+license = "MIT"
+authors = ["JacobLinCool <jacob@csie.cool>"]
+homepage = "https://github.com/JacobLinCool/rhythm-rs"
+repository = "https://github.com/JacobLinCool/rhythm-rs"
+edition = "2021"
+
+[lib]
+name = "rhythm_core"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0.197", features = ["derive"], optional = true }
