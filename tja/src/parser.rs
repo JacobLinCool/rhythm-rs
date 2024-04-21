@@ -27,6 +27,7 @@ impl TJAParser {
         let mut speed = 1.0;
         let mut measure = (4, 4);
         let mut segments: Vec<(i32, Vec<char>)> = Vec::new();
+        let mut current_combo: Option<TaikoNote> = None;
 
         for line in tja_content.as_ref().lines() {
             let line = line.trim();
@@ -59,6 +60,7 @@ impl TJAParser {
                             speed = 1.0;
                             measure = (4, 4);
                             segments.clear();
+                            current_combo = None;
                         }
                         _ => {}
                     }
@@ -152,7 +154,6 @@ impl TJAParser {
                     println!("{:?}", segments);
 
                     let notes = segments.iter().map(|(_, s)| s.len()).sum::<usize>();
-                    let mut current_combo: Option<TaikoNote> = None;
 
                     for (bpm, segment) in segments.iter() {
                         let duration = (60000.0 / *bpm as f64)
