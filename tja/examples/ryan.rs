@@ -53,12 +53,21 @@ fn main() {
             {
                 4
             } else if note.variant() == TaikoNoteVariant::Both
-                && (note.note_type == TaikoNoteType::SmallCombo
-                    || note.note_type == TaikoNoteType::BigCombo)
+                && note.note_type == TaikoNoteType::SmallCombo
             {
                 for i in (0..note.duration() as usize).step_by(80) {
                     chart.push((
                         1,
+                        note.start as f32 / 1000.0 - tja.header.offset.unwrap() + i as f32 / 1000.0,
+                    ));
+                }
+                0
+            } else if note.variant() == TaikoNoteVariant::Both
+                && note.note_type == TaikoNoteType::BigCombo
+            {
+                for i in (0..note.duration() as usize).step_by(80) {
+                    chart.push((
+                        3,
                         note.start as f32 / 1000.0 - tja.header.offset.unwrap() + i as f32 / 1000.0,
                     ));
                 }
