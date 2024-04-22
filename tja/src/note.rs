@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use rhythm_core::Note;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub enum TaikoNoteVariant {
@@ -50,7 +50,7 @@ impl PartialEq<TaikoNoteVariant> for u16 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub enum TaikoNoteType {
@@ -64,7 +64,7 @@ pub enum TaikoNoteType {
     GogoEnd,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub struct TaikoNote {
@@ -108,5 +108,13 @@ impl Note for TaikoNote {
 
     fn set_variant(&mut self, variant: u16) {
         self.variant = TaikoNoteVariant::from(variant);
+    }
+}
+
+impl Eq for TaikoNote {}
+
+impl Ord for TaikoNote {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start.partial_cmp(&other.start).unwrap()
     }
 }

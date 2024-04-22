@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 /// The `Note` trait represents a rhythm note. (combo notes can be seen as a single note with volume > 1)
-pub trait Note: std::fmt::Debug {
+pub trait Note: std::fmt::Debug + Ord {
     /// Returns the start time of the note.
     fn start(&self) -> f64;
 
