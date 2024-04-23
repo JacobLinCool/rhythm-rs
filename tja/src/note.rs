@@ -68,12 +68,15 @@ pub enum TaikoNoteType {
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub struct TaikoNote {
+    // in milliseconds
     pub start: f64,
+    // in milliseconds
     pub duration: f64,
     pub volume: u16,
     pub variant: TaikoNoteVariant,
     #[serde(rename = "type")]
     pub note_type: TaikoNoteType,
+    /// Speed is calculated as (bpm * scroll)
     pub speed: f32,
 }
 

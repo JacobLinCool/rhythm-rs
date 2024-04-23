@@ -23,8 +23,8 @@ impl TJAParser {
         let mut course: Option<TJACourse> = None;
         let mut balloons = Vec::new();
         let mut time_ms = 0.0;
-        let mut bpm = 0;
-        let mut speed = 1.0;
+        let mut bpm = 60;
+        let mut scroll = 1.0;
         let mut measure = (4, 4);
         let mut segments: Vec<(i32, Vec<char>)> = Vec::new();
         let mut current_combo: Option<TaikoNote> = None;
@@ -56,8 +56,8 @@ impl TJAParser {
                             course = Some(TJACourse::new(parse_course(value)));
                             balloons.clear();
                             time_ms = 0.0;
-                            bpm = tja.header.bpm.unwrap_or(0);
-                            speed = 1.0;
+                            bpm = tja.header.bpm.unwrap_or(60);
+                            scroll = 1.0;
                             measure = (4, 4);
                             segments.clear();
                             current_combo = None;
@@ -97,7 +97,7 @@ impl TJAParser {
                         volume: 1,
                         variant: TaikoNoteVariant::Invisible,
                         note_type: TaikoNoteType::GogoStart,
-                        speed,
+                        speed: bpm as f32 * scroll,
                     }),
                     "GOGOEND" => course.as_mut().unwrap().notes.push(TaikoNote {
                         start: time_ms,
@@ -105,7 +105,7 @@ impl TJAParser {
                         volume: 1,
                         variant: TaikoNoteVariant::Invisible,
                         note_type: TaikoNoteType::GogoEnd,
-                        speed,
+                        speed: bpm as f32 * scroll,
                     }),
                     "BPMCHANGE" => {
                         bpm = value
@@ -120,7 +120,7 @@ impl TJAParser {
                         measure = (beat, note);
                     }
                     "SCROLL" => {
-                        speed = value.unwrap().parse().unwrap_or(1.0);
+                        scroll = value.unwrap().parse().unwrap_or(1.0);
                     }
                     "DELAY" => {
                         let delay = value.unwrap().parse().unwrap_or(0.0);
@@ -168,41 +168,41 @@ impl TJAParser {
                                 '1' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / speed as f64),
+                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
                                         volume: 1,
                                         variant: TaikoNoteVariant::Don,
                                         note_type: TaikoNoteType::Small,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '2' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / speed as f64),
+                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
                                         volume: 1,
                                         variant: TaikoNoteVariant::Kat,
                                         note_type: TaikoNoteType::Small,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '3' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / speed as f64),
+                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
                                         volume: 1,
                                         variant: TaikoNoteVariant::Don,
                                         note_type: TaikoNoteType::Big,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '4' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / speed as f64),
+                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
                                         volume: 1,
                                         variant: TaikoNoteVariant::Kat,
                                         note_type: TaikoNoteType::Big,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '5' => {
@@ -212,7 +212,7 @@ impl TJAParser {
                                         volume: u16::MAX,
                                         variant: TaikoNoteVariant::Both,
                                         note_type: TaikoNoteType::SmallCombo,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '6' => {
@@ -222,7 +222,7 @@ impl TJAParser {
                                         volume: u16::MAX,
                                         variant: TaikoNoteVariant::Both,
                                         note_type: TaikoNoteType::BigCombo,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '7' => {
@@ -232,7 +232,7 @@ impl TJAParser {
                                         volume: balloons.pop().unwrap_or(5),
                                         variant: TaikoNoteVariant::Both,
                                         note_type: TaikoNoteType::Balloon,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 '8' => {
@@ -248,7 +248,7 @@ impl TJAParser {
                                         volume: balloons.pop().unwrap_or(5),
                                         variant: TaikoNoteVariant::Both,
                                         note_type: TaikoNoteType::Yam,
-                                        speed,
+                                        speed: *bpm as f32 * scroll,
                                     });
                                 }
                                 _ => {}
