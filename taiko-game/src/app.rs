@@ -34,6 +34,7 @@ pub struct App {
     playing: bool,
     score: i32,
     last_hit: i32,
+    combo: i32,
 }
 
 impl App {
@@ -73,6 +74,7 @@ impl App {
             playing: false,
             score: 0,
             last_hit: 0,
+            combo: 0,
         })
     }
 
@@ -89,6 +91,7 @@ impl App {
                     self.player.play_music(self.music.as_ref().unwrap()).await;
                     self.playing = true;
                     self.score = 0;
+                    self.combo = 0;
                 }
 
                 match e {
@@ -253,6 +256,7 @@ impl App {
                                             self.course.clone().unwrap().scoreinit.unwrap_or(1000)
                                                 / 2
                                         };
+                                        self.combo += 1;
                                     }
                                     if let Some((note, t)) =
                                         self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
@@ -285,6 +289,7 @@ impl App {
                                             self.course.clone().unwrap().scoreinit.unwrap_or(1000)
                                                 / 2
                                         };
+                                        self.combo += 1;
                                     }
                                     if let Some((note, t)) =
                                         self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
@@ -316,6 +321,14 @@ impl App {
                             let rhythm = self.game.as_mut().unwrap();
                             let notes =
                                 rhythm.advance_time(player_time * 1000.0 - rhythm.current_time());
+                            for note in notes {
+                                if note.variant == TaikoNoteVariant::Don
+                                    || note.variant == TaikoNoteVariant::Kat
+                                {
+                                    self.combo = 0;
+                                }
+                            }
+                            // auto play:
                             // for note in notes {
                             //     match note.variant() {
                             //         0 | 2 => self.player.play_effect(&self.sounds["don"]).await,
@@ -372,10 +385,11 @@ impl App {
                                 song_name.unwrap().to_string()
                             } else {
                                 format!(
-                                    "{} | {:.1} secs | {} pts",
+                                    "{} | {:.1} secs | {} pts | {} combo",
                                     song_name.unwrap(),
                                     player_time,
-                                    self.score
+                                    self.score,
+                                    self.combo
                                 )
                             };
                             let topbar_left = Block::default().title(
