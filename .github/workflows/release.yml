@@ -24,6 +24,8 @@ jobs:
             - name: Checkout Repository
               uses: actions/checkout@v4
 
+            - run: sudo apt update && sudo apt install -y libasound2-dev
+
             - uses: dtolnay/rust-toolchain@stable
 
             - name: Build
@@ -73,6 +75,10 @@ jobs:
               with:
                   toolchain: stable
                   targets: ${{ matrix.target }}
+
+            - name: Install libasound2-dev
+              run: sudo apt update && sudo apt install -y libasound2-dev
+              if: matrix.build == 'linux-x64' || matrix.build == 'linux-arm64' || matrix.build == 'linux-musl-x64'
 
             - name: Install musl-tools
               run: sudo apt update && sudo apt install -y musl-tools
