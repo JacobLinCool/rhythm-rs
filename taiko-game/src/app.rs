@@ -34,6 +34,7 @@ pub struct App {
     playing: bool,
     score: i32,
     last_hit: i32,
+    last_hit_show: i32,
     combo: i32,
 }
 
@@ -74,6 +75,7 @@ impl App {
             playing: false,
             score: 0,
             last_hit: 0,
+            last_hit_show: 0,
             combo: 0,
         })
     }
@@ -257,6 +259,7 @@ impl App {
                                                 / 2
                                         };
                                         self.combo += 1;
+                                        self.last_hit_show = 4;
                                     }
                                     if let Some((note, t)) =
                                         self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
@@ -290,6 +293,7 @@ impl App {
                                                 / 2
                                         };
                                         self.combo += 1;
+                                        self.last_hit_show = 4;
                                     }
                                     if let Some((note, t)) =
                                         self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
@@ -541,12 +545,18 @@ impl App {
 
                                 let mut spans: Vec<Span> =
                                     vec![Span::raw(" "); vertical_chunks[1].width as usize];
-                                let hit_color = match self.last_hit {
-                                    1 => Color::White,
-                                    2 => Color::Yellow,
-                                    _ => Color::Black,
+                                let hit_color = if self.last_hit_show == 0 {
+                                    Color::Black
+                                } else {
+                                    match self.last_hit {
+                                        1 => Color::White,
+                                        2 => Color::Yellow,
+                                        _ => Color::Black,
+                                    }
                                 };
-                                self.last_hit = 0;
+                                if self.last_hit_show > 0 {
+                                    self.last_hit_show -= 1;
+                                }
                                 spans[hit_span] = Span::styled("|", Style::default().bg(hit_color));
                                 let hit_line = Line::from(spans);
 
