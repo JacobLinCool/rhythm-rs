@@ -505,18 +505,17 @@ impl App {
                                 let mut spans: Vec<Span> =
                                     vec![Span::raw(" "); vertical_chunks[1].width as usize];
                                 let hit_color = match self.last_hit {
-                                    1 => Some(Color::White),
-                                    2 => Some(Color::Yellow),
-                                    _ => None,
+                                    1 => Color::White,
+                                    2 => Color::Yellow,
+                                    _ => Color::Black,
                                 };
                                 self.last_hit = 0;
-                                if let Some(color) = hit_color {
-                                    spans[hit_span] = Span::styled(" ", Style::default().bg(color));
-                                }
+                                spans[hit_span] = Span::styled("|", Style::default().bg(hit_color));
                                 let hit_line = Line::from(spans);
 
-                                let paragraph = Paragraph::new(vec![hit_line, note_line])
-                                    .block(Block::default().borders(Borders::ALL));
+                                let paragraph =
+                                    Paragraph::new(vec![hit_line.clone(), note_line, hit_line])
+                                        .block(Block::default().borders(Borders::ALL));
                                 f.render_widget(paragraph, vertical_chunks[1]);
                             }
                         })?;
