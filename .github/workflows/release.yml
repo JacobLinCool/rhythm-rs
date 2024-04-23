@@ -17,6 +17,7 @@ jobs:
                   repo_token: ${{ secrets.GITHUB_TOKEN }}
                   prerelease: true
                   automatic_release_tag: "latest"
+                  title: "Dev Build"
 
     publish_crate:
         runs-on: ubuntu-latest
