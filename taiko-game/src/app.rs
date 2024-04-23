@@ -79,7 +79,7 @@ impl App {
     pub async fn run(&mut self) -> Result<()> {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
 
-        let mut tui = tui::Tui::new()?.tick_rate(self.fps.into()).frame_rate(30.0);
+        let mut tui = tui::Tui::new()?.tick_rate(self.fps.into()).frame_rate(60.0);
         tui.enter()?;
 
         loop {
