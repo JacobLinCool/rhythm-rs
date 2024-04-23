@@ -280,6 +280,7 @@ impl App {
                                         self.score += if (t - note.duration() / 2.0).abs()
                                             < note.duration() / 2.0
                                         {
+                                            self.last_hit = 2;
                                             self.course.clone().unwrap().scoreinit.unwrap_or(1000)
                                         } else {
                                             self.course.clone().unwrap().scoreinit.unwrap_or(1000)
@@ -289,6 +290,7 @@ impl App {
                                     if let Some((note, t)) =
                                         self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
                                     {
+                                        self.last_hit = 1;
                                         self.score += 100;
                                     }
                                 }
