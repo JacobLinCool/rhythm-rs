@@ -64,10 +64,10 @@ jobs:
                       os: windows-latest
                       target: x86_64-pc-windows-msvc
                       artifact_name: "taiko-windows-amd64"
-                    - build: linux-musl-x64
-                      os: ubuntu-latest
-                      target: x86_64-unknown-linux-musl
-                      artifact_name: "taiko-linux-musl-amd64"
+                    # - build: linux-musl-x64
+                    #   os: ubuntu-latest
+                    #   target: x86_64-unknown-linux-musl
+                    #   artifact_name: "taiko-linux-musl-amd64"
         steps:
             - name: Checkout Repository
               uses: actions/checkout@v4
@@ -78,7 +78,7 @@ jobs:
                   targets: ${{ matrix.target }}
 
             - name: Install libasound2-dev
-              run: sudo apt update && sudo apt install -y libasound2-dev
+              run: sudo apt update && sudo apt install -y libasound2-dev libasound2-dev:arm64
               if: matrix.build == 'linux-x64' || matrix.build == 'linux-arm64' || matrix.build == 'linux-musl-x64'
 
             - name: Install musl-tools
