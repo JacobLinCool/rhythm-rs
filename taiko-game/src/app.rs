@@ -214,14 +214,12 @@ impl App {
                                         self.song.as_ref().unwrap().header.offset.unwrap_or(0.0)
                                             as f64;
                                     for note in course.notes.iter_mut() {
-                                        if TaikoNoteVariant::from(note.variant())
-                                            == TaikoNoteVariant::Don
-                                            || TaikoNoteVariant::from(note.variant())
-                                                == TaikoNoteVariant::Kat
+                                        if note.variant == TaikoNoteVariant::Don
+                                            || note.variant == TaikoNoteVariant::Kat
                                         {
                                             note.start -= note.duration / 2.0;
                                         }
-                                        note.start -= 100.0; // 100ms offset for audio delay
+                                        // note.start -= 100.0; // 100ms offset for audio delay
                                         note.start -= offset * 1000.0;
                                     }
 
@@ -438,18 +436,24 @@ impl App {
                                     .notes
                                     .iter()
                                     .filter_map(|note| {
-                                        let y = (note.start + note.duration / 2.0
+                                        let x = (note.start
+                                            + (if note.variant == TaikoNoteVariant::Both {
+                                                0.0
+                                            } else {
+                                                note.duration / 2.0
+                                            })
                                             - played * 1000.0)
-                                            * note.duration
-                                            * 0.0002
-                                            * 0.01;
+                                            / note.speed as f64
+                                            * 0.06;
 
-                                        if TaikoNoteVariant::from(note.variant())
-                                            == TaikoNoteVariant::Invisible
-                                        {
+                                        if note.variant == TaikoNoteVariant::Invisible {
                                             None
-                                        } else if y > -0.05 && y <= 1.0 {
-                                            Some((note, y))
+                                        } else if note.volume == 0 {
+                                            None
+                                        } else if note.variant == TaikoNoteVariant::Both {
+                                            Some((note, x))
+                                        } else if x > -0.05 && x <= 1.0 {
+                                            Some((note, x))
                                         } else {
                                             None
                                         }
@@ -474,29 +478,48 @@ impl App {
                                 spans[hit_span] =
                                     Span::styled(" ", Style::default().bg(Color::Green));
                                 for (note, x) in &notes {
-                                    let variant = note.variant();
-                                    let note_type = note.note_type;
                                     let x =
                                         ((x + 0.05) * (vertical_chunks[1].width as f64)) as usize;
-                                    let color = match TaikoNoteVariant::from(variant) {
+                                    let color = match note.variant {
                                         TaikoNoteVariant::Don => Color::Red,
                                         TaikoNoteVariant::Kat => Color::Blue,
                                         TaikoNoteVariant::Both => Color::Yellow,
                                         _ => Color::White,
                                     };
                                     if x < vertical_chunks[1].width as usize {
-                                        spans[x] = Span::styled(
-                                            match note_type {
-                                                TaikoNoteType::Small => "o",
-                                                TaikoNoteType::Big => "O",
-                                                TaikoNoteType::SmallCombo => "x",
-                                                TaikoNoteType::BigCombo => "X",
-                                                TaikoNoteType::Balloon => "B",
-                                                TaikoNoteType::Yam => "Y",
-                                                _ => " ",
-                                            },
-                                            Style::default().bg(color),
-                                        );
+                                        match note.note_type {
+                                            TaikoNoteType::Small => {
+                                                spans[x] =
+                                                    Span::styled("o", Style::default().bg(color));
+                                            }
+                                            TaikoNoteType::Big => {
+                                                spans[x] =
+                                                    Span::styled("O", Style::default().bg(color));
+                                            }
+                                            TaikoNoteType::SmallCombo
+                                            | TaikoNoteType::BigCombo
+                                            | TaikoNoteType::Balloon
+                                            | TaikoNoteType::Yam => {
+                                                let end = (((note.start + note.duration
+                                                    - played * 1000.0)
+                                                    / note.speed as f64
+                                                    * 0.06
+                                                    + 0.05)
+                                                    * (vertical_chunks[1].width as f64))
+                                                    as usize;
+                                                let mut x = x;
+                                                while x < end
+                                                    && x < vertical_chunks[1].width as usize
+                                                {
+                                                    spans[x] = Span::styled(
+                                                        " ",
+                                                        Style::default().bg(color),
+                                                    );
+                                                    x += 1;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
 
