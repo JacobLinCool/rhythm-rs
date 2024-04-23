@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "rhythm-core",
     "tja",
+    "taiko-game",
 ]

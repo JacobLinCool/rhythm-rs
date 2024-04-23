@@ -1,0 +1,9 @@
+# config is not implemented yet
+
+[keybinding]
+quit = [ "esc" ]
+prev = [ "up", "left" ]
+next = [ "down", "right" ]
+select = [ "enter" ]
+don = [ "f", "j" ]
+kat = [ "d", "k" ]
