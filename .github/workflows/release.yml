@@ -102,7 +102,7 @@ jobs:
                   repo_token: ${{ secrets.GITHUB_TOKEN }}
                   file: target/${{ matrix.target }}/release/taiko
                   asset_name: ${{ matrix.artifact_name }}
-                  tag: ${{ github.ref }}
+                  tag: latest
 
             - name: Upload to Release (Windows)
               uses: svenstaro/upload-release-action@v2
@@ -111,4 +111,4 @@ jobs:
                   repo_token: ${{ secrets.GITHUB_TOKEN }}
                   file: target/${{ matrix.target }}/release/taiko.exe
                   asset_name: ${{ matrix.artifact_name }}.exe
-                  tag: ${{ github.ref }}
+                  tag: latest
