@@ -387,7 +387,7 @@ impl App {
                                 .split(size);
 
                             let topbar_right = Block::default().title(
-                                block::Title::from(format!("{:.2} frames per sec", fps).dim())
+                                block::Title::from(format!("{:.2} tps", fps).dim())
                                     .alignment(Alignment::Right),
                             );
                             f.render_widget(topbar_right, chunks[0]);
@@ -398,8 +398,13 @@ impl App {
                                 song_name.unwrap().to_string()
                             } else {
                                 format!(
-                                    "{} | {:.1} secs | {} pts | {} combo (max: {})",
+                                    "{} ({}) | {:.1} secs | {} pts | {} combo (max: {})",
                                     song_name.unwrap(),
+                                    if self.course.as_ref().unwrap().course < COURSE_TYPE.len() as i32 {
+                                        COURSE_TYPE[self.course.as_ref().unwrap().course as usize]
+                                    } else {
+                                        "Unknown"
+                                    },
                                     player_time,
                                     self.output.score,
                                     self.output.current_combo,
