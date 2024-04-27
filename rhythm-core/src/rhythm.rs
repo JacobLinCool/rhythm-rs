@@ -15,7 +15,7 @@ pub struct Rhythm<T: Note> {
     availables: Vec<T>,
 }
 
-impl<T: Note + Clone + Copy + Ord> Rhythm<T> {
+impl<T: Note> Rhythm<T> {
     pub fn new(notes: Vec<T>) -> Self {
         let mut availables = notes.clone();
         availables.sort_unstable();
@@ -31,7 +31,7 @@ impl<T: Note + Clone + Copy + Ord> Rhythm<T> {
         self.time
     }
 
-    pub fn advance_time(&mut self, time: impl Into<f64>) -> Vec<T> {
+    pub fn forward(&mut self, time: impl Into<f64>) -> Vec<T> {
         self.time += time.into();
         self.update_availables()
     }
@@ -43,14 +43,18 @@ impl<T: Note + Clone + Copy + Ord> Rhythm<T> {
         self.update_availables();
     }
 
+    pub fn finished(&self) -> bool {
+        self.availables.is_empty()
+    }
+
     pub fn hit(&mut self, variant: impl Into<u16>) -> Option<(&T, f64)> {
-        let variant = variant.into();
+        let variant: u16 = variant.into();
         let hitables = self.availables.iter_mut().filter(|note| {
             note.start() <= self.time && note.start() + note.duration() >= self.time
         });
 
         for note in hitables {
-            if note.variant() == variant && note.volume() > 0 {
+            if note.matches_variant(variant) && note.volume() > 0 {
                 note.set_volume(note.volume() - 1);
                 let time = self.time - note.start();
                 return Some((note, time));
@@ -65,7 +69,7 @@ impl<T: Note + Clone + Copy + Ord> Rhythm<T> {
         self.availables.retain(|note| {
             let keep = note.start() + note.duration() >= self.time && note.volume() > 0;
             if !keep && note.volume() > 0 {
-                removed.push(*note);
+                removed.push(note.clone());
             }
             keep
         });
@@ -91,11 +95,11 @@ mod tests {
 
         assert_eq!(rhythm.current_time(), 0.0);
 
-        assert_eq!(rhythm.advance_time(500), vec![]);
+        assert_eq!(rhythm.forward(500), vec![]);
         assert_eq!(rhythm.current_time(), 500.0);
         assert_eq!(rhythm.hit(0u16), None);
 
-        assert_eq!(rhythm.advance_time(550), vec![]);
+        assert_eq!(rhythm.forward(550), vec![]);
         assert_eq!(rhythm.current_time(), 1050.0);
         assert_eq!(rhythm.hit(1u16), None);
         assert_eq!(
@@ -105,14 +109,14 @@ mod tests {
         assert_eq!(rhythm.hit(0u16), None);
 
         assert_eq!(
-            rhythm.advance_time(200),
+            rhythm.forward(200),
             vec![SimpleNote::new(1100, 100, 1u16, 1u16)]
         );
         assert_eq!(rhythm.current_time(), 1250.0);
         assert_eq!(rhythm.hit(1u16), None);
 
         assert_eq!(
-            rhythm.advance_time(2000),
+            rhythm.forward(2000),
             vec![
                 SimpleNote::new(2000, 100, 1u16, 0u16),
                 SimpleNote::new(2100, 100, 1u16, 1u16)
@@ -131,7 +135,7 @@ mod tests {
 
         assert_eq!(rhythm.current_time(), 0.0);
 
-        assert_eq!(rhythm.advance_time(1500), vec![]);
+        assert_eq!(rhythm.forward(1500), vec![]);
         assert_eq!(rhythm.current_time(), 1500.0);
         for i in 0..10 {
             assert_eq!(
@@ -141,12 +145,12 @@ mod tests {
                     500.0 + i as f64 * 10.0
                 ))
             );
-            assert_eq!(rhythm.advance_time(10), vec![]);
+            assert_eq!(rhythm.forward(10), vec![]);
         }
         assert_eq!(rhythm.current_time(), 1600.0);
         assert_eq!(rhythm.hit(0u16), None);
 
-        assert_eq!(rhythm.advance_time(3000), vec![]);
+        assert_eq!(rhythm.forward(3000), vec![]);
         assert_eq!(rhythm.current_time(), 4600.0);
         for i in 0..1000 {
             assert_eq!(
