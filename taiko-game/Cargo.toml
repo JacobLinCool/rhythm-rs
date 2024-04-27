@@ -14,8 +14,9 @@ name = "taiko"
 path = "src/main.rs"
 
 [dependencies]
-rhythm-core = { path = "../rhythm-core", version = "0.1.0" }
+rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
 tja = { path = "../tja", version = "0.2.0" }
+taiko-core = { path = "../taiko-core", version = "0.0.1" }
 better-panic = "0.3.0"
 clap = { version = "4.5.4", features = ["derive", "cargo", "wrap_help", "unicode", "string", "unstable-styles"] }
 color-eyre = "0.6.3"

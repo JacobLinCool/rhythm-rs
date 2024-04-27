@@ -8,21 +8,31 @@ use rodio::{source::Source, Decoder, OutputStream, Sink};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{fs, io, path::PathBuf, time::Instant};
+use taiko_core::constant::COURSE_TYPE;
 use tokio::sync::mpsc;
 
 use rhythm_core::Note;
+use taiko_core::{
+    DefaultTaikoEngine, GameSource, Hit, InputState, Judgement, OutputState, TaikoEngine,
+};
 use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA};
 
 use crate::assets::{DON_WAV, KAT_WAV};
 use crate::sound::{SoundData, SoundPlayer};
 use crate::{action::Action, sound, tui};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Page {
+    SongSelect,
+    CourseSelect,
+    Game,
+}
+
 pub struct App {
     songs: Vec<(String, PathBuf)>,
     song: Option<TJA>,
     song_selector: ListState,
     course: Option<TJACourse>,
-    game: Option<Rhythm<TaikoNote>>,
     course_selector: ListState,
     player: sound::RodioSoundPlayer,
     sounds: HashMap<String, sound::SoundData>,
@@ -31,11 +41,10 @@ pub struct App {
     pending_quit: bool,
     pending_suspend: bool,
     ticks: Vec<Instant>,
-    playing: bool,
-    score: i32,
+    taiko: Option<DefaultTaikoEngine>,
     last_hit: i32,
     last_hit_show: i32,
-    combo: i32,
+    output: OutputState,
 }
 
 impl App {
@@ -46,7 +55,10 @@ impl App {
         let mut course_selector = ListState::default();
         course_selector.select(None);
 
-        let songs = list_songs(dir).unwrap();
+        let songs = list_songs(dir)?;
+        if songs.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No songs found").into());
+        }
 
         let mut sounds = HashMap::new();
         sounds.insert(
@@ -64,7 +76,6 @@ impl App {
             song: None,
             song_selector,
             course: None,
-            game: None,
             course_selector,
             player: sound::RodioSoundPlayer::new().unwrap(),
             sounds,
@@ -72,12 +83,116 @@ impl App {
             pending_quit: false,
             pending_suspend: false,
             ticks: Vec::new(),
-            playing: false,
-            score: 0,
+            taiko: None,
             last_hit: 0,
             last_hit_show: 0,
-            combo: 0,
+            output: OutputState {
+                finished: false,
+                score: 0,
+                current_combo: 0,
+                max_combo: 0,
+                gauge: 0.0,
+                judgement: None,
+                display: vec![],
+            },
         })
+    }
+
+    pub fn page(&self) -> Page {
+        if self.song.is_none() {
+            Page::SongSelect
+        } else if self.taiko.is_none() {
+            Page::CourseSelect
+        } else {
+            Page::Game
+        }
+    }
+
+    async fn enter_course_menu(&mut self) -> Result<()> {
+        let selected = self.song_selector.selected().unwrap_or(0);
+        let content = fs::read_to_string(&self.songs[selected].1).unwrap();
+        let parser = TJAParser::new();
+        let mut song = parser
+            .parse(content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        song.courses.sort_by_key(|course| course.course);
+
+        let fallback_ogg = self.songs[selected].1.with_extension("ogg");
+        let rel = song
+            .header
+            .wave
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(
+                fallback_ogg
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        let path = self.songs[selected].1.parent().unwrap().join(rel);
+
+        self.music.replace(sound::SoundData::load_from_path(path)?);
+        self.song.replace(song);
+        self.player
+            .play_music_from(
+                self.music.as_ref().unwrap(),
+                self.song
+                    .clone()
+                    .unwrap()
+                    .header
+                    .demostart
+                    .unwrap_or(0.0)
+                    .into(),
+            )
+            .await;
+
+        Ok(())
+    }
+
+    async fn leave_course_menu(&mut self) {
+        self.song.take();
+        self.music.take();
+        self.player.stop_music().await;
+    }
+
+    async fn enter_game(&mut self) -> Result<()> {
+        let selected = self.course_selector.selected().unwrap_or(0);
+        let mut course = self
+            .song
+            .as_ref()
+            .unwrap()
+            .courses
+            .get(selected)
+            .unwrap()
+            .clone();
+
+        let offset = self.song.as_ref().unwrap().header.offset.unwrap_or(0.0) as f64;
+        for note in course.notes.iter_mut() {
+            note.start -= offset;
+        }
+
+        let source = GameSource {
+            difficulty: course.course as u8,
+            level: course.level.unwrap() as u8,
+            scoreinit: course.scoreinit,
+            scorediff: course.scorediff,
+            notes: course.notes.clone(),
+        };
+
+        self.course.replace(course);
+        self.taiko.replace(DefaultTaikoEngine::new(source));
+
+        self.player.stop_music().await;
+        self.player.play_music(self.music.as_ref().unwrap()).await;
+
+        Ok(())
+    }
+
+    async fn leave_game(&mut self) {
+        self.taiko.take();
+        self.course.take();
+        self.player.stop_music().await;
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -86,16 +201,11 @@ impl App {
         let mut tui = tui::Tui::new()?.tick_rate(self.fps.into()).frame_rate(60.0);
         tui.enter()?;
 
-        loop {
-            if let Some(e) = tui.next().await {
-                if self.music.is_some() && self.game.is_some() && !self.playing {
-                    self.player.stop_music().await;
-                    self.player.play_music(self.music.as_ref().unwrap()).await;
-                    self.playing = true;
-                    self.score = 0;
-                    self.combo = 0;
-                }
+        let mut hit: Option<Hit> = None;
 
+        loop {
+            let player_time = self.player.get_music_time().await;
+            if let Some(e) = tui.next().await {
                 match e {
                     tui::Event::Quit => action_tx.send(Action::Quit)?,
                     tui::Event::Tick => action_tx.send(Action::Tick)?,
@@ -110,42 +220,38 @@ impl App {
                             }
                             | KeyEvent {
                                 code: KeyCode::Esc, ..
-                            } => {
-                                if self.game.is_some() {
-                                    self.game = None;
-                                    self.course = None;
-                                    self.score = 0;
-                                    self.playing = false;
-                                    self.player.stop_music().await;
-                                } else if self.song.is_some() {
-                                    self.song = None;
-                                    self.music = None;
-                                    self.score = 0;
-                                    self.player.stop_music().await;
-                                } else {
-                                    action_tx.send(Action::Quit)?;
+                            } => match self.page() {
+                                Page::SongSelect => action_tx.send(Action::Quit)?,
+                                Page::CourseSelect => {
+                                    self.leave_course_menu().await;
                                 }
-                            }
+                                Page::Game => {
+                                    self.leave_game().await;
+                                    self.enter_course_menu().await?;
+                                }
+                            },
                             KeyEvent {
                                 code: KeyCode::Up, ..
                             }
                             | KeyEvent {
                                 code: KeyCode::Left,
                                 ..
-                            } => {
-                                if self.song.is_none() {
+                            } => match self.page() {
+                                Page::SongSelect => {
                                     let selected = self.song_selector.selected().unwrap_or(0);
                                     self.song_selector.select(Some(
                                         (selected + self.songs.len() - 1) % self.songs.len(),
                                     ));
-                                } else if self.game.is_none() {
+                                }
+                                Page::CourseSelect => {
                                     let selected = self.course_selector.selected().unwrap_or(0);
                                     self.course_selector.select(Some(
                                         (selected + self.song.as_ref().unwrap().courses.len() - 1)
                                             % self.song.as_ref().unwrap().courses.len(),
                                     ));
                                 }
-                            }
+                                _ => {}
+                            },
                             KeyEvent {
                                 code: KeyCode::Down,
                                 ..
@@ -153,85 +259,30 @@ impl App {
                             | KeyEvent {
                                 code: KeyCode::Right,
                                 ..
-                            } => {
-                                if self.song.is_none() {
+                            } => match self.page() {
+                                Page::SongSelect => {
                                     let selected = self.song_selector.selected().unwrap_or(0);
                                     self.song_selector.select(Some(
                                         (selected + self.songs.len() + 1) % self.songs.len(),
                                     ));
-                                } else if self.game.is_none() {
+                                }
+                                Page::CourseSelect => {
                                     let selected = self.course_selector.selected().unwrap_or(0);
                                     self.course_selector.select(Some(
                                         (selected + self.song.as_ref().unwrap().courses.len() + 1)
                                             % self.song.as_ref().unwrap().courses.len(),
                                     ));
                                 }
-                            }
+                                _ => {}
+                            },
                             KeyEvent {
                                 code: KeyCode::Enter,
                                 ..
                             } => {
-                                if self.song.is_none() {
-                                    let selected = self.song_selector.selected().unwrap_or(0);
-                                    let content =
-                                        fs::read_to_string(&self.songs[selected].1).unwrap();
-                                    let parser = TJAParser::new();
-                                    let song = parser.parse(content).map_err(|e| {
-                                        io::Error::new(io::ErrorKind::InvalidData, e)
-                                    })?;
-
-                                    let fallback_ogg = self.songs[selected].1.with_extension("ogg");
-                                    let rel = song.header.wave.clone().unwrap_or(
-                                        fallback_ogg
-                                            .file_name()
-                                            .unwrap()
-                                            .to_string_lossy()
-                                            .to_string(),
-                                    );
-                                    let path = self.songs[selected].1.parent().unwrap().join(rel);
-
-                                    self.music.replace(sound::SoundData::load_from_path(path)?);
-                                    self.song.replace(song);
-                                    self.player
-                                        .play_music_from(
-                                            self.music.as_ref().unwrap(),
-                                            self.song
-                                                .clone()
-                                                .unwrap()
-                                                .header
-                                                .demostart
-                                                .unwrap_or(0.0)
-                                                .into(),
-                                        )
-                                        .await;
-                                } else if self.game.is_none() {
-                                    let selected = self.course_selector.selected().unwrap_or(0);
-                                    let mut course = self
-                                        .song
-                                        .as_ref()
-                                        .unwrap()
-                                        .courses
-                                        .get(selected)
-                                        .unwrap()
-                                        .clone();
-
-                                    let offset =
-                                        self.song.as_ref().unwrap().header.offset.unwrap_or(0.0)
-                                            as f64;
-                                    for note in course.notes.iter_mut() {
-                                        if note.variant == TaikoNoteVariant::Don
-                                            || note.variant == TaikoNoteVariant::Kat
-                                        {
-                                            note.start -= note.duration / 2.0;
-                                        }
-                                        // note.start -= 100.0; // 100ms offset for audio delay
-                                        note.start -= offset * 1000.0;
-                                    }
-
-                                    let rhythm = Rhythm::new(course.notes.clone());
-
-                                    self.course.replace(course);
-                                    self.game.replace(rhythm);
+                                if self.page() == Page::SongSelect {
+                                    self.enter_course_menu().await?
+                                } else if self.page() == Page::CourseSelect {
+                                    self.enter_game().await?
                                 }
                             }
                             KeyEvent {
@@ -244,28 +295,8 @@ impl App {
                             } => {
                                 // don
                                 self.player.play_effect(&self.sounds["don"]).await;
-                                if self.game.is_some() {
-                                    if let Some((note, t)) =
-                                        self.game.as_mut().unwrap().hit(TaikoNoteVariant::Don)
-                                    {
-                                        self.score += if (t - note.duration() / 2.0).abs()
-                                            < note.duration() / 3.0
-                                        {
-                                            self.last_hit = 2;
-                                            self.course.clone().unwrap().scoreinit.unwrap_or(1000)
-                                        } else {
-                                            self.last_hit = 1;
-                                            self.course.clone().unwrap().scoreinit.unwrap_or(1000)
-                                                / 2
-                                        };
-                                        self.combo += 1;
-                                        self.last_hit_show = 4;
-                                    }
-                                    if let Some((note, t)) =
-                                        self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
-                                    {
-                                        self.score += 100;
-                                    }
+                                if self.taiko.is_some() {
+                                    hit.replace(Hit::Don);
                                 }
                             }
                             KeyEvent {
@@ -278,28 +309,8 @@ impl App {
                             } => {
                                 // kat
                                 self.player.play_effect(&self.sounds["kat"]).await;
-                                if self.game.is_some() {
-                                    if let Some((note, t)) =
-                                        self.game.as_mut().unwrap().hit(TaikoNoteVariant::Kat)
-                                    {
-                                        self.score += if (t - note.duration() / 2.0).abs()
-                                            < note.duration() / 3.0
-                                        {
-                                            self.last_hit = 2;
-                                            self.course.clone().unwrap().scoreinit.unwrap_or(1000)
-                                        } else {
-                                            self.last_hit = 1;
-                                            self.course.clone().unwrap().scoreinit.unwrap_or(1000)
-                                                / 2
-                                        };
-                                        self.combo += 1;
-                                        self.last_hit_show = 4;
-                                    }
-                                    if let Some((note, t)) =
-                                        self.game.as_mut().unwrap().hit(TaikoNoteVariant::Both)
-                                    {
-                                        self.score += 100;
-                                    }
+                                if self.taiko.is_some() {
+                                    hit.replace(Hit::Kat);
                                 }
                             }
                             _ => {}
@@ -321,25 +332,23 @@ impl App {
                         }
 
                         let player_time = self.player.get_music_time().await;
-                        if self.game.is_some() {
-                            let rhythm = self.game.as_mut().unwrap();
-                            let notes =
-                                rhythm.advance_time(player_time * 1000.0 - rhythm.current_time());
-                            for note in notes {
-                                if note.variant == TaikoNoteVariant::Don
-                                    || note.variant == TaikoNoteVariant::Kat
-                                {
-                                    self.combo = 0;
-                                }
+                        if self.taiko.is_some() {
+                            let taiko = self.taiko.as_mut().unwrap();
+
+                            let input: InputState<Hit> = InputState {
+                                time: player_time,
+                                hit: hit.take(),
+                            };
+
+                            self.output = taiko.forward(input);
+                            if self.output.judgement.is_some() {
+                                self.last_hit = match self.output.judgement.unwrap() {
+                                    Judgement::Ok => 1,
+                                    Judgement::Great => 2,
+                                    _ => 0,
+                                };
+                                self.last_hit_show = 4;
                             }
-                            // auto play:
-                            // for note in notes {
-                            //     match note.variant() {
-                            //         0 | 2 => self.player.play_effect(&self.sounds["don"]).await,
-                            //         1 => self.player.play_effect(&self.sounds["kat"]).await,
-                            //         _ => {}
-                            //     }
-                            // }
                         }
                     }
                     Action::Quit => self.pending_quit = true,
@@ -385,15 +394,16 @@ impl App {
 
                             let topbar_left_content = if song_name.is_none() {
                                 "Taiko on Terminal!!".to_owned()
-                            } else if player_time <= 0.0 {
+                            } else if self.taiko.is_none() {
                                 song_name.unwrap().to_string()
                             } else {
                                 format!(
-                                    "{} | {:.1} secs | {} pts | {} combo",
+                                    "{} | {:.1} secs | {} pts | {} combo (max: {})",
                                     song_name.unwrap(),
                                     player_time,
-                                    self.score,
-                                    self.combo
+                                    self.output.score,
+                                    self.output.current_combo,
+                                    self.output.max_combo
                                 )
                             };
                             let topbar_left = Block::default().title(
@@ -410,25 +420,39 @@ impl App {
                                             .borders(Borders::ALL)
                                             .title("Select a Song"),
                                     )
-                                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                                    .highlight_style(
+                                        Style::default()
+                                            .fg(Color::Yellow)
+                                            .add_modifier(Modifier::BOLD),
+                                    );
                                 self.song_selector.select(Some(
                                     self.song_selector.selected().unwrap_or(0) % self.songs.len(),
                                 ));
 
                                 f.render_stateful_widget(list, chunks[1], &mut self.song_selector);
-                            } else if self.game.is_none() {
+                            } else if self.taiko.is_none() {
                                 let song = self.song.as_ref().unwrap();
-                                let names = song
-                                    .courses
-                                    .iter()
-                                    .map(|course| format!("{}", course.course));
+                                let names = song.courses.iter().map(|course| {
+                                    format!(
+                                        "{}",
+                                        if course.course < COURSE_TYPE.len() as i32 {
+                                            COURSE_TYPE[course.course as usize]
+                                        } else {
+                                            "Unknown"
+                                        }
+                                    )
+                                });
                                 let list = List::new(names)
                                     .block(
                                         Block::default()
                                             .borders(Borders::ALL)
                                             .title("Select a Course"),
                                     )
-                                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                                    .highlight_style(
+                                        Style::default()
+                                            .fg(Color::Yellow)
+                                            .add_modifier(Modifier::BOLD),
+                                    );
                                 self.course_selector.select(Some(
                                     self.course_selector.selected().unwrap_or(0)
                                         % song.courses.len(),
@@ -443,69 +467,47 @@ impl App {
                                 let vertical_chunks = Layout::default()
                                     .direction(Direction::Vertical)
                                     .constraints(
-                                        [Constraint::Length(1), Constraint::Min(1)].as_ref(),
+                                        [Constraint::Length(1), Constraint::Length(5)].as_ref(),
                                     )
                                     .split(chunks[1]);
 
-                                // draw the notes
-                                let course = self.course.as_ref().unwrap();
-                                let played = if self.playing { player_time } else { 0.0 };
-                                let notes = course
-                                    .notes
-                                    .iter()
-                                    .filter_map(|note| {
-                                        let x = (note.start
-                                            + (if note.variant == TaikoNoteVariant::Both {
-                                                0.0
-                                            } else {
-                                                note.duration / 2.0
-                                            })
-                                            - played * 1000.0)
-                                            / note.speed as f64
-                                            * 0.06;
+                                let guage_chunk = vertical_chunks[0];
+                                let game_zone = vertical_chunks[1];
 
-                                        if note.variant == TaikoNoteVariant::Invisible {
-                                            None
-                                        } else if note.volume == 0 {
-                                            None
-                                        } else if note.variant == TaikoNoteVariant::Both {
-                                            Some((note, x))
-                                        } else if x > -0.05 && x <= 1.0 {
-                                            Some((note, x))
-                                        } else {
-                                            None
-                                        }
+                                let guage = Canvas::default()
+                                    .paint(|ctx| {
+                                        ctx.draw(&Rectangle {
+                                            x: 0.0,
+                                            y: 0.0,
+                                            width: self.output.gauge,
+                                            height: 1.0,
+                                            color: Color::White,
+                                        });
                                     })
-                                    .collect::<Vec<_>>();
-
-                                let selected = format!(
-                                    "{} {} {:?}",
-                                    self.course.as_ref().unwrap().course,
-                                    notes.len(),
-                                    &notes
-                                );
-                                let block = Block::default().title(
-                                    block::Title::from(selected.dim()).alignment(Alignment::Center),
-                                );
-
-                                f.render_widget(block, vertical_chunks[0]);
+                                    .x_bounds([0.0, 1.0])
+                                    .y_bounds([0.0, 1.0]);
+                                f.render_widget(guage, guage_chunk);
 
                                 let mut spans: Vec<Span> =
-                                    vec![Span::raw(" "); vertical_chunks[1].width as usize];
-                                let hit_span = (0.05 * vertical_chunks[1].width as f64) as usize;
+                                    vec![Span::raw(" "); game_zone.width as usize];
+                                let hit_span = (0.1 * game_zone.width as f64) as usize;
                                 spans[hit_span] =
                                     Span::styled(" ", Style::default().bg(Color::Green));
-                                for (note, x) in &notes {
-                                    let x =
-                                        ((x + 0.05) * (vertical_chunks[1].width as f64)) as usize;
-                                    let color = match note.variant {
+                                for note in self.output.display.iter() {
+                                    let pos = note.position(player_time);
+                                    if pos.is_none() {
+                                        continue;
+                                    }
+                                    let (start, end) = pos.unwrap();
+                                    let x = (start * (game_zone.width as f64)) as usize;
+                                    let color = match TaikoNoteVariant::from(note.variant()) {
                                         TaikoNoteVariant::Don => Color::Red,
                                         TaikoNoteVariant::Kat => Color::Blue,
                                         TaikoNoteVariant::Both => Color::Yellow,
                                         _ => Color::White,
                                     };
-                                    if x < vertical_chunks[1].width as usize {
-                                        match note.note_type {
+                                    if x < game_zone.width as usize {
+                                        match note.inner.note_type {
                                             TaikoNoteType::Small => {
                                                 spans[x] =
                                                     Span::styled("o", Style::default().bg(color));
@@ -518,17 +520,9 @@ impl App {
                                             | TaikoNoteType::BigCombo
                                             | TaikoNoteType::Balloon
                                             | TaikoNoteType::Yam => {
-                                                let end = (((note.start + note.duration
-                                                    - played * 1000.0)
-                                                    / note.speed as f64
-                                                    * 0.06
-                                                    + 0.05)
-                                                    * (vertical_chunks[1].width as f64))
-                                                    as usize;
+                                                let end = (end * (game_zone.width as f64)) as usize;
                                                 let mut x = x;
-                                                while x < end
-                                                    && x < vertical_chunks[1].width as usize
-                                                {
+                                                while x < end && x < game_zone.width as usize {
                                                     spans[x] = Span::styled(
                                                         " ",
                                                         Style::default().bg(color),
@@ -544,7 +538,7 @@ impl App {
                                 let note_line = Line::from(spans);
 
                                 let mut spans: Vec<Span> =
-                                    vec![Span::raw(" "); vertical_chunks[1].width as usize];
+                                    vec![Span::raw(" "); game_zone.width as usize];
                                 let hit_color = if self.last_hit_show == 0 {
                                     Color::Black
                                 } else {
@@ -563,7 +557,7 @@ impl App {
                                 let paragraph =
                                     Paragraph::new(vec![hit_line.clone(), note_line, hit_line])
                                         .block(Block::default().borders(Borders::ALL));
-                                f.render_widget(paragraph, vertical_chunks[1]);
+                                f.render_widget(paragraph, game_zone);
                             }
                         })?;
                     }
@@ -604,6 +598,12 @@ fn list_songs(dir: PathBuf) -> io::Result<Vec<(String, PathBuf)>> {
                 }
             }
         }
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{:?} not found", dir),
+        ));
     }
+
     Ok(songs)
 }
