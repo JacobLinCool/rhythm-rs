@@ -454,7 +454,7 @@ impl App {
                             f.render_widget(topbar_right, chunks[0]);
 
                             let topbar_left_content = if song_name.is_none() {
-                                "Taiko on Terminal!!".to_owned()
+                                format!("Taiko on Terminal! v{} {}", env!("CARGO_PKG_VERSION"), env!("VERGEN_GIT_DESCRIBE"))
                             } else if self.taiko.is_none() {
                                 song_name.unwrap().to_string()
                             } else {
