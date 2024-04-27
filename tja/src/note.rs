@@ -7,21 +7,21 @@ use rhythm_core::Note;
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub enum TaikoNoteVariant {
-    Don,
-    Kat,
-    Both,
-    Invisible,
-    Unknown,
+    Don = 0b01,
+    Kat = 0b10,
+    Both = 0b11,
+    Invisible = 0b1111111,
+    Unknown = 0,
 }
 
 impl From<TaikoNoteVariant> for u16 {
     fn from(val: TaikoNoteVariant) -> Self {
         match val {
-            TaikoNoteVariant::Don => 0,
-            TaikoNoteVariant::Kat => 1,
-            TaikoNoteVariant::Both => 2,
-            TaikoNoteVariant::Invisible => 100,
-            TaikoNoteVariant::Unknown => u16::MAX,
+            TaikoNoteVariant::Don => 0b01,
+            TaikoNoteVariant::Kat => 0b10,
+            TaikoNoteVariant::Both => 0b11,
+            TaikoNoteVariant::Invisible => 0b1111111,
+            TaikoNoteVariant::Unknown => 0,
         }
     }
 }
@@ -29,10 +29,10 @@ impl From<TaikoNoteVariant> for u16 {
 impl From<u16> for TaikoNoteVariant {
     fn from(value: u16) -> Self {
         match value {
-            0 => TaikoNoteVariant::Don,
-            1 => TaikoNoteVariant::Kat,
-            2 => TaikoNoteVariant::Both,
-            100 => TaikoNoteVariant::Invisible,
+            0b01 => TaikoNoteVariant::Don,
+            0b10 => TaikoNoteVariant::Kat,
+            0b11 => TaikoNoteVariant::Both,
+            0b1111111 => TaikoNoteVariant::Invisible,
             _ => TaikoNoteVariant::Unknown,
         }
     }
@@ -93,8 +93,9 @@ impl Note for TaikoNote {
         self.volume
     }
 
-    fn variant(&self) -> u16 {
-        self.variant.into()
+    #[allow(refining_impl_trait)]
+    fn variant(&self) -> TaikoNoteVariant {
+        self.variant
     }
 
     fn set_start(&mut self, start: f64) {
@@ -109,8 +110,22 @@ impl Note for TaikoNote {
         self.volume = volume;
     }
 
-    fn set_variant(&mut self, variant: u16) {
-        self.variant = TaikoNoteVariant::from(variant);
+    fn set_variant(&mut self, variant: impl Into<u16>) {
+        self.variant = TaikoNoteVariant::from(variant.into());
+    }
+
+    fn matches_variant(&self, variant: impl Into<u16>) -> bool {
+        let variant: u16 = variant.into();
+        let variant: TaikoNoteVariant = variant.into();
+        match variant {
+            TaikoNoteVariant::Don => {
+                self.variant == TaikoNoteVariant::Don || self.variant == TaikoNoteVariant::Both
+            }
+            TaikoNoteVariant::Kat => {
+                self.variant == TaikoNoteVariant::Kat || self.variant == TaikoNoteVariant::Both
+            }
+            _ => false,
+        }
     }
 }
 
