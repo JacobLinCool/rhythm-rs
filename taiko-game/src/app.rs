@@ -45,6 +45,7 @@ pub struct App {
     last_hit: i32,
     last_hit_show: i32,
     output: OutputState,
+    hit: Option<Hit>,
 }
 
 impl App {
@@ -95,6 +96,7 @@ impl App {
                 judgement: None,
                 display: vec![],
             },
+            hit: None,
         })
     }
 
@@ -195,13 +197,176 @@ impl App {
         self.player.stop_music().await;
     }
 
+    async fn handle_key_event(
+        &mut self,
+        key: &KeyEvent,
+        action_tx: &mpsc::UnboundedSender<Action>,
+    ) -> Result<()> {
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Esc, ..
+            } => match self.page() {
+                Page::SongSelect => action_tx.send(Action::Quit)?,
+                Page::CourseSelect => {
+                    self.leave_course_menu().await;
+                }
+                Page::Game => {
+                    self.leave_game().await;
+                    self.enter_course_menu().await?;
+                }
+            },
+            KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => match self.page() {
+                Page::SongSelect => {
+                    let selected = self.song_selector.selected().unwrap_or(0);
+                    self.song_selector
+                        .select(Some((selected + self.songs.len() - 1) % self.songs.len()));
+                }
+                Page::CourseSelect => {
+                    let selected = self.course_selector.selected().unwrap_or(0);
+                    self.course_selector.select(Some(
+                        (selected + self.song.as_ref().unwrap().courses.len() - 1)
+                            % self.song.as_ref().unwrap().courses.len(),
+                    ));
+                }
+                _ => {}
+            },
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => match self.page() {
+                Page::SongSelect => {
+                    let selected = self.song_selector.selected().unwrap_or(0);
+                    self.song_selector
+                        .select(Some((selected + self.songs.len() + 1) % self.songs.len()));
+                }
+                Page::CourseSelect => {
+                    let selected = self.course_selector.selected().unwrap_or(0);
+                    self.course_selector.select(Some(
+                        (selected + self.song.as_ref().unwrap().courses.len() + 1)
+                            % self.song.as_ref().unwrap().courses.len(),
+                    ));
+                }
+                _ => {}
+            },
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                if self.page() == Page::SongSelect {
+                    self.enter_course_menu().await?
+                } else if self.page() == Page::CourseSelect {
+                    self.enter_game().await?
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('j'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('g'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('h'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('v'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('b'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('m'),
+                ..
+            } => {
+                // don
+                self.player.play_effect(&self.sounds["don"]).await;
+                if self.taiko.is_some() {
+                    self.hit.replace(Hit::Don);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('e'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('r'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('t'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('y'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('u'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('i'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('k'),
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('o'),
+                ..
+            } => {
+                // kat
+                self.player.play_effect(&self.sounds["kat"]).await;
+                if self.taiko.is_some() {
+                    self.hit.replace(Hit::Kat);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
 
         let mut tui = tui::Tui::new()?.tick_rate(self.fps.into()).frame_rate(60.0);
         tui.enter()?;
-
-        let mut hit: Option<Hit> = None;
 
         loop {
             let player_time = self.player.get_music_time().await;
@@ -211,111 +376,7 @@ impl App {
                     tui::Event::Tick => action_tx.send(Action::Tick)?,
                     tui::Event::Render => action_tx.send(Action::Render)?,
                     tui::Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
-                    tui::Event::Key(key) => {
-                        match key {
-                            KeyEvent {
-                                code: KeyCode::Char('c'),
-                                modifiers: KeyModifiers::CONTROL,
-                                ..
-                            }
-                            | KeyEvent {
-                                code: KeyCode::Esc, ..
-                            } => match self.page() {
-                                Page::SongSelect => action_tx.send(Action::Quit)?,
-                                Page::CourseSelect => {
-                                    self.leave_course_menu().await;
-                                }
-                                Page::Game => {
-                                    self.leave_game().await;
-                                    self.enter_course_menu().await?;
-                                }
-                            },
-                            KeyEvent {
-                                code: KeyCode::Up, ..
-                            }
-                            | KeyEvent {
-                                code: KeyCode::Left,
-                                ..
-                            } => match self.page() {
-                                Page::SongSelect => {
-                                    let selected = self.song_selector.selected().unwrap_or(0);
-                                    self.song_selector.select(Some(
-                                        (selected + self.songs.len() - 1) % self.songs.len(),
-                                    ));
-                                }
-                                Page::CourseSelect => {
-                                    let selected = self.course_selector.selected().unwrap_or(0);
-                                    self.course_selector.select(Some(
-                                        (selected + self.song.as_ref().unwrap().courses.len() - 1)
-                                            % self.song.as_ref().unwrap().courses.len(),
-                                    ));
-                                }
-                                _ => {}
-                            },
-                            KeyEvent {
-                                code: KeyCode::Down,
-                                ..
-                            }
-                            | KeyEvent {
-                                code: KeyCode::Right,
-                                ..
-                            } => match self.page() {
-                                Page::SongSelect => {
-                                    let selected = self.song_selector.selected().unwrap_or(0);
-                                    self.song_selector.select(Some(
-                                        (selected + self.songs.len() + 1) % self.songs.len(),
-                                    ));
-                                }
-                                Page::CourseSelect => {
-                                    let selected = self.course_selector.selected().unwrap_or(0);
-                                    self.course_selector.select(Some(
-                                        (selected + self.song.as_ref().unwrap().courses.len() + 1)
-                                            % self.song.as_ref().unwrap().courses.len(),
-                                    ));
-                                }
-                                _ => {}
-                            },
-                            KeyEvent {
-                                code: KeyCode::Enter,
-                                ..
-                            } => {
-                                if self.page() == Page::SongSelect {
-                                    self.enter_course_menu().await?
-                                } else if self.page() == Page::CourseSelect {
-                                    self.enter_game().await?
-                                }
-                            }
-                            KeyEvent {
-                                code: KeyCode::Char('f'),
-                                ..
-                            }
-                            | KeyEvent {
-                                code: KeyCode::Char('j'),
-                                ..
-                            } => {
-                                // don
-                                self.player.play_effect(&self.sounds["don"]).await;
-                                if self.taiko.is_some() {
-                                    hit.replace(Hit::Don);
-                                }
-                            }
-                            KeyEvent {
-                                code: KeyCode::Char('d'),
-                                ..
-                            }
-                            | KeyEvent {
-                                code: KeyCode::Char('k'),
-                                ..
-                            } => {
-                                // kat
-                                self.player.play_effect(&self.sounds["kat"]).await;
-                                if self.taiko.is_some() {
-                                    hit.replace(Hit::Kat);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    tui::Event::Key(key) => self.handle_key_event(&key, &action_tx).await?,
                     _ => {}
                 }
             }
@@ -337,7 +398,7 @@ impl App {
 
                             let input: InputState<Hit> = InputState {
                                 time: player_time,
-                                hit: hit.take(),
+                                hit: self.hit.take(),
                             };
 
                             self.output = taiko.forward(input);
@@ -400,7 +461,9 @@ impl App {
                                 format!(
                                     "{} ({}) | {:.1} secs | {} pts | {} combo (max: {})",
                                     song_name.unwrap(),
-                                    if self.course.as_ref().unwrap().course < COURSE_TYPE.len() as i32 {
+                                    if self.course.as_ref().unwrap().course
+                                        < COURSE_TYPE.len() as i32
+                                    {
                                         COURSE_TYPE[self.course.as_ref().unwrap().course as usize]
                                     } else {
                                         "Unknown"
