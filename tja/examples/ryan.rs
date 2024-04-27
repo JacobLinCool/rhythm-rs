@@ -16,7 +16,7 @@ struct RyanChart {
 #[derive(Serialize, Deserialize)]
 struct RyanChartInner {
     course: i32,
-    chart: Vec<(i32, f32)>,
+    chart: Vec<(i32, f32, f32, u16)>,
 }
 
 fn main() {
@@ -55,41 +55,53 @@ fn main() {
             } else if note.variant() == TaikoNoteVariant::Both
                 && note.note_type == TaikoNoteType::SmallCombo
             {
-                for i in (0..note.duration() as usize).step_by(80) {
-                    chart.push((
-                        1,
-                        note.start as f32 / 1000.0 - tja.header.offset.unwrap() + i as f32 / 1000.0,
-                    ));
-                }
+                chart.push((
+                    5,
+                    note.start as f32 - tja.header.offset.unwrap(),
+                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
+                    0,
+                ));
                 0
             } else if note.variant() == TaikoNoteVariant::Both
                 && note.note_type == TaikoNoteType::BigCombo
             {
-                for i in (0..note.duration() as usize).step_by(80) {
-                    chart.push((
-                        3,
-                        note.start as f32 / 1000.0 - tja.header.offset.unwrap() + i as f32 / 1000.0,
-                    ));
-                }
+                chart.push((
+                    6,
+                    note.start as f32 - tja.header.offset.unwrap(),
+                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
+                    0,
+                ));
                 0
             } else if note.variant() == TaikoNoteVariant::Both
-                && (note.note_type == TaikoNoteType::Balloon
-                    || note.note_type == TaikoNoteType::Yam)
+                && (note.note_type == TaikoNoteType::Balloon)
             {
-                let step = note.duration() as f32 / note.volume as f32;
-                for i in 0..note.volume() {
-                    chart.push((
-                        1,
-                        note.start as f32 / 1000.0 - tja.header.offset.unwrap()
-                            + i as f32 * step / 1000.0,
-                    ));
-                }
+                chart.push((
+                    7,
+                    note.start as f32 - tja.header.offset.unwrap(),
+                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
+                    note.volume(),
+                ));
+                0
+            } else if note.variant() == TaikoNoteVariant::Both
+                && (note.note_type == TaikoNoteType::Yam)
+            {
+                chart.push((
+                    7,
+                    note.start as f32 - tja.header.offset.unwrap(),
+                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
+                    note.volume(),
+                ));
                 0
             } else {
                 0
             };
             if t != 0 {
-                chart.push((t, note.start as f32 / 1000.0 - tja.header.offset.unwrap()));
+                chart.push((
+                    t,
+                    note.start as f32 - tja.header.offset.unwrap(),
+                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
+                    0,
+                ));
             }
         }
         ryan_chart.data.push(RyanChartInner {
