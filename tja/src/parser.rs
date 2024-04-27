@@ -124,7 +124,7 @@ impl TJAParser {
                     }
                     "DELAY" => {
                         let delay = value.unwrap().parse().unwrap_or(0.0);
-                        time_ms += delay * 1000.0;
+                        time_ms += delay;
                     }
                     "START" => {
                         // #[cfg(debug_assertions)]
@@ -156,7 +156,7 @@ impl TJAParser {
                     let notes = segments.iter().map(|(_, s)| s.len()).sum::<usize>();
 
                     for (bpm, segment) in segments.iter() {
-                        let duration = (60000.0 / *bpm as f64)
+                        let duration = (60.0 / *bpm as f64)
                             * (measure.0 as f64 / measure.1 as f64)
                             * (4.0 / notes as f64);
 
@@ -168,7 +168,7 @@ impl TJAParser {
                                 '1' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
+                                        duration: 0.0,
                                         volume: 1,
                                         variant: TaikoNoteVariant::Don,
                                         note_type: TaikoNoteType::Small,
@@ -178,7 +178,7 @@ impl TJAParser {
                                 '2' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
+                                        duration: 0.0,
                                         volume: 1,
                                         variant: TaikoNoteVariant::Kat,
                                         note_type: TaikoNoteType::Small,
@@ -188,7 +188,7 @@ impl TJAParser {
                                 '3' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
+                                        duration: 0.0,
                                         volume: 1,
                                         variant: TaikoNoteVariant::Don,
                                         note_type: TaikoNoteType::Big,
@@ -198,7 +198,7 @@ impl TJAParser {
                                 '4' => {
                                     course.as_mut().unwrap().notes.push(TaikoNote {
                                         start: time_ms,
-                                        duration: (30000.0 / *bpm as f64 / scroll as f64),
+                                        duration: 0.0,
                                         volume: 1,
                                         variant: TaikoNoteVariant::Kat,
                                         note_type: TaikoNoteType::Big,
