@@ -1,0 +1,16 @@
+[package]
+name = "taiko-core"
+description = "A taiko game core written in Rust."
+version = "0.0.1"
+license = "MIT"
+authors = ["JacobLinCool <jacob@csie.cool>"]
+homepage = "https://github.com/JacobLinCool/rhythm-rs"
+repository = "https://github.com/JacobLinCool/rhythm-rs"
+edition = "2021"
+
+[lib]
+name = "taiko_core"
+
+[dependencies]
+rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
+tja = { path = "../tja", version = "0.2.0" }
