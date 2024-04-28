@@ -167,6 +167,8 @@ pub struct DefaultTaikoEngine {
     current_time: f64,
 
     total_notes: usize,
+
+    passed_display: Vec<CalculatedNote>,
 }
 
 impl TaikoEngine<Hit> for DefaultTaikoEngine {
@@ -225,6 +227,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             gauge: 0.0,
             current_time: 0.0,
             total_notes,
+            passed_display: vec![],
         }
     }
 
@@ -317,13 +320,19 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
 
         self.gauge = self.gauge.max(0.0).min(1.0);
 
-        let display = self
+        self.passed_display.extend(passed);
+        self.passed_display.retain(|note| note.visible(input.time));
+
+        let available_display = self
             .rhythm
-            .notes
+            .availables()
             .iter()
             .filter(|note| note.visible(input.time))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+
+        let mut display = self.passed_display.clone();
+        display.extend(available_display);
 
         OutputState {
             finished: self.rhythm.finished(),
