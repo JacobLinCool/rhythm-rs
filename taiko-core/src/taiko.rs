@@ -104,6 +104,10 @@ impl Note for CalculatedNote {
     fn set_variant(&mut self, variant: impl Into<u16>) {
         self.inner.variant = TaikoNoteVariant::from(variant.into());
     }
+
+    fn matches_variant(&self, variant: impl Into<u16>) -> bool {
+        self.inner.matches_variant(variant)
+    }
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
