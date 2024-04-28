@@ -31,6 +31,10 @@ impl<T: Note> Rhythm<T> {
         self.time
     }
 
+    pub fn availables(&self) -> &[T] {
+        &self.availables
+    }
+
     pub fn forward(&mut self, time: impl Into<f64>) -> Vec<T> {
         self.time += time.into();
         self.update_availables()
