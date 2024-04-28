@@ -404,11 +404,12 @@ impl App {
                             self.output = taiko.forward(input);
                             if self.output.judgement.is_some() {
                                 self.last_hit = match self.output.judgement.unwrap() {
-                                    Judgement::Ok => 1,
-                                    Judgement::Great => 2,
+                                    Judgement::Great => 1,
+                                    Judgement::Ok => 2,
+                                    Judgement::Miss => 3,
                                     _ => 0,
                                 };
-                                self.last_hit_show = 4;
+                                self.last_hit_show = 6;
                             }
                         }
                     }
@@ -454,7 +455,11 @@ impl App {
                             f.render_widget(topbar_right, chunks[0]);
 
                             let topbar_left_content = if song_name.is_none() {
-                                format!("Taiko on Terminal! v{} {}", env!("CARGO_PKG_VERSION"), env!("VERGEN_GIT_DESCRIBE"))
+                                format!(
+                                    "Taiko on Terminal! v{} {}",
+                                    env!("CARGO_PKG_VERSION"),
+                                    env!("VERGEN_GIT_DESCRIBE")
+                                )
                             } else if self.taiko.is_none() {
                                 song_name.unwrap().to_string()
                             } else {
@@ -556,11 +561,33 @@ impl App {
                                     .y_bounds([0.0, 1.0]);
                                 f.render_widget(guage, guage_chunk);
 
+                                let hit_color = if self.last_hit_show == 0 {
+                                    Color::Black
+                                } else {
+                                    match self.last_hit {
+                                        1 => Color::Yellow,
+                                        2 => Color::White,
+                                        3 => Color::Blue,
+                                        _ => Color::Black,
+                                    }
+                                };
+                                if self.last_hit_show > 0 {
+                                    self.last_hit_show -= 1;
+                                }
+
                                 let mut spans: Vec<Span> =
                                     vec![Span::raw(" "); game_zone.width as usize];
                                 let hit_span = (0.1 * game_zone.width as f64) as usize;
                                 spans[hit_span] =
                                     Span::styled(" ", Style::default().bg(Color::Green));
+                                if hit_span > 0 {
+                                    spans[hit_span - 1] =
+                                        Span::styled(" ", Style::default().bg(hit_color));
+                                }
+                                if hit_span < game_zone.width as usize - 1 {
+                                    spans[hit_span + 1] =
+                                        Span::styled(" ", Style::default().bg(hit_color));
+                                }
                                 for note in self.output.display.iter() {
                                     let pos = note.position(player_time);
                                     if pos.is_none() {
@@ -607,19 +634,15 @@ impl App {
 
                                 let mut spans: Vec<Span> =
                                     vec![Span::raw(" "); game_zone.width as usize];
-                                let hit_color = if self.last_hit_show == 0 {
-                                    Color::Black
-                                } else {
-                                    match self.last_hit {
-                                        1 => Color::White,
-                                        2 => Color::Yellow,
-                                        _ => Color::Black,
-                                    }
-                                };
-                                if self.last_hit_show > 0 {
-                                    self.last_hit_show -= 1;
-                                }
                                 spans[hit_span] = Span::styled("|", Style::default().bg(hit_color));
+                                if hit_span > 0 {
+                                    spans[hit_span - 1] =
+                                        Span::styled(" ", Style::default().bg(hit_color));
+                                }
+                                if hit_span < game_zone.width as usize - 1 {
+                                    spans[hit_span + 1] =
+                                        Span::styled(" ", Style::default().bg(hit_color));
+                                }
                                 let hit_line = Line::from(spans);
 
                                 let paragraph =
