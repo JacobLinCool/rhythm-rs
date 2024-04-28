@@ -26,7 +26,7 @@ impl TJAParser {
         let mut bpm = 60;
         let mut scroll = 1.0;
         let mut measure = (4, 4);
-        let mut segments: Vec<(i32, Vec<char>)> = Vec::new();
+        let mut segments: Vec<(i32, f32, Vec<char>)> = Vec::new();
         let mut current_combo: Option<TaikoNote> = None;
 
         for line in tja_content.as_ref().lines() {
@@ -137,25 +137,29 @@ impl TJAParser {
                 }
             } else {
                 let data = line.strip_suffix(',');
-                let segment = (bpm, data.unwrap_or(line).chars().collect::<Vec<char>>());
+                let segment = (
+                    bpm,
+                    scroll,
+                    data.unwrap_or(line).chars().collect::<Vec<char>>(),
+                );
                 segments.push(segment);
 
                 if data.is_some() {
-                    let notes = segments.iter().map(|(_, s)| s.len()).sum::<usize>();
+                    let notes = segments.iter().map(|(_, _, s)| s.len()).sum::<usize>();
                     if notes == 0 {
                         if segments.is_empty() {
-                            segments.push((bpm, vec!['0']));
+                            segments.push((bpm, scroll, vec!['0']));
                         } else if segments.len() == 1 {
-                            segments.get_mut(0).unwrap().1.push('0');
+                            segments.get_mut(0).unwrap().2.push('0');
                         }
                     }
 
                     // #[cfg(debug_assertions)]
                     // println!("{:?}", segments);
 
-                    let notes = segments.iter().map(|(_, s)| s.len()).sum::<usize>();
+                    let notes = segments.iter().map(|(_, _, s)| s.len()).sum::<usize>();
 
-                    for (bpm, segment) in segments.iter() {
+                    for (bpm, scroll, segment) in segments.iter() {
                         let duration = (60.0 / *bpm as f64)
                             * (measure.0 as f64 / measure.1 as f64)
                             * (4.0 / notes as f64);
