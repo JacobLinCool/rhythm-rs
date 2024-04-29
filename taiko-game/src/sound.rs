@@ -53,6 +53,12 @@ pub(crate) trait SoundPlayer {
     /// Plays a sound effect.
     async fn play_effect(&mut self, effect: &SoundData);
 
+    /// Loads a background music.
+    async fn load_music(&mut self, music: &SoundData);
+
+    /// Plays a background music after loading it.
+    async fn play_loaded_music(&mut self);
+
     /// Plays a background music.
     async fn play_music(&mut self, music: &SoundData);
 
@@ -118,7 +124,7 @@ impl SoundPlayer for RodioSoundPlayer {
         self.controller.add(source);
     }
 
-    async fn play_music(&mut self, music: &SoundData) {
+    async fn load_music(&mut self, music: &SoundData) {
         let sink = self.sink.lock().await;
 
         let source = rodio::buffer::SamplesBuffer::new(
@@ -131,10 +137,18 @@ impl SoundPlayer for RodioSoundPlayer {
         sink.append(mixer);
         self.controller = controller;
         self.controller.add(source);
-
-        sink.play();
+        sink.pause();
         self.music_start = Some(Instant::now());
         self.music_time = 0.0;
+    }
+
+    async fn play_loaded_music(&mut self) {
+        self.resume_music().await
+    }
+
+    async fn play_music(&mut self, music: &SoundData) {
+        self.load_music(music).await;
+        self.play_loaded_music().await;
     }
 
     async fn play_music_from(&mut self, music: &SoundData, time: f64) {

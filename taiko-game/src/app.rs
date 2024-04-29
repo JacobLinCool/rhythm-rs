@@ -51,6 +51,7 @@ pub struct App {
     auto_play: Option<Vec<TaikoNote>>,
     auto_play_combo_sleep: u8,
     guage_color_change: i32,
+    enter_countdown: i16,
 }
 
 impl App {
@@ -105,6 +106,7 @@ impl App {
             auto_play: None,
             auto_play_combo_sleep: 0,
             guage_color_change: 0,
+            enter_countdown: 0,
         })
     }
 
@@ -167,6 +169,8 @@ impl App {
     }
 
     async fn enter_game(&mut self) -> Result<()> {
+        self.enter_countdown = self.args.tps as i16 * -3;
+
         let selected = self.course_selector.selected().unwrap_or(0);
         let mut course = self
             .song
@@ -198,7 +202,7 @@ impl App {
         self.taiko.replace(DefaultTaikoEngine::new(source));
 
         self.player.stop_music().await;
-        self.player.play_music(self.music.as_ref().unwrap()).await;
+        self.player.load_music(self.music.as_ref().unwrap()).await;
 
         Ok(())
     }
@@ -406,7 +410,18 @@ impl App {
                             self.ticks.remove(0);
                         }
 
-                        let player_time = self.player.get_music_time().await;
+                        if self.enter_countdown < 0 {
+                            self.enter_countdown += 1;
+                        } else if self.enter_countdown == 0 {
+                            self.player.play_loaded_music().await;
+                            self.enter_countdown = 1;
+                        }
+
+                        let player_time = if self.enter_countdown <= 0 {
+                            self.enter_countdown as f64 / self.args.tps as f64
+                        } else {
+                            self.player.get_music_time().await
+                        };
                         if self.taiko.is_some() {
                             let taiko = self.taiko.as_mut().unwrap();
 
@@ -480,7 +495,11 @@ impl App {
                         } else {
                             0.0
                         };
-                        let player_time = self.player.get_music_time().await;
+                        let player_time = if self.enter_countdown <= 0 {
+                            self.enter_countdown as f64 / self.args.tps as f64
+                        } else {
+                            self.player.get_music_time().await
+                        };
 
                         let song_name: Option<String> = if self.song.is_none() {
                             None
