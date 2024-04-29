@@ -173,13 +173,13 @@ Data directory: {data_dir_path}"
     )
 }
 
-pub fn read_shiftjis_or_utf8<P: AsRef<std::path::Path>>(path: P) -> Result<String> {
+pub fn read_utf8_or_shiftjis<P: AsRef<std::path::Path>>(path: P) -> Result<String> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
-    let encoding = if !encoding_rs::SHIFT_JIS.decode_without_bom_handling(&bytes).1 {
-        encoding_rs::SHIFT_JIS
-    } else {
+    let encoding = if !encoding_rs::UTF_8.decode_without_bom_handling(&bytes).1 {
         encoding_rs::UTF_8
+    } else {
+        encoding_rs::SHIFT_JIS
     };
 
     let (cow, _, _) = encoding.decode(&bytes);

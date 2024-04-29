@@ -20,7 +20,7 @@ use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA}
 use crate::assets::{DON_WAV, KAT_WAV};
 use crate::cli::AppArgs;
 use crate::sound::{SoundData, SoundPlayer};
-use crate::utils::read_shiftjis_or_utf8;
+use crate::utils::read_utf8_or_shiftjis;
 use crate::{action::Action, sound, tui};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +118,7 @@ impl App {
 
     async fn enter_course_menu(&mut self) -> Result<()> {
         let selected = self.song_selector.selected().unwrap_or(0);
-        let content = read_shiftjis_or_utf8(&self.songs[selected].1).unwrap();
+        let content = read_utf8_or_shiftjis(&self.songs[selected].1).unwrap();
         let parser = TJAParser::new();
         let mut song = parser
             .parse(content)
