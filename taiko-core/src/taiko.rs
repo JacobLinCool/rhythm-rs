@@ -1,7 +1,7 @@
 use rhythm_core::{Note, Rhythm};
 use tja::{TaikoNote, TaikoNoteVariant};
 
-use crate::constant::{GUAGE_MISS_FACTOR, RANGE_GREAT, RANGE_MISS, RANGE_OK};
+use crate::constant::{GUAGE_FULL_THRESHOLD, GUAGE_MISS_FACTOR, RANGE_GREAT, RANGE_MISS, RANGE_OK};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub enum Hit {
@@ -288,6 +288,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                 * GUAGE_MISS_FACTOR[self.difficulty as usize][self.level as usize];
         }
 
+        let full = GUAGE_FULL_THRESHOLD[self.difficulty as usize][self.level as usize];
         match judgement {
             Some(Judgement::Great) => {
                 self.score += self.scoreinit as u32;
@@ -295,7 +296,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                 self.current_combo += 1;
                 self.max_combo = self.max_combo.max(self.current_combo);
 
-                self.gauge += 1.0 / self.total_notes as f64;
+                self.gauge += 1.0 / self.total_notes as f64 / full;
             }
             Some(Judgement::Ok) => {
                 self.score += (self.scoreinit as u32) / 2;
@@ -304,13 +305,15 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                 self.max_combo = self.max_combo.max(self.current_combo);
 
                 self.gauge += (1.0 / self.total_notes as f64)
-                    * (if self.difficulty >= 3 { 0.5 } else { 0.75 });
+                    * (if self.difficulty >= 3 { 0.5 } else { 0.75 })
+                    / full;
             }
             Some(Judgement::Miss) => {
                 self.current_combo = 0;
 
                 self.gauge -= (1.0 / self.total_notes as f64)
-                    * GUAGE_MISS_FACTOR[self.difficulty as usize][self.level as usize];
+                    * GUAGE_MISS_FACTOR[self.difficulty as usize][self.level as usize]
+                    / full;
             }
             Some(Judgement::ComboHit) => {
                 self.score += 100;

@@ -8,7 +8,7 @@ use rodio::{source::Source, Decoder, OutputStream, Sink};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{fs, io, path::PathBuf, time::Instant};
-use taiko_core::constant::{COURSE_TYPE, RANGE_GREAT};
+use taiko_core::constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT};
 use tokio::sync::mpsc;
 
 use rhythm_core::Note;
@@ -50,6 +50,7 @@ pub struct App {
     hit: Option<Hit>,
     auto_play: Option<Vec<TaikoNote>>,
     auto_play_combo_sleep: u8,
+    guage_color_change: i32,
 }
 
 impl App {
@@ -103,6 +104,7 @@ impl App {
             hit: None,
             auto_play: None,
             auto_play_combo_sleep: 0,
+            guage_color_change: 0,
         })
     }
 
@@ -601,6 +603,38 @@ impl App {
                                 let guage_chunk = vertical_chunks[0];
                                 let game_zone = vertical_chunks[1];
 
+                                let difficulty = self.course.as_ref().unwrap().course as usize;
+                                let level = self.course.as_ref().unwrap().level.unwrap() as usize;
+                                let guage_color = if self.output.gauge == 1.0 {
+                                    self.guage_color_change += 1;
+                                    if self.guage_color_change >= 20 {
+                                        self.guage_color_change = 0;
+                                    }
+                                    if self.guage_color_change >= 15 {
+                                        Color::Cyan
+                                    } else if self.guage_color_change >= 10 {
+                                        Color::Yellow
+                                    } else if self.guage_color_change >= 5 {
+                                        Color::Green
+                                    } else {
+                                        Color::White
+                                    }
+                                } else if self.output.gauge
+                                    >= (GUAGE_PASS_THRESHOLD[difficulty][level]
+                                        / GUAGE_FULL_THRESHOLD[difficulty][level])
+                                {
+                                    Color::Yellow
+                                } else {
+                                    Color::White
+                                };
+
+                                let guage_splits = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints(
+                                        [Constraint::Fill(1), Constraint::Length(4)].as_ref(),
+                                    )
+                                    .split(guage_chunk);
+
                                 let guage = Canvas::default()
                                     .paint(|ctx| {
                                         ctx.draw(&Rectangle {
@@ -608,12 +642,22 @@ impl App {
                                             y: 0.0,
                                             width: self.output.gauge,
                                             height: 1.0,
-                                            color: Color::White,
+                                            color: guage_color,
                                         });
                                     })
                                     .x_bounds([0.0, 1.0])
                                     .y_bounds([0.0, 1.0]);
-                                f.render_widget(guage, guage_chunk);
+                                f.render_widget(guage, guage_splits[0]);
+
+                                let soul = Text::styled(
+                                    " 魂",
+                                    Style::default().fg(if self.output.gauge == 1.0 {
+                                        guage_color
+                                    } else {
+                                        Color::Black
+                                    }),
+                                );
+                                f.render_widget(soul, guage_splits[1]);
 
                                 let hit_color = if self.last_hit_show == 0 {
                                     Color::Black
