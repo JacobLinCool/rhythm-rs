@@ -23,10 +23,10 @@ impl TJAParser {
         let mut course: Option<TJACourse> = None;
         let mut balloons = Vec::new();
         let mut time_ms = 0.0;
-        let mut bpm = 60;
+        let mut bpm = 60.0;
         let mut scroll = 1.0;
         let mut measure = (4, 4);
-        let mut segments: Vec<(i32, f32, Vec<char>)> = Vec::new();
+        let mut segments: Vec<(f32, f32, Vec<char>)> = Vec::new();
         let mut current_combo: Option<TaikoNote> = None;
 
         for line in tja_content.as_ref().lines() {
@@ -56,7 +56,7 @@ impl TJAParser {
                             course = Some(TJACourse::new(parse_course(value)));
                             balloons.clear();
                             time_ms = 0.0;
-                            bpm = tja.header.bpm.unwrap_or(60);
+                            bpm = tja.header.bpm.unwrap_or(60.0);
                             scroll = 1.0;
                             measure = (4, 4);
                             segments.clear();
@@ -111,7 +111,7 @@ impl TJAParser {
                         bpm = value
                             .unwrap()
                             .parse()
-                            .unwrap_or(tja.header.bpm.unwrap_or(0));
+                            .unwrap_or(tja.header.bpm.unwrap_or(0.0));
                     }
                     "MEASURE" => {
                         let (beat, note) = value.unwrap().split_once('/').unwrap();

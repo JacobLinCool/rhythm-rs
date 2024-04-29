@@ -20,7 +20,7 @@ pub struct TJAHeader {
     /// The subtitle of the song.
     pub subtitle: Option<String>,
     /// The BPM of the song.
-    pub bpm: Option<i32>,
+    pub bpm: Option<f32>,
     /// The wave file of the song.
     pub wave: Option<String>,
     /// The offset of the song.
