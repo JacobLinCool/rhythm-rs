@@ -1,7 +1,7 @@
 [package]
 name = "taiko-game"
 description = "A taiko game written in Rust."
-version = "0.0.1"
+version = "0.0.2"
 license = "MIT"
 authors = ["JacobLinCool <jacob@csie.cool>"]
 homepage = "https://github.com/JacobLinCool/rhythm-rs"

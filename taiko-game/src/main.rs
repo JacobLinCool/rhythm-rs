@@ -11,7 +11,7 @@ pub mod tui;
 pub mod utils;
 
 use clap::Parser;
-use cli::Cli;
+use cli::AppArgs;
 use color_eyre::eyre::Result;
 
 use crate::{
@@ -24,8 +24,8 @@ async fn tokio_main() -> Result<()> {
 
     initialize_panic_handler()?;
 
-    let args = Cli::parse();
-    let mut app = App::new(args.songdir, args.fps)?;
+    let args = AppArgs::parse();
+    let mut app = App::new(args)?;
     app.run().await?;
 
     Ok(())

@@ -6,7 +6,7 @@ use crate::utils::version;
 
 #[derive(Parser, Debug)]
 #[command(author, version = version(), about)]
-pub struct Cli {
+pub struct AppArgs {
     #[arg(
         short,
         long,
@@ -23,5 +23,14 @@ pub struct Cli {
         help = "The tick rate of the game",
         default_value_t = 200
     )]
-    pub fps: u8,
+    pub tps: u8,
+
+    #[arg(
+        short,
+        long,
+        value_name = "AUTO",
+        help = "Enable auto mode",
+        default_value_t = false
+    )]
+    pub auto: bool,
 }

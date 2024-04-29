@@ -8,7 +8,7 @@ use rodio::{source::Source, Decoder, OutputStream, Sink};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{fs, io, path::PathBuf, time::Instant};
-use taiko_core::constant::COURSE_TYPE;
+use taiko_core::constant::{COURSE_TYPE, RANGE_GREAT};
 use tokio::sync::mpsc;
 
 use rhythm_core::Note;
@@ -18,6 +18,7 @@ use taiko_core::{
 use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA};
 
 use crate::assets::{DON_WAV, KAT_WAV};
+use crate::cli::AppArgs;
 use crate::sound::{SoundData, SoundPlayer};
 use crate::{action::Action, sound, tui};
 
@@ -29,6 +30,7 @@ pub enum Page {
 }
 
 pub struct App {
+    args: AppArgs,
     songs: Vec<(String, PathBuf)>,
     song: Option<TJA>,
     song_selector: ListState,
@@ -37,7 +39,6 @@ pub struct App {
     player: sound::RodioSoundPlayer,
     sounds: HashMap<String, sound::SoundData>,
     music: Option<sound::SoundData>,
-    fps: u8,
     pending_quit: bool,
     pending_suspend: bool,
     ticks: Vec<Instant>,
@@ -46,17 +47,19 @@ pub struct App {
     last_hit_show: i32,
     output: OutputState,
     hit: Option<Hit>,
+    auto_play: Option<Vec<TaikoNote>>,
+    auto_play_combo_sleep: u8,
 }
 
 impl App {
-    pub fn new(dir: PathBuf, fps: u8) -> Result<Self> {
+    pub fn new(args: AppArgs) -> Result<Self> {
         let mut song_selector = ListState::default();
         song_selector.select(Some(0));
 
         let mut course_selector = ListState::default();
         course_selector.select(None);
 
-        let songs = list_songs(dir)?;
+        let songs = list_songs(args.songdir.clone())?;
         if songs.is_empty() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "No songs found").into());
         }
@@ -72,8 +75,8 @@ impl App {
         );
 
         Ok(Self {
+            args,
             songs,
-            fps,
             song: None,
             song_selector,
             course: None,
@@ -97,6 +100,8 @@ impl App {
                 display: vec![],
             },
             hit: None,
+            auto_play: None,
+            auto_play_combo_sleep: 0,
         })
     }
 
@@ -181,6 +186,10 @@ impl App {
             scorediff: course.scorediff,
             notes: course.notes.clone(),
         };
+
+        if self.args.auto {
+            self.auto_play.replace(course.notes.clone());
+        }
 
         self.course.replace(course);
         self.taiko.replace(DefaultTaikoEngine::new(source));
@@ -365,7 +374,9 @@ impl App {
     pub async fn run(&mut self) -> Result<()> {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
 
-        let mut tui = tui::Tui::new()?.tick_rate(self.fps.into()).frame_rate(60.0);
+        let mut tui = tui::Tui::new()?
+            .tick_rate(self.args.tps.into())
+            .frame_rate(60.0);
         tui.enter()?;
 
         loop {
@@ -396,6 +407,48 @@ impl App {
                         if self.taiko.is_some() {
                             let taiko = self.taiko.as_mut().unwrap();
 
+                            if self.auto_play.is_some() {
+                                while let Some(note) = self.auto_play.as_mut().unwrap().first() {
+                                    if player_time > note.start + note.duration {
+                                        self.auto_play.as_mut().unwrap().remove(0);
+                                        continue;
+                                    }
+
+                                    if note.variant == TaikoNoteVariant::Don {
+                                        if (note.start - player_time).abs() < RANGE_GREAT {
+                                            self.player.play_effect(&self.sounds["don"]).await;
+                                            self.hit.replace(Hit::Don);
+                                            self.auto_play.as_mut().unwrap().remove(0);
+                                        } else {
+                                            break;
+                                        }
+                                    } else if note.variant == TaikoNoteVariant::Kat {
+                                        if (note.start - player_time).abs() < RANGE_GREAT {
+                                            self.player.play_effect(&self.sounds["kat"]).await;
+                                            self.hit.replace(Hit::Kat);
+                                            self.auto_play.as_mut().unwrap().remove(0);
+                                        } else {
+                                            break;
+                                        }
+                                    } else if note.variant == TaikoNoteVariant::Both {
+                                        if player_time > note.start {
+                                            if self.auto_play_combo_sleep == 0 {
+                                                self.player.play_effect(&self.sounds["don"]).await;
+                                                self.hit.replace(Hit::Don);
+                                                self.auto_play_combo_sleep = self.args.tps / 20;
+                                            } else {
+                                                self.auto_play_combo_sleep -= 1;
+                                            }
+                                            break;
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        self.auto_play.as_mut().unwrap().remove(0);
+                                    }
+                                }
+                            }
+
                             let input: InputState<Hit> = InputState {
                                 time: player_time,
                                 hit: self.hit.take(),
@@ -418,7 +471,7 @@ impl App {
                     Action::Resume => self.pending_suspend = false,
                     Action::Resize(w, h) => tui.resize(Rect::new(0, 0, w, h))?,
                     Action::Render => {
-                        let fps = if !self.ticks.is_empty() {
+                        let tps = if !self.ticks.is_empty() {
                             self.ticks.len() as f64
                                 / (self.ticks[self.ticks.len() - 1] - self.ticks[0]).as_secs_f64()
                         } else {
@@ -449,7 +502,7 @@ impl App {
                                 .split(size);
 
                             let topbar_right = Block::default().title(
-                                block::Title::from(format!("{:.2} tps", fps).dim())
+                                block::Title::from(format!("{:.2} tps", tps).dim())
                                     .alignment(Alignment::Right),
                             );
                             f.render_widget(topbar_right, chunks[0]);
@@ -659,8 +712,8 @@ impl App {
                 tui.suspend()?;
                 action_tx.send(Action::Resume)?;
                 tui = tui::Tui::new()?
-                    .tick_rate(self.fps.into())
-                    .frame_rate(self.fps.into());
+                    .tick_rate(self.args.tps.into())
+                    .frame_rate(self.args.tps.into());
                 tui.enter()?;
             } else if self.pending_quit {
                 tui.stop()?;
