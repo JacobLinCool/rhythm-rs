@@ -172,3 +172,16 @@ Config directory: {config_dir_path}
 Data directory: {data_dir_path}"
     )
 }
+
+pub fn read_shiftjis_or_utf8<P: AsRef<std::path::Path>>(path: P) -> Result<String> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let encoding = if !encoding_rs::SHIFT_JIS.decode_without_bom_handling(&bytes).1 {
+        encoding_rs::SHIFT_JIS
+    } else {
+        encoding_rs::UTF_8
+    };
+
+    let (cow, _, _) = encoding.decode(&bytes);
+    Ok(cow.into_owned())
+}

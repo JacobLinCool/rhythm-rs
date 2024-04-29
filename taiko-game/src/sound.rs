@@ -15,7 +15,8 @@ impl SoundData {
     pub fn load_from_path(
         file_path: impl AsRef<Path>,
     ) -> Result<Self, rodio::decoder::DecoderError> {
-        let file = File::open(file_path).expect("Failed to open file");
+        let file = File::open(&file_path)
+            .expect(format!("Failed to open file: {:?}", file_path.as_ref()).as_str());
         Self::load_from_file(file)
     }
 
