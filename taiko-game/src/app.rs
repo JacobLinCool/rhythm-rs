@@ -184,7 +184,7 @@ impl App {
 
         let source = GameSource {
             difficulty: course.course as u8,
-            level: course.level.unwrap() as u8,
+            level: course.level.unwrap_or(0) as u8,
             scoreinit: course.scoreinit,
             scorediff: course.scorediff,
             notes: course.notes.clone(),
@@ -565,9 +565,13 @@ impl App {
                                     format!(
                                         "{}",
                                         if course.course < COURSE_TYPE.len() as i32 {
-                                            COURSE_TYPE[course.course as usize]
+                                            format!(
+                                                "{:<8} ({})",
+                                                COURSE_TYPE[course.course as usize],
+                                                course.level.unwrap_or(0)
+                                            )
                                         } else {
-                                            "Unknown"
+                                            "Unknown".to_owned()
                                         }
                                     )
                                 });
@@ -575,7 +579,7 @@ impl App {
                                     .block(
                                         Block::default()
                                             .borders(Borders::ALL)
-                                            .title("Select a Course"),
+                                            .title("Select a Difficulty"),
                                     )
                                     .highlight_style(
                                         Style::default()
@@ -604,7 +608,8 @@ impl App {
                                 let game_zone = vertical_chunks[1];
 
                                 let difficulty = self.course.as_ref().unwrap().course as usize;
-                                let level = self.course.as_ref().unwrap().level.unwrap() as usize;
+                                let level =
+                                    self.course.as_ref().unwrap().level.unwrap_or(0) as usize;
                                 let guage_color = if self.output.gauge == 1.0 {
                                     self.guage_color_change += 1;
                                     if self.guage_color_change >= 20 {
