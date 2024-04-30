@@ -62,6 +62,7 @@ pub enum TaikoNoteType {
     Yam,
     GogoStart,
     GogoEnd,
+    BarLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]

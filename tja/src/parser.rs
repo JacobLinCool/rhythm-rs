@@ -136,15 +136,15 @@ impl TJAParser {
                     _ => {}
                 }
             } else {
-                let data = line.strip_suffix(',');
+                let last_part = line.strip_suffix(',');
                 let segment = (
                     bpm,
                     scroll,
-                    data.unwrap_or(line).chars().collect::<Vec<char>>(),
+                    last_part.unwrap_or(line).chars().collect::<Vec<char>>(),
                 );
                 segments.push(segment);
 
-                if data.is_some() {
+                if last_part.is_some() {
                     let notes = segments.iter().map(|(_, _, s)| s.len()).sum::<usize>();
                     if notes == 0 {
                         if segments.is_empty() {
@@ -159,13 +159,24 @@ impl TJAParser {
 
                     let notes = segments.iter().map(|(_, _, s)| s.len()).sum::<usize>();
 
+                    let mut first = true;
                     for (bpm, scroll, segment) in segments.iter() {
                         let duration = (60.0 / *bpm as f64)
                             * (measure.0 as f64 / measure.1 as f64)
                             * (4.0 / notes as f64);
 
-                        // #[cfg(debug_assertions)]
-                        // println!("  {:?}", duration);
+                        // bar line
+                        if first {
+                            course.as_mut().unwrap().notes.push(TaikoNote {
+                                start: time_ms,
+                                duration: 0.0,
+                                volume: 0,
+                                variant: TaikoNoteVariant::Invisible,
+                                note_type: TaikoNoteType::BarLine,
+                                speed: bpm * scroll,
+                            });
+                            first = false;
+                        }
 
                         for c in segment.iter() {
                             match c {
