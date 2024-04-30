@@ -52,6 +52,8 @@ pub struct App {
     auto_play_combo_sleep: u8,
     guage_color_change: i32,
     enter_countdown: i16,
+    last_hit_type: Option<Hit>,
+    hit_show: i32,
 }
 
 impl App {
@@ -107,6 +109,8 @@ impl App {
             auto_play_combo_sleep: 0,
             guage_color_change: 0,
             enter_countdown: 0,
+            last_hit_type: None,
+            hit_show: 0,
         })
     }
 
@@ -329,6 +333,8 @@ impl App {
                 self.player.play_effect(&self.sounds["don"]).await;
                 if self.taiko.is_some() {
                     self.hit.replace(Hit::Don);
+                    self.last_hit_type.replace(Hit::Don);
+                    self.hit_show = self.args.tps as i32 / 40;
                 }
             }
             KeyEvent {
@@ -371,6 +377,8 @@ impl App {
                 self.player.play_effect(&self.sounds["kat"]).await;
                 if self.taiko.is_some() {
                     self.hit.replace(Hit::Kat);
+                    self.last_hit_type.replace(Hit::Kat);
+                    self.hit_show = self.args.tps as i32 / 40;
                 }
             }
             _ => {}
@@ -436,6 +444,8 @@ impl App {
                                         if (note.start - player_time).abs() < RANGE_GREAT {
                                             self.player.play_effect(&self.sounds["don"]).await;
                                             self.hit.replace(Hit::Don);
+                                            self.last_hit_type.replace(Hit::Don);
+                                            self.hit_show = self.args.tps as i32 / 40;
                                             self.auto_play.as_mut().unwrap().remove(0);
                                         } else {
                                             break;
@@ -444,6 +454,8 @@ impl App {
                                         if (note.start - player_time).abs() < RANGE_GREAT {
                                             self.player.play_effect(&self.sounds["kat"]).await;
                                             self.hit.replace(Hit::Kat);
+                                            self.last_hit_type.replace(Hit::Kat);
+                                            self.hit_show = self.args.tps as i32 / 40;
                                             self.auto_play.as_mut().unwrap().remove(0);
                                         } else {
                                             break;
@@ -453,6 +465,8 @@ impl App {
                                             if self.auto_play_combo_sleep == 0 {
                                                 self.player.play_effect(&self.sounds["don"]).await;
                                                 self.hit.replace(Hit::Don);
+                                                self.last_hit_type.replace(Hit::Don);
+                                                self.hit_show = self.args.tps as i32 / 40;
                                                 self.auto_play_combo_sleep = self.args.tps / 20;
                                             } else {
                                                 self.auto_play_combo_sleep -= 1;
@@ -754,9 +768,23 @@ impl App {
 
                                 let note_line = Line::from(spans);
 
+                                let hit_reflection_color =
+                                    if self.last_hit_type.is_some() && self.hit_show > 0 {
+                                        self.hit_show -= 1;
+                                        match self.last_hit_type.as_ref().unwrap() {
+                                            Hit::Don => Color::Red,
+                                            Hit::Kat => Color::Cyan,
+                                        }
+                                    } else {
+                                        Color::White
+                                    };
+
                                 let mut spans: Vec<Span> =
                                     vec![Span::raw(" "); game_zone.width as usize];
-                                spans[hit_span] = Span::styled("|", Style::default().bg(hit_color));
+                                spans[hit_span] = Span::styled(
+                                    "|",
+                                    Style::default().fg(hit_reflection_color).bg(hit_color),
+                                );
                                 if hit_span > 0 {
                                     spans[hit_span - 1] =
                                         Span::styled(" ", Style::default().bg(hit_color));
