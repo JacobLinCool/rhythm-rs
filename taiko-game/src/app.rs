@@ -49,7 +49,7 @@ pub struct App {
     output: OutputState,
     hit: Option<Hit>,
     auto_play: Option<Vec<TaikoNote>>,
-    auto_play_combo_sleep: u8,
+    auto_play_combo_sleep: u16,
     guage_color_change: i32,
     enter_countdown: i16,
     last_hit_type: Option<Hit>,

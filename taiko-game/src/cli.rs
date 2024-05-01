@@ -23,7 +23,7 @@ pub struct AppArgs {
         help = "The tick rate of the game",
         default_value_t = 200
     )]
-    pub tps: u8,
+    pub tps: u16,
 
     #[arg(
         short,
