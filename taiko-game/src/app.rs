@@ -1,15 +1,21 @@
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use kira::{
+    manager::{backend::DefaultBackend, AudioManager, AudioManagerSettings},
+    sound::static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
+    track::{TrackBuilder, TrackHandle},
+    tween::Tween,
+};
 use ratatui::prelude::Rect;
 use ratatui::widgets::canvas::{Canvas, Rectangle};
 use ratatui::{prelude::*, widgets::*};
 use rhythm_core::Rhythm;
-use rodio::{source::Source, Decoder, OutputStream, Sink};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{de, Deserialize, Serialize};
+use std::{collections::HashMap, io::Cursor, time::Duration};
 use std::{fs, io, path::PathBuf, time::Instant};
 use taiko_core::constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT};
 use tokio::sync::mpsc;
+use tracing::instrument::WithSubscriber;
 
 use rhythm_core::Note;
 use taiko_core::{
@@ -19,9 +25,8 @@ use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA}
 
 use crate::assets::{DON_WAV, KAT_WAV};
 use crate::cli::AppArgs;
-use crate::sound::{SoundData, SoundPlayer};
 use crate::utils::read_utf8_or_shiftjis;
-use crate::{action::Action, sound, tui};
+use crate::{action::Action, tui};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
@@ -37,9 +42,10 @@ pub struct App {
     song_selector: ListState,
     course: Option<TJACourse>,
     course_selector: ListState,
-    player: sound::RodioSoundPlayer,
-    sounds: HashMap<String, sound::SoundData>,
-    music: Option<sound::SoundData>,
+    player: AudioManager,
+    sounds: HashMap<String, StaticSoundData>,
+    effect_track: TrackHandle,
+    playing: Option<StaticSoundHandle>,
     pending_quit: bool,
     pending_suspend: bool,
     ticks: Vec<Instant>,
@@ -69,14 +75,23 @@ impl App {
             return Err(io::Error::new(io::ErrorKind::NotFound, "No songs found").into());
         }
 
+        let mut player = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())?;
+        let effect_track = player.add_sub_track(TrackBuilder::new())?;
+
         let mut sounds = HashMap::new();
         sounds.insert(
             "don".to_owned(),
-            SoundData::load_from_buffer(DON_WAV.to_vec())?,
+            StaticSoundData::from_cursor(
+                Cursor::new(DON_WAV.to_vec()),
+                StaticSoundSettings::default(),
+            )?,
         );
         sounds.insert(
             "kat".to_owned(),
-            SoundData::load_from_buffer(KAT_WAV.to_vec())?,
+            StaticSoundData::from_cursor(
+                Cursor::new(KAT_WAV.to_vec()),
+                StaticSoundSettings::default(),
+            )?,
         );
 
         Ok(Self {
@@ -86,9 +101,10 @@ impl App {
             song_selector,
             course: None,
             course_selector,
-            player: sound::RodioSoundPlayer::new().unwrap(),
+            player,
+            effect_track,
             sounds,
-            music: None,
+            playing: None,
             pending_quit: false,
             pending_suspend: false,
             ticks: Vec::new(),
@@ -124,6 +140,33 @@ impl App {
         }
     }
 
+    fn music_path(&self) -> Result<PathBuf> {
+        if let Some(song) = &self.song {
+            let fallback_ogg = self.songs[self.song_selector.selected().unwrap()]
+                .1
+                .with_extension("ogg");
+            let rel = song
+                .header
+                .wave
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(
+                    fallback_ogg
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            Ok(self.songs[self.song_selector.selected().unwrap()]
+                .1
+                .parent()
+                .unwrap()
+                .join(rel))
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, "No song is available").into())
+        }
+    }
+
     async fn enter_course_menu(&mut self) -> Result<()> {
         let selected = self.song_selector.selected().unwrap_or(0);
         let content = read_utf8_or_shiftjis(&self.songs[selected].1).unwrap();
@@ -132,44 +175,27 @@ impl App {
             .parse(content)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         song.courses.sort_by_key(|course| course.course);
-
-        let fallback_ogg = self.songs[selected].1.with_extension("ogg");
-        let rel = song
-            .header
-            .wave
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(
-                fallback_ogg
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        let path = self.songs[selected].1.parent().unwrap().join(rel);
-
-        self.music.replace(sound::SoundData::load_from_path(path)?);
         self.song.replace(song);
-        self.player
-            .play_music_from(
-                self.music.as_ref().unwrap(),
-                self.song
-                    .clone()
-                    .unwrap()
-                    .header
-                    .demostart
-                    .unwrap_or(0.0)
-                    .into(),
-            )
-            .await;
 
+        let path = self.music_path()?;
+
+        let demostart = self.song.clone().unwrap().header.demostart.unwrap_or(0.0) as f64;
+        let music =
+            StaticSoundData::from_file(path, StaticSoundSettings::new().loop_region(demostart..))?;
+        self.playing.replace(self.player.play(music)?);
+        self.player.resume(Tween::default())?;
         Ok(())
     }
 
-    async fn leave_course_menu(&mut self) {
+    async fn leave_course_menu(&mut self) -> Result<()> {
         self.song.take();
-        self.music.take();
-        self.player.stop_music().await;
+        if let Some(mut playing) = self.playing.take() {
+            playing.stop(Tween {
+                duration: Duration::from_secs_f32(0.5),
+                ..Default::default()
+            })?;
+        }
+        Ok(())
     }
 
     async fn enter_game(&mut self) -> Result<()> {
@@ -205,16 +231,28 @@ impl App {
         self.course.replace(course);
         self.taiko.replace(DefaultTaikoEngine::new(source));
 
-        self.player.stop_music().await;
-        self.player.load_music(self.music.as_ref().unwrap()).await;
+        if let Some(mut playing) = self.playing.take() {
+            playing.stop(Tween::default())?;
+        }
+        let music = StaticSoundData::from_file(
+            self.songs[self.song_selector.selected().unwrap()]
+                .1
+                .with_extension("ogg"),
+            StaticSoundSettings::default(),
+        )?;
+        self.player.pause(Tween::default())?;
+        self.playing.replace(self.player.play(music)?);
 
         Ok(())
     }
 
-    async fn leave_game(&mut self) {
+    async fn leave_game(&mut self) -> Result<()> {
         self.taiko.take();
         self.course.take();
-        self.player.stop_music().await;
+        if let Some(mut playing) = self.playing.take() {
+            playing.stop(Tween::default())?;
+        }
+        Ok(())
     }
 
     async fn handle_key_event(
@@ -233,10 +271,10 @@ impl App {
             } => match self.page() {
                 Page::SongSelect => action_tx.send(Action::Quit)?,
                 Page::CourseSelect => {
-                    self.leave_course_menu().await;
+                    self.leave_course_menu().await?;
                 }
                 Page::Game => {
-                    self.leave_game().await;
+                    self.leave_game().await?;
                     self.enter_course_menu().await?;
                 }
             },
@@ -330,7 +368,7 @@ impl App {
                 ..
             } => {
                 // don
-                self.player.play_effect(&self.sounds["don"]).await;
+                self.player.play(self.sounds["don"].clone())?;
                 if self.taiko.is_some() {
                     self.hit.replace(Hit::Don);
                     self.last_hit_type.replace(Hit::Don);
@@ -374,7 +412,7 @@ impl App {
                 ..
             } => {
                 // kat
-                self.player.play_effect(&self.sounds["kat"]).await;
+                self.player.play(self.sounds["kat"].clone())?;
                 if self.taiko.is_some() {
                     self.hit.replace(Hit::Kat);
                     self.last_hit_type.replace(Hit::Kat);
@@ -395,7 +433,13 @@ impl App {
         tui.enter()?;
 
         loop {
-            let player_time = self.player.get_music_time().await;
+            let player_time = if self.enter_countdown <= 0 {
+                self.enter_countdown as f64 / self.args.tps as f64
+            } else if let Some(music) = &self.playing {
+                music.position()
+            } else {
+                0.0
+            };
             if let Some(e) = tui.next().await {
                 match e {
                     tui::Event::Quit => action_tx.send(Action::Quit)?,
@@ -421,15 +465,10 @@ impl App {
                         if self.enter_countdown < 0 {
                             self.enter_countdown += 1;
                         } else if self.enter_countdown == 0 {
-                            self.player.play_loaded_music().await;
+                            self.player.resume(Tween::default())?;
                             self.enter_countdown = 1;
                         }
 
-                        let player_time = if self.enter_countdown <= 0 {
-                            self.enter_countdown as f64 / self.args.tps as f64
-                        } else {
-                            self.player.get_music_time().await
-                        };
                         if self.taiko.is_some() {
                             let taiko = self.taiko.as_mut().unwrap();
 
@@ -442,7 +481,7 @@ impl App {
 
                                     if note.variant == TaikoNoteVariant::Don {
                                         if (note.start - player_time).abs() < RANGE_GREAT {
-                                            self.player.play_effect(&self.sounds["don"]).await;
+                                            self.player.play(self.sounds["don"].clone())?;
                                             self.hit.replace(Hit::Don);
                                             self.last_hit_type.replace(Hit::Don);
                                             self.hit_show = self.args.tps as i32 / 40;
@@ -452,7 +491,7 @@ impl App {
                                         }
                                     } else if note.variant == TaikoNoteVariant::Kat {
                                         if (note.start - player_time).abs() < RANGE_GREAT {
-                                            self.player.play_effect(&self.sounds["kat"]).await;
+                                            self.player.play(self.sounds["kat"].clone())?;
                                             self.hit.replace(Hit::Kat);
                                             self.last_hit_type.replace(Hit::Kat);
                                             self.hit_show = self.args.tps as i32 / 40;
@@ -463,7 +502,7 @@ impl App {
                                     } else if note.variant == TaikoNoteVariant::Both {
                                         if player_time > note.start {
                                             if self.auto_play_combo_sleep == 0 {
-                                                self.player.play_effect(&self.sounds["don"]).await;
+                                                self.player.play(self.sounds["don"].clone())?;
                                                 self.hit.replace(Hit::Don);
                                                 self.last_hit_type.replace(Hit::Don);
                                                 self.hit_show = self.args.tps as i32 / 40;
@@ -508,11 +547,6 @@ impl App {
                                 / (self.ticks[self.ticks.len() - 1] - self.ticks[0]).as_secs_f64()
                         } else {
                             0.0
-                        };
-                        let player_time = if self.enter_countdown <= 0 {
-                            self.enter_countdown as f64 / self.args.tps as f64
-                        } else {
-                            self.player.get_music_time().await
                         };
 
                         let song_name: Option<String> = if self.song.is_none() {
