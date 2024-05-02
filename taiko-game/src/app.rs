@@ -24,10 +24,13 @@ use taiko_core::{
 };
 use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA};
 
-use crate::assets::{DON_WAV, KAT_WAV};
 use crate::cli::AppArgs;
 use crate::utils::read_utf8_or_shiftjis;
 use crate::{action::Action, tui};
+use crate::{
+    assets::{DON_WAV, KAT_WAV},
+    loader::{PlaylistLoader, Song},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
@@ -38,8 +41,8 @@ pub enum Page {
 
 pub struct App {
     args: AppArgs,
-    songs: Vec<(String, PathBuf)>,
-    song: Option<TJA>,
+    songs: Option<Vec<Song>>,
+    song: Option<Song>,
     song_selector: ListState,
     course: Option<TJACourse>,
     course_selector: ListState,
@@ -61,6 +64,7 @@ pub struct App {
     enter_countdown: i16,
     last_hit_type: Option<Hit>,
     hit_show: i32,
+    loader: PlaylistLoader,
 }
 
 impl App {
@@ -71,10 +75,7 @@ impl App {
         let mut course_selector = ListState::default();
         course_selector.select(None);
 
-        let songs = list_songs(&args.songdir)?;
-        if songs.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No songs found").into());
-        }
+        let loader = PlaylistLoader::new(args.songdir.clone());
 
         let mut player = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())?;
         let effect_track = player.add_sub_track(TrackBuilder::new())?;
@@ -97,7 +98,7 @@ impl App {
 
         Ok(Self {
             args,
-            songs,
+            songs: None,
             song: None,
             song_selector,
             course: None,
@@ -128,6 +129,7 @@ impl App {
             enter_countdown: 0,
             last_hit_type: None,
             hit_show: 0,
+            loader,
         })
     }
 
@@ -141,52 +143,25 @@ impl App {
         }
     }
 
-    fn music_path(&self) -> Result<PathBuf> {
-        if let Some(song) = &self.song {
-            let fallback_ogg = self.songs[self.song_selector.selected().unwrap()]
-                .1
-                .with_extension("ogg");
-            let rel = song
-                .header
-                .wave
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(
-                    fallback_ogg
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string(),
-                );
-            Ok(self.songs[self.song_selector.selected().unwrap()]
-                .1
-                .parent()
-                .unwrap()
-                .join(rel))
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, "No song is available").into())
-        }
+    async fn enter_song_menu(&mut self) -> Result<()> {
+        let songs = self.loader.list().await?;
+        self.songs.replace(songs);
+        Ok(())
     }
 
     async fn enter_course_menu(&mut self) -> Result<()> {
         let selected = self.song_selector.selected().unwrap_or(0);
-        let content = read_utf8_or_shiftjis(&self.songs[selected].1).unwrap();
-        let parser = TJAParser::new();
-        let mut song = parser
-            .parse(content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        song.courses.sort_by_key(|course| course.course);
-        self.song.replace(song);
+        let song = self.songs.as_ref().unwrap()[selected].clone();
 
-        let path = self.music_path()?;
-
-        let demostart = self.song.as_ref().unwrap().header.demostart.unwrap_or(0.0) as f64;
+        let demostart = song.tja().header.demostart.unwrap_or(0.0) as f64;
         let settings = StaticSoundSettings::new()
             .loop_region(demostart..)
             .playback_region(demostart..);
-        let music = StaticSoundData::from_file(path, settings)?;
-        self.playing.replace(self.player.play(music)?);
+        let music = song.music().await?;
+        self.playing
+            .replace(self.player.play(music.with_settings(settings))?);
         self.player.resume(Tween::default())?;
+        self.song.replace(song);
         Ok(())
     }
 
@@ -201,17 +176,12 @@ impl App {
     async fn enter_game(&mut self) -> Result<()> {
         self.enter_countdown = self.args.tps as i16 * -3;
 
-        let selected = self.course_selector.selected().unwrap_or(0);
-        let mut course = self
-            .song
-            .as_ref()
-            .unwrap()
-            .courses
-            .get(selected)
-            .unwrap()
-            .clone();
+        let song = self.song.as_ref().unwrap();
 
-        let offset = self.song.as_ref().unwrap().header.offset.unwrap_or(0.0) as f64;
+        let selected = self.course_selector.selected().unwrap_or(0);
+        let mut course = song.tja().courses.get(selected).unwrap().clone();
+
+        let offset = song.tja().header.offset.unwrap_or(0.0) as f64;
         for note in course.notes.iter_mut() {
             note.start -= offset;
         }
@@ -234,14 +204,8 @@ impl App {
         if let Some(mut playing) = self.playing.take() {
             playing.stop(Tween::default())?;
         }
-        let music = StaticSoundData::from_file(
-            self.songs[self.song_selector.selected().unwrap()]
-                .1
-                .with_extension("ogg"),
-            StaticSoundSettings::default(),
-        )?;
         self.player.pause(Tween::default())?;
-        self.playing.replace(self.player.play(music)?);
+        self.playing.replace(self.player.play(song.music().await?)?);
 
         Ok(())
     }
@@ -272,6 +236,7 @@ impl App {
                 Page::SongSelect => action_tx.send(Action::Quit)?,
                 Page::CourseSelect => {
                     self.leave_course_menu().await?;
+                    self.enter_song_menu().await?;
                 }
                 Page::Game => {
                     self.leave_game().await?;
@@ -286,12 +251,15 @@ impl App {
                 ..
             } => match self.page() {
                 Page::SongSelect => {
-                    select_prev(&mut self.song_selector, 0..self.songs.len())?;
+                    select_prev(
+                        &mut self.song_selector,
+                        0..self.songs.as_ref().unwrap().len(),
+                    )?;
                 }
                 Page::CourseSelect => {
                     select_prev(
                         &mut self.course_selector,
-                        0..self.song.as_ref().unwrap().courses.len(),
+                        0..self.song.as_ref().unwrap().tja().courses.len(),
                     )?;
                 }
                 _ => {}
@@ -305,12 +273,15 @@ impl App {
                 ..
             } => match self.page() {
                 Page::SongSelect => {
-                    select_next(&mut self.song_selector, 0..self.songs.len())?;
+                    select_next(
+                        &mut self.song_selector,
+                        0..self.songs.as_ref().unwrap().len(),
+                    )?;
                 }
                 Page::CourseSelect => {
                     select_next(
                         &mut self.course_selector,
-                        0..self.song.as_ref().unwrap().courses.len(),
+                        0..self.song.as_ref().unwrap().tja().courses.len(),
                     )?;
                 }
                 _ => {}
@@ -397,11 +368,14 @@ impl App {
             } => {
                 // kat (left)
                 if self.page() == Page::SongSelect {
-                    select_prev(&mut self.song_selector, 0..self.songs.len())?;
+                    select_prev(
+                        &mut self.song_selector,
+                        0..self.songs.as_ref().unwrap().len(),
+                    )?;
                 } else if self.page() == Page::CourseSelect {
                     select_prev(
                         &mut self.course_selector,
-                        0..self.song.as_ref().unwrap().courses.len(),
+                        0..self.song.as_ref().unwrap().tja().courses.len(),
                     )?;
                 } else {
                     self.player.play(self.sounds["kat"].clone())?;
@@ -434,11 +408,14 @@ impl App {
             } => {
                 // kat (right)
                 if self.page() == Page::SongSelect {
-                    select_next(&mut self.song_selector, 0..self.songs.len())?;
+                    select_next(
+                        &mut self.song_selector,
+                        0..self.songs.as_ref().unwrap().len(),
+                    )?;
                 } else if self.page() == Page::CourseSelect {
                     select_next(
                         &mut self.course_selector,
-                        0..self.song.as_ref().unwrap().courses.len(),
+                        0..self.song.as_ref().unwrap().tja().courses.len(),
                     )?;
                 } else {
                     self.player.play(self.sounds["kat"].clone())?;
@@ -463,6 +440,10 @@ impl App {
         tui.enter()?;
 
         loop {
+            if self.songs.is_none() {
+                self.enter_song_menu().await?;
+            }
+
             let player_time = if self.enter_countdown <= 0 {
                 self.enter_countdown as f64 / self.args.tps as f64
             } else if let Some(music) = &self.playing {
@@ -582,13 +563,7 @@ impl App {
                         let song_name: Option<String> = if self.song.is_none() {
                             None
                         } else {
-                            let fallback = &self.songs[self.song_selector.selected().unwrap()].0;
-                            let title = &self.song.as_ref().unwrap().header.title;
-                            if title.is_none() || title.as_ref().unwrap().is_empty() {
-                                Some(fallback.clone())
-                            } else {
-                                title.clone()
-                            }
+                            self.song.as_ref().unwrap().tja().header.title.clone()
                         };
 
                         tui.draw(|f| {
@@ -639,8 +614,13 @@ impl App {
                             f.render_widget(topbar_left, chunks[0]);
 
                             if self.song.is_none() {
-                                let names = self.songs.iter().map(|(name, _)| name.clone());
-                                let list = List::new(names)
+                                let items = self
+                                    .songs
+                                    .as_ref()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|s| s.tja().header.title.as_ref().unwrap().clone());
+                                let list = List::new(items)
                                     .block(
                                         Block::default()
                                             .borders(Borders::ALL)
@@ -652,13 +632,14 @@ impl App {
                                             .add_modifier(Modifier::BOLD),
                                     );
                                 self.song_selector.select(Some(
-                                    self.song_selector.selected().unwrap_or(0) % self.songs.len(),
+                                    self.song_selector.selected().unwrap_or(0)
+                                        % self.songs.as_ref().unwrap().len(),
                                 ));
 
                                 f.render_stateful_widget(list, chunks[1], &mut self.song_selector);
                             } else if self.taiko.is_none() {
                                 let song = self.song.as_ref().unwrap();
-                                let names = song.courses.iter().map(|course| {
+                                let names = song.tja().courses.iter().map(|course| {
                                     format!(
                                         "{}",
                                         if course.course < COURSE_TYPE.len() as i32 {
@@ -685,7 +666,7 @@ impl App {
                                     );
                                 self.course_selector.select(Some(
                                     self.course_selector.selected().unwrap_or(0)
-                                        % song.courses.len(),
+                                        % song.tja().courses.len(),
                                 ));
 
                                 f.render_stateful_widget(

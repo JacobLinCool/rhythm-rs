@@ -8,6 +8,7 @@ pub mod assets;
 pub mod cli;
 pub mod tui;
 pub mod utils;
+pub mod loader;
 
 use clap::Parser;
 use cli::AppArgs;
