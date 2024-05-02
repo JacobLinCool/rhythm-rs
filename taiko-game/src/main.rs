@@ -6,9 +6,9 @@ pub mod action;
 pub mod app;
 pub mod assets;
 pub mod cli;
+pub mod loader;
 pub mod tui;
 pub mod utils;
-pub mod loader;
 
 use clap::Parser;
 use cli::AppArgs;

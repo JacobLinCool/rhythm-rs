@@ -29,7 +29,9 @@ impl PlaylistLoader {
                 tja.courses.sort_by_key(|course| course.course);
 
                 if tja.header.title.is_none() || tja.header.title.as_ref().unwrap().is_empty() {
-                    tja.header.title.replace(path.file_stem().unwrap().to_string_lossy().to_string());
+                    tja.header
+                        .title
+                        .replace(path.file_stem().unwrap().to_string_lossy().to_string());
                 }
 
                 if tja.header.subtitle.is_none() {

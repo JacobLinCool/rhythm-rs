@@ -614,12 +614,26 @@ impl App {
                             f.render_widget(topbar_left, chunks[0]);
 
                             if self.song.is_none() {
-                                let items = self
-                                    .songs
-                                    .as_ref()
-                                    .unwrap()
-                                    .iter()
-                                    .map(|s| s.tja().header.title.as_ref().unwrap().clone());
+                                let items = self.songs.as_ref().unwrap().iter().map(|s| {
+                                    let title = Span::styled(
+                                        format!("{}", s.tja().header.title.as_ref().unwrap()),
+                                        Style::default(),
+                                    );
+                                    let tw = (f.size().width as f32 * 0.4) as usize;
+                                    let w = title.width();
+                                    let w = if w > tw { 0 } else { tw - w };
+                                    let subtitle = Span::styled(
+                                        format!(
+                                            " {}{}",
+                                            " ".repeat(w),
+                                            s.tja().header.subtitle.as_ref().unwrap()
+                                        ),
+                                        Style::default().dim(),
+                                    );
+
+                                    let line = Line::from(vec![title, subtitle]);
+                                    line
+                                });
                                 let list = List::new(items)
                                     .block(
                                         Block::default()
