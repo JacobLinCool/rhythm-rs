@@ -1,6 +1,7 @@
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kira::{
+    clock::{ClockHandle, ClockSpeed},
     manager::{backend::DefaultBackend, AudioManager, AudioManagerSettings},
     sound::static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
     track::{TrackBuilder, TrackHandle},
@@ -47,6 +48,7 @@ pub struct App {
     course: Option<TJACourse>,
     course_selector: ListState,
     player: AudioManager,
+    player_clock: ClockHandle,
     sounds: HashMap<String, StaticSoundData>,
     effect_track: TrackHandle,
     playing: Option<StaticSoundHandle>,
@@ -65,6 +67,7 @@ pub struct App {
     last_hit_type: Option<Hit>,
     hit_show: i32,
     loader: PlaylistLoader,
+    next_demo: Option<(Instant, usize)>,
 }
 
 impl App {
@@ -79,6 +82,7 @@ impl App {
 
         let mut player = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())?;
         let effect_track = player.add_sub_track(TrackBuilder::new())?;
+        let player_clock = player.add_clock(ClockSpeed::TicksPerSecond(10.0))?;
 
         let mut sounds = HashMap::new();
         sounds.insert(
@@ -104,6 +108,7 @@ impl App {
             course: None,
             course_selector,
             player,
+            player_clock,
             effect_track,
             sounds,
             playing: None,
@@ -130,6 +135,7 @@ impl App {
             last_hit_type: None,
             hit_show: 0,
             loader,
+            next_demo: None,
         })
     }
 
@@ -152,24 +158,15 @@ impl App {
     async fn enter_course_menu(&mut self) -> Result<()> {
         let selected = self.song_selector.selected().unwrap_or(0);
         let song = self.songs.as_ref().unwrap()[selected].clone();
-
-        let demostart = song.tja().header.demostart.unwrap_or(0.0) as f64;
-        let settings = StaticSoundSettings::new()
-            .loop_region(demostart..)
-            .playback_region(demostart..);
-        let music = song.music().await?;
-        self.playing
-            .replace(self.player.play(music.with_settings(settings))?);
-        self.player.resume(Tween::default())?;
         self.song.replace(song);
+        if self.playing.is_none() {
+            self.schedule_demo();
+        }
         Ok(())
     }
 
     async fn leave_course_menu(&mut self) -> Result<()> {
         self.song.take();
-        if let Some(mut playing) = self.playing.take() {
-            playing.stop(Tween::default())?;
-        }
         Ok(())
     }
 
@@ -219,6 +216,45 @@ impl App {
         Ok(())
     }
 
+    fn schedule_demo(&mut self) {
+        self.next_demo
+            .replace((Instant::now(), self.song_selector.selected().unwrap_or(0)));
+    }
+
+    async fn play_demo(&mut self) -> Result<()> {
+        if self.taiko.is_some() || self.next_demo.is_none() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.next_demo.as_ref().unwrap().0)
+            .as_secs_f64();
+        if elapsed < 0.5 {
+            return Ok(());
+        }
+
+        if self.next_demo.as_ref().unwrap().1 != self.song_selector.selected().unwrap_or(0) {
+            return Ok(());
+        }
+
+        let (_, selected) = self.next_demo.take().unwrap();
+        let song = self.songs.as_ref().unwrap()[selected].clone();
+
+        let demostart = song.tja().header.demostart.unwrap_or(0.0) as f64;
+        let settings = StaticSoundSettings::new()
+            .loop_region(demostart..)
+            .playback_region(demostart..);
+        let music = song.music().await?;
+        if let Some(mut playing) = self.playing.take() {
+            playing.stop(Tween::default())?;
+        }
+        self.playing
+            .replace(self.player.play(music.with_settings(settings))?);
+        self.player.resume(Tween::default())?;
+        Ok(())
+    }
+
     async fn handle_key_event(
         &mut self,
         key: &KeyEvent,
@@ -255,6 +291,7 @@ impl App {
                         &mut self.song_selector,
                         0..self.songs.as_ref().unwrap().len(),
                     )?;
+                    self.schedule_demo();
                 }
                 Page::CourseSelect => {
                     select_prev(
@@ -277,6 +314,7 @@ impl App {
                         &mut self.song_selector,
                         0..self.songs.as_ref().unwrap().len(),
                     )?;
+                    self.schedule_demo();
                 }
                 Page::CourseSelect => {
                     select_next(
@@ -372,6 +410,7 @@ impl App {
                         &mut self.song_selector,
                         0..self.songs.as_ref().unwrap().len(),
                     )?;
+                    self.schedule_demo();
                 } else if self.page() == Page::CourseSelect {
                     select_prev(
                         &mut self.course_selector,
@@ -412,6 +451,7 @@ impl App {
                         &mut self.song_selector,
                         0..self.songs.as_ref().unwrap().len(),
                     )?;
+                    self.schedule_demo();
                 } else if self.page() == Page::CourseSelect {
                     select_next(
                         &mut self.course_selector,
@@ -442,6 +482,7 @@ impl App {
         loop {
             if self.songs.is_none() {
                 self.enter_song_menu().await?;
+                self.schedule_demo();
             }
 
             let player_time = if self.enter_countdown <= 0 {
@@ -478,6 +519,10 @@ impl App {
                         } else if self.enter_countdown == 0 {
                             self.player.resume(Tween::default())?;
                             self.enter_countdown = 1;
+                        }
+
+                        if self.next_demo.is_some() {
+                            self.play_demo().await?;
                         }
 
                         if self.taiko.is_some() {
