@@ -181,8 +181,10 @@ impl App {
         let path = self.music_path()?;
 
         let demostart = self.song.clone().unwrap().header.demostart.unwrap_or(0.0) as f64;
-        let music =
-            StaticSoundData::from_file(path, StaticSoundSettings::new().loop_region(demostart..))?;
+        let settings = StaticSoundSettings::new()
+            .loop_region(demostart..)
+            .playback_region(demostart..);
+        let music = StaticSoundData::from_file(path, settings)?;
         self.playing.replace(self.player.play(music)?);
         self.player.resume(Tween::default())?;
         Ok(())
