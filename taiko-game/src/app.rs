@@ -5,6 +5,7 @@ use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
     track::{TrackBuilder, TrackHandle},
     tween::Tween,
+    Volume,
 };
 use ratatui::prelude::Rect;
 use ratatui::widgets::canvas::{Canvas, Rectangle};
@@ -83,14 +84,14 @@ impl App {
             "don".to_owned(),
             StaticSoundData::from_cursor(
                 Cursor::new(DON_WAV.to_vec()),
-                StaticSoundSettings::default(),
+                StaticSoundSettings::new().volume(args.sevol as f64 / 100.0),
             )?,
         );
         sounds.insert(
             "kat".to_owned(),
             StaticSoundData::from_cursor(
                 Cursor::new(KAT_WAV.to_vec()),
-                StaticSoundSettings::default(),
+                StaticSoundSettings::new().volume(args.sevol as f64 / 100.0),
             )?,
         );
 

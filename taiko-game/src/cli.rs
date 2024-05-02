@@ -33,4 +33,20 @@ pub struct AppArgs {
         default_value_t = false
     )]
     pub auto: bool,
+
+    #[arg(
+        long,
+        value_name = "SEVOL",
+        help = "The volume of the sound effects",
+        default_value_t = 100
+    )]
+    pub sevol: u8,
+
+    #[arg(
+        long,
+        value_name = "SONGVOL",
+        help = "The volume of the song music",
+        default_value_t = 100
+    )]
+    pub songvol: u8,
 }
