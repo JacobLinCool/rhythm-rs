@@ -12,7 +12,7 @@ use ratatui::widgets::canvas::{Canvas, Rectangle};
 use ratatui::{prelude::*, widgets::*};
 use rhythm_core::Rhythm;
 use serde::{de, Deserialize, Serialize};
-use std::{collections::HashMap, io::Cursor, time::Duration};
+use std::{collections::HashMap, io::Cursor, ops::Range, time::Duration};
 use std::{fs, io, path::PathBuf, time::Instant};
 use taiko_core::constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT};
 use tokio::sync::mpsc;
@@ -71,7 +71,7 @@ impl App {
         let mut course_selector = ListState::default();
         course_selector.select(None);
 
-        let songs = list_songs(args.songdir.clone())?;
+        let songs = list_songs(&args.songdir)?;
         if songs.is_empty() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "No songs found").into());
         }
@@ -180,7 +180,7 @@ impl App {
 
         let path = self.music_path()?;
 
-        let demostart = self.song.clone().unwrap().header.demostart.unwrap_or(0.0) as f64;
+        let demostart = self.song.as_ref().unwrap().header.demostart.unwrap_or(0.0) as f64;
         let settings = StaticSoundSettings::new()
             .loop_region(demostart..)
             .playback_region(demostart..);
@@ -193,10 +193,7 @@ impl App {
     async fn leave_course_menu(&mut self) -> Result<()> {
         self.song.take();
         if let Some(mut playing) = self.playing.take() {
-            playing.stop(Tween {
-                duration: Duration::from_secs_f32(0.5),
-                ..Default::default()
-            })?;
+            playing.stop(Tween::default())?;
         }
         Ok(())
     }
@@ -289,16 +286,13 @@ impl App {
                 ..
             } => match self.page() {
                 Page::SongSelect => {
-                    let selected = self.song_selector.selected().unwrap_or(0);
-                    self.song_selector
-                        .select(Some((selected + self.songs.len() - 1) % self.songs.len()));
+                    select_prev(&mut self.song_selector, 0..self.songs.len())?;
                 }
                 Page::CourseSelect => {
-                    let selected = self.course_selector.selected().unwrap_or(0);
-                    self.course_selector.select(Some(
-                        (selected + self.song.as_ref().unwrap().courses.len() - 1)
-                            % self.song.as_ref().unwrap().courses.len(),
-                    ));
+                    select_prev(
+                        &mut self.course_selector,
+                        0..self.song.as_ref().unwrap().courses.len(),
+                    )?;
                 }
                 _ => {}
             },
@@ -311,16 +305,13 @@ impl App {
                 ..
             } => match self.page() {
                 Page::SongSelect => {
-                    let selected = self.song_selector.selected().unwrap_or(0);
-                    self.song_selector
-                        .select(Some((selected + self.songs.len() + 1) % self.songs.len()));
+                    select_next(&mut self.song_selector, 0..self.songs.len())?;
                 }
                 Page::CourseSelect => {
-                    let selected = self.course_selector.selected().unwrap_or(0);
-                    self.course_selector.select(Some(
-                        (selected + self.song.as_ref().unwrap().courses.len() + 1)
-                            % self.song.as_ref().unwrap().courses.len(),
-                    ));
+                    select_next(
+                        &mut self.course_selector,
+                        0..self.song.as_ref().unwrap().courses.len(),
+                    )?;
                 }
                 _ => {}
             },
@@ -335,6 +326,10 @@ impl App {
                 }
             }
             KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            }
+            | KeyEvent {
                 code: KeyCode::Char('f'),
                 ..
             }
@@ -371,11 +366,17 @@ impl App {
                 ..
             } => {
                 // don
-                self.player.play(self.sounds["don"].clone())?;
-                if self.taiko.is_some() {
-                    self.hit.replace(Hit::Don);
-                    self.last_hit_type.replace(Hit::Don);
-                    self.hit_show = self.args.tps as i32 / 40;
+                if self.page() == Page::SongSelect {
+                    self.enter_course_menu().await?
+                } else if self.page() == Page::CourseSelect {
+                    self.enter_game().await?
+                } else {
+                    self.player.play(self.sounds["don"].clone())?;
+                    if self.taiko.is_some() {
+                        self.hit.replace(Hit::Don);
+                        self.last_hit_type.replace(Hit::Don);
+                        self.hit_show = self.args.tps as i32 / 40;
+                    }
                 }
             }
             KeyEvent {
@@ -393,8 +394,25 @@ impl App {
             | KeyEvent {
                 code: KeyCode::Char('t'),
                 ..
+            } => {
+                // kat (left)
+                if self.page() == Page::SongSelect {
+                    select_prev(&mut self.song_selector, 0..self.songs.len())?;
+                } else if self.page() == Page::CourseSelect {
+                    select_prev(
+                        &mut self.course_selector,
+                        0..self.song.as_ref().unwrap().courses.len(),
+                    )?;
+                } else {
+                    self.player.play(self.sounds["kat"].clone())?;
+                    if self.taiko.is_some() {
+                        self.hit.replace(Hit::Kat);
+                        self.last_hit_type.replace(Hit::Kat);
+                        self.hit_show = self.args.tps as i32 / 40;
+                    }
+                }
             }
-            | KeyEvent {
+            KeyEvent {
                 code: KeyCode::Char('y'),
                 ..
             }
@@ -414,12 +432,21 @@ impl App {
                 code: KeyCode::Char('o'),
                 ..
             } => {
-                // kat
-                self.player.play(self.sounds["kat"].clone())?;
-                if self.taiko.is_some() {
-                    self.hit.replace(Hit::Kat);
-                    self.last_hit_type.replace(Hit::Kat);
-                    self.hit_show = self.args.tps as i32 / 40;
+                // kat (right)
+                if self.page() == Page::SongSelect {
+                    select_next(&mut self.song_selector, 0..self.songs.len())?;
+                } else if self.page() == Page::CourseSelect {
+                    select_next(
+                        &mut self.course_selector,
+                        0..self.song.as_ref().unwrap().courses.len(),
+                    )?;
+                } else {
+                    self.player.play(self.sounds["kat"].clone())?;
+                    if self.taiko.is_some() {
+                        self.hit.replace(Hit::Kat);
+                        self.last_hit_type.replace(Hit::Kat);
+                        self.hit_show = self.args.tps as i32 / 40;
+                    }
                 }
             }
             _ => {}
@@ -556,8 +583,8 @@ impl App {
                             None
                         } else {
                             let fallback = &self.songs[self.song_selector.selected().unwrap()].0;
-                            let title = self.song.as_ref().unwrap().header.title.clone();
-                            if title.is_none() || title.clone().unwrap().is_empty() {
+                            let title = &self.song.as_ref().unwrap().header.title;
+                            if title.is_none() || title.as_ref().unwrap().is_empty() {
                                 Some(fallback.clone())
                             } else {
                                 title.clone()
@@ -859,10 +886,10 @@ impl App {
     }
 }
 
-fn list_songs(dir: PathBuf) -> io::Result<Vec<(String, PathBuf)>> {
+fn list_songs(dir: &PathBuf) -> io::Result<Vec<(String, PathBuf)>> {
     let mut songs = Vec::new();
     if dir.is_dir() {
-        for entry in fs::read_dir(&dir)? {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             if let Some(ext) = entry.path().extension() {
                 if ext == "tja" {
@@ -884,4 +911,16 @@ fn list_songs(dir: PathBuf) -> io::Result<Vec<(String, PathBuf)>> {
     }
 
     Ok(songs)
+}
+
+fn select_next(list: &mut ListState, range: Range<usize>) -> Result<()> {
+    list.select(Some((list.selected().unwrap_or(0) + 1) % range.end));
+    Ok(())
+}
+
+fn select_prev(list: &mut ListState, range: Range<usize>) -> Result<()> {
+    list.select(Some(
+        (list.selected().unwrap_or(0) + range.end - 1) % range.end,
+    ));
+    Ok(())
 }
