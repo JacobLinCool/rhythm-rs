@@ -25,13 +25,13 @@ use taiko_core::{
 };
 use tja::{TJACourse, TJAParser, TaikoNote, TaikoNoteType, TaikoNoteVariant, TJA};
 
-use crate::cli::AppArgs;
 use crate::utils::read_utf8_or_shiftjis;
 use crate::{action::Action, tui};
 use crate::{
     assets::{DON_WAV, KAT_WAV},
     loader::{PlaylistLoader, Song},
 };
+use crate::{cli::AppArgs, latency::LatencyMeter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
@@ -54,7 +54,7 @@ pub struct App {
     playing: Option<StaticSoundHandle>,
     pending_quit: bool,
     pending_suspend: bool,
-    ticks: Vec<Instant>,
+    lm: LatencyMeter,
     taiko: Option<DefaultTaikoEngine>,
     last_hit: i32,
     last_hit_show: i32,
@@ -114,7 +114,7 @@ impl App {
             playing: None,
             pending_quit: false,
             pending_suspend: false,
-            ticks: Vec::new(),
+            lm: LatencyMeter::new(),
             taiko: None,
             last_hit: 0,
             last_hit_show: 0,
@@ -485,6 +485,7 @@ impl App {
                 self.schedule_demo();
             }
 
+            let latency = self.lm.latency_ms();
             let player_time = if self.enter_countdown <= 0 {
                 self.enter_countdown as f64 / self.args.tps as f64
             } else if let Some(music) = &self.playing {
@@ -509,10 +510,7 @@ impl App {
                 }
                 match action {
                     Action::Tick => {
-                        self.ticks.push(Instant::now());
-                        if self.ticks.len() > 50 {
-                            self.ticks.remove(0);
-                        }
+                        self.lm.tick();
 
                         if self.enter_countdown < 0 {
                             self.enter_countdown += 1;
@@ -598,13 +596,6 @@ impl App {
                     Action::Resume => self.pending_suspend = false,
                     Action::Resize(w, h) => tui.resize(Rect::new(0, 0, w, h))?,
                     Action::Render => {
-                        let tps = if !self.ticks.is_empty() {
-                            self.ticks.len() as f64
-                                / (self.ticks[self.ticks.len() - 1] - self.ticks[0]).as_secs_f64()
-                        } else {
-                            0.0
-                        };
-
                         let song_name: Option<String> = if self.song.is_none() {
                             None
                         } else {
@@ -622,7 +613,7 @@ impl App {
                                 .split(size);
 
                             let topbar_right = Block::default().title(
-                                block::Title::from(format!("{:.2} tps", tps).dim())
+                                block::Title::from(format!("{:.2} ms", latency).dim())
                                     .alignment(Alignment::Right),
                             );
                             f.render_widget(topbar_right, chunks[0]);

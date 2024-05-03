@@ -6,3 +6,6 @@ members = [
     "taiko-core",
     "taiko-game",
 ]
+
+[profile.release]
+debug = true
