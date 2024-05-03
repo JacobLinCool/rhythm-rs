@@ -19,35 +19,32 @@ impl PlaylistLoader {
     pub async fn list(&self) -> Result<Vec<Song>> {
         let mut playlists = Vec::new();
 
-        for entry in glob(&format!("{}/**/*.tja", self.path.to_string_lossy())).unwrap() {
-            if let Ok(path) = entry {
-                let parser = TJAParser::new();
-                let mut tja = parser
-                    .parse(&read_utf8_or_shiftjis(&path)?)
-                    .map_err(|e| color_eyre::eyre::eyre!("Failed to parse TJA file: {}", e))?;
+        for path in glob(&format!("{}/**/*.tja", self.path.to_string_lossy()))?.flatten() {
+            let parser = TJAParser::new();
+            let mut tja = parser
+                .parse(&read_utf8_or_shiftjis(&path)?)
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to parse TJA file: {}", e))?;
 
-                tja.courses.sort_by_key(|course| course.course);
+            tja.courses.sort_by_key(|course| course.course);
 
-                if tja.header.title.is_none() || tja.header.title.as_ref().unwrap().is_empty() {
-                    tja.header
-                        .title
-                        .replace(path.file_stem().unwrap().to_string_lossy().to_string());
-                }
-
-                if tja.header.subtitle.is_none() {
-                    tja.header.subtitle.replace(String::new());
-                }
-
-                let music_path =
-                    if let Some(wave) = tja.header.wave.clone().filter(|s| !s.is_empty()) {
-                        let path = path.parent().unwrap().join(wave);
-                        path
-                    } else {
-                        path.with_extension("ogg")
-                    };
-
-                playlists.push(Song { tja, music_path });
+            if tja.header.title.is_none() || tja.header.title.as_ref().unwrap().is_empty() {
+                tja.header
+                    .title
+                    .replace(path.file_stem().unwrap().to_string_lossy().to_string());
             }
+
+            if tja.header.subtitle.is_none() {
+                tja.header.subtitle.replace(String::new());
+            }
+
+            let music_path = if let Some(wave) = tja.header.wave.clone().filter(|s| !s.is_empty()) {
+                let path = path.parent().unwrap().join(wave);
+                path
+            } else {
+                path.with_extension("ogg")
+            };
+
+            playlists.push(Song { tja, music_path });
         }
 
         Ok(playlists)
