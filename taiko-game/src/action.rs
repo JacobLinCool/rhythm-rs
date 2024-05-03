@@ -6,7 +6,9 @@ use serde::{
 };
 use strum::Display;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Display, Deserialize)]
+use crate::app::Page;
+
+#[derive(Debug, Clone, PartialEq, Eq, Display)]
 pub enum Action {
     Tick,
     Render,
@@ -17,4 +19,5 @@ pub enum Action {
     Refresh,
     Error(String),
     Help,
+    Switch(Page),
 }

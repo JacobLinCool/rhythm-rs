@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 use color_eyre::eyre::Result;
 use directories::ProjectDirs;
 use human_panic::metadata;
 use lazy_static::lazy_static;
+use ratatui::widgets::ListState;
 use tracing::error;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
@@ -184,4 +185,16 @@ pub fn read_utf8_or_shiftjis<P: AsRef<std::path::Path>>(path: P) -> Result<Strin
 
     let (cow, _, _) = encoding.decode(&bytes);
     Ok(cow.into_owned())
+}
+
+pub fn select_next(list: &mut ListState, range: Range<usize>) -> Result<()> {
+    list.select(Some((list.selected().unwrap_or(0) + 1) % range.end));
+    Ok(())
+}
+
+pub fn select_prev(list: &mut ListState, range: Range<usize>) -> Result<()> {
+    list.select(Some(
+        (list.selected().unwrap_or(0) + range.end - 1) % range.end,
+    ));
+    Ok(())
 }

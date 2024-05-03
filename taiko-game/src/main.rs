@@ -6,6 +6,7 @@ pub mod action;
 pub mod app;
 pub mod assets;
 pub mod cli;
+pub mod component;
 pub mod latency;
 pub mod loader;
 pub mod tui;

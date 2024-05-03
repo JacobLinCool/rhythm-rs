@@ -5,6 +5,12 @@ pub struct LatencyMeter {
     ticks: Vec<Instant>,
 }
 
+impl Default for LatencyMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatencyMeter {
     pub fn new() -> Self {
         Self {
