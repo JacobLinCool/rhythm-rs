@@ -131,6 +131,11 @@ impl Component for SongMenu {
     async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
         let songs = app.loader.list().await?;
         app.songs.replace(songs);
+
+        if app.playing.is_none() {
+            app.schedule_demo();
+        }
+
         Ok(())
     }
 }

@@ -16,7 +16,7 @@ use ratatui::{
 use rhythm_core::Note;
 use taiko_core::{
     constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT},
-    DefaultTaikoEngine, GameSource, Hit, InputState, Judgement, TaikoEngine,
+    DefaultTaikoEngine, Final, GameSource, Hit, InputState, Judgement, TaikoEngine,
 };
 use tja::{TaikoNote, TaikoNoteType, TaikoNoteVariant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -32,6 +32,8 @@ pub struct GameScreen {
     hit_show: i32,
     auto_play: Option<Vec<TaikoNote>>,
     auto_play_combo_sleep: u16,
+    last_player_time: f64,
+    player_frozen: u16,
 }
 
 impl Component for GameScreen {
@@ -45,6 +47,8 @@ impl Component for GameScreen {
             hit_show: 0,
             auto_play: None,
             auto_play_combo_sleep: 0,
+            last_player_time: 0.0,
+            player_frozen: 0,
         }
     }
 
@@ -239,6 +243,15 @@ impl Component for GameScreen {
             },
             Event::Tick => {
                 let player_time = app.player_time();
+                if self.last_player_time == player_time {
+                    self.player_frozen += 1;
+                    if self.player_frozen >= app.args.tps / 2 && app.output.finished {
+                        tx.send(Action::Switch(Page::GameResult))?;
+                    }
+                } else {
+                    self.player_frozen = 0;
+                }
+                self.last_player_time = player_time;
 
                 if self.auto_play.is_some() {
                     while let Some(note) = self.auto_play.as_mut().unwrap().first() {
@@ -359,10 +372,113 @@ impl Component for GameScreen {
     }
 }
 
-pub struct GameResult {}
+pub struct GameResult {
+    result: Option<Final>,
+}
 
 impl Component for GameResult {
     fn new() -> Self {
-        Self {}
+        Self { result: None }
+    }
+
+    fn render(&mut self, app: &mut AppGlobalState, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        if self.result.is_none() {
+            return Ok(());
+        }
+
+        let result = self.result.as_ref().unwrap();
+
+        let table = Table::new(
+            vec![
+                Row::new(vec![
+                    Cell::from("Score"),
+                    Cell::from(format!("{}", result.score)),
+                    Cell::from("Max Combo"),
+                    Cell::from(format!("{}", result.max_combo)),
+                ]),
+                Row::new(vec![
+                    Cell::from("Great"),
+                    Cell::from(format!("{}", result.greats)),
+                    Cell::from("Good"),
+                    Cell::from(format!("{}", result.goods)),
+                ]),
+                Row::new(vec![
+                    Cell::from("Miss"),
+                    Cell::from(format!("{}", result.misses)),
+                    Cell::from("魂"),
+                    Cell::from(format!("{:.1}%", result.gauge * 100.0)).style(Style::default().fg(
+                        if result.passed {
+                            Color::Yellow
+                        } else {
+                            Color::White
+                        },
+                    )),
+                ]),
+            ],
+            vec![
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+                Constraint::Fill(1),
+            ],
+        );
+
+        f.render_widget(table, area);
+
+        Ok(())
+    }
+
+    fn handle(
+        &mut self,
+        app: &mut AppGlobalState,
+        event: Event,
+        tx: UnboundedSender<Action>,
+    ) -> Result<()> {
+        if let Event::Key(e) = event {
+            match e {
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Esc, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => tx.send(Action::Switch(Page::SongMenu))?,
+
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                } => match c {
+                    ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
+                        tx.send(Action::Switch(Page::SongMenu))?;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
+        self.result.replace(app.taiko.as_mut().unwrap().finalize());
+        Ok(())
+    }
+
+    async fn leave(&mut self, app: &mut AppGlobalState, next: Page) -> Result<()> {
+        if next == Page::SongMenu {
+            app.taiko.take();
+            app.selected_course.take();
+            app.selected_song.take();
+        }
+        if let Some(mut playing) = app.playing.take() {
+            playing.stop(Tween::default())?;
+        }
+        Ok(())
     }
 }

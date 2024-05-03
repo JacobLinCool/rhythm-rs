@@ -213,9 +213,8 @@ impl App {
         tui.enter()?;
 
         loop {
-            if self.state.songs.is_none() {
+            if self.page == Page::None {
                 action_tx.send(Action::Switch(Page::SongMenu))?;
-                self.state.schedule_demo();
             }
 
             if let Some(e) = tui.next().await {
@@ -333,44 +332,46 @@ impl App {
                         })?;
                     }
                     Action::Switch(page) => {
-                        match self.page {
-                            Page::SongMenu => {
-                                self.songmenu.leave(&mut self.state, page).await?;
+                        if self.page != page {
+                            match self.page {
+                                Page::SongMenu => {
+                                    self.songmenu.leave(&mut self.state, page).await?;
+                                }
+                                Page::CourseMenu => {
+                                    self.coursemenu.leave(&mut self.state, page).await?;
+                                }
+                                Page::GameScreen => {
+                                    self.game.leave(&mut self.state, page).await?;
+                                }
+                                Page::GameResult => {
+                                    self.result.leave(&mut self.state, page).await?;
+                                }
+                                Page::Error => {
+                                    self.error.leave(&mut self.state, page).await?;
+                                }
+                                Page::None => {}
                             }
-                            Page::CourseMenu => {
-                                self.coursemenu.leave(&mut self.state, page).await?;
-                            }
-                            Page::GameScreen => {
-                                self.game.leave(&mut self.state, page).await?;
-                            }
-                            Page::GameResult => {
-                                self.result.leave(&mut self.state, page).await?;
-                            }
-                            Page::Error => {
-                                self.error.leave(&mut self.state, page).await?;
-                            }
-                            Page::None => {}
-                        }
 
-                        self.page = page;
+                            self.page = page;
 
-                        match self.page {
-                            Page::SongMenu => {
-                                self.songmenu.enter(&mut self.state).await?;
+                            match self.page {
+                                Page::SongMenu => {
+                                    self.songmenu.enter(&mut self.state).await?;
+                                }
+                                Page::CourseMenu => {
+                                    self.coursemenu.enter(&mut self.state).await?;
+                                }
+                                Page::GameScreen => {
+                                    self.game.enter(&mut self.state).await?;
+                                }
+                                Page::GameResult => {
+                                    self.result.enter(&mut self.state).await?;
+                                }
+                                Page::Error => {
+                                    self.error.enter(&mut self.state).await?;
+                                }
+                                Page::None => {}
                             }
-                            Page::CourseMenu => {
-                                self.coursemenu.enter(&mut self.state).await?;
-                            }
-                            Page::GameScreen => {
-                                self.game.enter(&mut self.state).await?;
-                            }
-                            Page::GameResult => {
-                                self.result.enter(&mut self.state).await?;
-                            }
-                            Page::Error => {
-                                self.error.enter(&mut self.state).await?;
-                            }
-                            Page::None => {}
                         }
                     }
                     _ => {}
