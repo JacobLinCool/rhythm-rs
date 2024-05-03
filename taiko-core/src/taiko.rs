@@ -1,7 +1,10 @@
 use rhythm_core::{Note, Rhythm};
 use tja::{TaikoNote, TaikoNoteVariant};
 
-use crate::constant::{GUAGE_FULL_THRESHOLD, GUAGE_MISS_FACTOR, RANGE_GREAT, RANGE_MISS, RANGE_OK};
+use crate::constant::{
+    GUAGE_FULL_THRESHOLD, GUAGE_MISS_FACTOR, GUAGE_PASS_THRESHOLD, RANGE_GREAT, RANGE_MISS,
+    RANGE_OK,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub enum Hit {
@@ -157,6 +160,7 @@ pub struct Final {
     pub goods: u32,
     pub misses: u32,
     pub max_hit: u32,
+    pub passed: bool,
 }
 
 pub trait TaikoEngine<H> {
@@ -390,6 +394,10 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             }
         }
 
+        let passed = self.gauge
+            >= (GUAGE_PASS_THRESHOLD[self.difficulty as usize][self.level as usize]
+                / GUAGE_FULL_THRESHOLD[self.difficulty as usize][self.level as usize]);
+
         Final {
             score: self.score,
             max_combo: self.max_combo,
@@ -398,6 +406,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             goods,
             misses,
             max_hit: self.max_hit_count,
+            passed,
         }
     }
 }
