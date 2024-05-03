@@ -24,6 +24,7 @@ pub struct CalculatedNote {
     pub idx: usize,
     pub visible_start: f64,
     pub visible_end: f64,
+    pub hit_count: u32,
 }
 
 impl Eq for CalculatedNote {}
@@ -147,9 +148,21 @@ pub struct OutputState {
     pub display: Vec<CalculatedNote>,
 }
 
+#[derive(Clone, PartialEq, PartialOrd, Debug)]
+pub struct Final {
+    pub score: u32,
+    pub max_combo: u32,
+    pub gauge: f64,
+    pub greats: u32,
+    pub goods: u32,
+    pub misses: u32,
+    pub max_hit: u32,
+}
+
 pub trait TaikoEngine<H> {
     fn new(src: GameSource) -> Self;
     fn forward(&mut self, input: InputState<H>) -> OutputState;
+    fn finalize(&self) -> Final;
 }
 
 pub struct DefaultTaikoEngine {
@@ -169,6 +182,9 @@ pub struct DefaultTaikoEngine {
     total_notes: usize,
 
     passed_display: Vec<CalculatedNote>,
+
+    judgements: Vec<Judgement>,
+    max_hit_count: u32,
 }
 
 impl TaikoEngine<Hit> for DefaultTaikoEngine {
@@ -204,6 +220,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                     idx,
                     visible_start,
                     visible_end,
+                    hit_count: 0,
                 }
             })
             .collect::<Vec<_>>();
@@ -228,6 +245,8 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             current_time: 0.0,
             total_notes,
             passed_display: vec![],
+            judgements: vec![],
+            max_hit_count: 0,
         }
     }
 
@@ -241,6 +260,8 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                 Hit::Don => {
                     if let Some((note, delta_from_start)) = self.rhythm.hit(TaikoNoteVariant::Don) {
                         if note.variant() == TaikoNoteVariant::Both {
+                            note.hit_count += 1;
+                            self.max_hit_count = self.max_hit_count.max(note.hit_count);
                             Some(Judgement::ComboHit)
                         } else {
                             let delta = (delta_from_start - note.duration() / 2.0).abs();
@@ -259,6 +280,8 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
                 Hit::Kat => {
                     if let Some((note, t)) = self.rhythm.hit(TaikoNoteVariant::Kat) {
                         if note.variant() == TaikoNoteVariant::Both {
+                            note.hit_count += 1;
+                            self.max_hit_count = self.max_hit_count.max(note.hit_count);
                             Some(Judgement::ComboHit)
                         } else {
                             let delta = (t - note.duration() / 2.0).abs();
@@ -279,13 +302,14 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             None
         };
 
-        // missed note, reset combo
-        if passed.iter().any(|note| {
-            note.variant() == TaikoNoteVariant::Don || note.variant() == TaikoNoteVariant::Kat
-        }) {
-            self.current_combo = 0;
-            self.gauge -= (1.0 / self.total_notes as f64)
-                * GUAGE_MISS_FACTOR[self.difficulty as usize][self.level as usize];
+        // missed notes
+        for note in passed.iter() {
+            if note.variant() == TaikoNoteVariant::Don || note.variant() == TaikoNoteVariant::Kat {
+                self.current_combo = 0;
+                self.gauge -= (1.0 / self.total_notes as f64)
+                    * GUAGE_MISS_FACTOR[self.difficulty as usize][self.level as usize];
+                self.judgements.push(Judgement::Miss);
+            }
         }
 
         let full = GUAGE_FULL_THRESHOLD[self.difficulty as usize][self.level as usize];
@@ -321,6 +345,10 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             _ => {}
         };
 
+        if judgement.is_some() {
+            self.judgements.push(judgement.unwrap());
+        }
+
         self.gauge = self.gauge.max(0.0).min(1.0);
 
         self.passed_display.extend(passed);
@@ -345,6 +373,31 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             gauge: self.gauge,
             judgement,
             display,
+        }
+    }
+
+    fn finalize(&self) -> Final {
+        let mut greats = 0;
+        let mut goods = 0;
+        let mut misses = 0;
+
+        for judgement in self.judgements.iter() {
+            match judgement {
+                Judgement::Great => greats += 1,
+                Judgement::Ok => goods += 1,
+                Judgement::Miss => misses += 1,
+                _ => {}
+            }
+        }
+
+        Final {
+            score: self.score,
+            max_combo: self.max_combo,
+            gauge: self.gauge,
+            greats,
+            goods,
+            misses,
+            max_hit: self.max_hit_count,
         }
     }
 }

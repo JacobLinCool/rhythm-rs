@@ -51,7 +51,7 @@ impl<T: Note> Rhythm<T> {
         self.availables.is_empty()
     }
 
-    pub fn hit(&mut self, variant: impl Into<u16>) -> Option<(&T, f64)> {
+    pub fn hit(&mut self, variant: impl Into<u16>) -> Option<(&mut T, f64)> {
         let variant: u16 = variant.into();
         let hitables = self.availables.iter_mut().filter(|note| {
             note.start() <= self.time && note.start() + note.duration() >= self.time
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(rhythm.hit(1u16), None);
         assert_eq!(
             rhythm.hit(0u16),
-            Some((&SimpleNote::new(1000, 100, 0u16, 0u16), 50.0))
+            Some((&mut SimpleNote::new(1000, 100, 0u16, 0u16), 50.0))
         );
         assert_eq!(rhythm.hit(0u16), None);
 
@@ -145,7 +145,7 @@ mod tests {
             assert_eq!(
                 rhythm.hit(0u16),
                 Some((
-                    &SimpleNote::new(1000, 1000, 9 - i as u16, 0u16),
+                    &mut SimpleNote::new(1000, 1000, 9 - i as u16, 0u16),
                     500.0 + i as f64 * 10.0
                 ))
             );
@@ -160,7 +160,7 @@ mod tests {
             assert_eq!(
                 rhythm.hit(1u16),
                 Some((
-                    &SimpleNote::new(3000, 2000, u16::MAX - 1 - i as u16, 1u16),
+                    &mut SimpleNote::new(3000, 2000, u16::MAX - 1 - i as u16, 1u16),
                     1600.0
                 ))
             );
