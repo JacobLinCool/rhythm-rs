@@ -88,6 +88,7 @@ impl Component for SongMenu {
                 | KeyEvent {
                     code: KeyCode::Up, ..
                 } => {
+                    app.player.play(app.sounds["kat"].clone())?;
                     select_prev(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
                     app.schedule_demo();
                 }
@@ -100,6 +101,7 @@ impl Component for SongMenu {
                     code: KeyCode::Down,
                     ..
                 } => {
+                    app.player.play(app.sounds["kat"].clone())?;
                     select_next(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
                     app.schedule_demo();
                 }
@@ -109,13 +111,16 @@ impl Component for SongMenu {
                     ..
                 } => match c {
                     ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
+                        app.player.play(app.sounds["don"].clone())?;
                         tx.send(Action::Switch(Page::CourseMenu))?;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' => {
+                        app.player.play(app.sounds["kat"].clone())?;
                         select_prev(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
                         app.schedule_demo();
                     }
                     'k' | 'l' | ';' | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
+                        app.player.play(app.sounds["kat"].clone())?;
                         select_next(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
                         app.schedule_demo();
                     }
@@ -209,10 +214,13 @@ impl Component for CourseMenu {
                 }
                 | KeyEvent {
                     code: KeyCode::Up, ..
-                } => select_prev(
-                    &mut app.course_selector,
-                    0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                )?,
+                } => {
+                    app.player.play(app.sounds["kat"].clone())?;
+                    select_prev(
+                        &mut app.course_selector,
+                        0..app.selected_song.as_ref().unwrap().tja().courses.len(),
+                    )?;
+                }
 
                 KeyEvent {
                     code: KeyCode::Right,
@@ -221,25 +229,31 @@ impl Component for CourseMenu {
                 | KeyEvent {
                     code: KeyCode::Down,
                     ..
-                } => select_next(
-                    &mut app.course_selector,
-                    0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                )?,
+                } => {
+                    app.player.play(app.sounds["kat"].clone())?;
+                    select_next(
+                        &mut app.course_selector,
+                        0..app.selected_song.as_ref().unwrap().tja().courses.len(),
+                    )?;
+                }
 
                 KeyEvent {
                     code: KeyCode::Char(c),
                     ..
                 } => match c {
                     ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
+                        app.player.play(app.sounds["don"].clone())?;
                         tx.send(Action::Switch(Page::GameScreen))?;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' => {
+                        app.player.play(app.sounds["kat"].clone())?;
                         select_prev(
                             &mut app.course_selector,
                             0..app.selected_song.as_ref().unwrap().tja().courses.len(),
                         )?;
                     }
                     'k' | 'l' | ';' | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
+                        app.player.play(app.sounds["kat"].clone())?;
                         select_next(
                             &mut app.course_selector,
                             0..app.selected_song.as_ref().unwrap().tja().courses.len(),
