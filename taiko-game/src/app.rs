@@ -75,6 +75,7 @@ pub struct AppGlobalState {
     pub taiko: Option<DefaultTaikoEngine>,
     pub output: OutputState,
     pub enter_countdown: i16,
+    pub game_ticks: Vec<Instant>,
 }
 
 impl AppGlobalState {
@@ -182,6 +183,7 @@ impl App {
             enter_countdown: 0,
             loader,
             next_demo: None,
+            game_ticks: Vec::new(),
         };
 
         let topbar = TopBar::new();

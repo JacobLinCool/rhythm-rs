@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::{
     action::Action,
     app::{App, AppGlobalState, Page},
@@ -253,6 +255,10 @@ impl Component for GameScreen {
                 }
                 self.last_player_time = player_time;
 
+                if player_time >= 0.0 && !app.output.finished {
+                    app.game_ticks.push(Instant::now());
+                }
+
                 if self.auto_play.is_some() {
                     while let Some(note) = self.auto_play.as_mut().unwrap().first() {
                         if player_time > note.start + note.duration {
@@ -357,6 +363,8 @@ impl Component for GameScreen {
         app.player.pause(Tween::default())?;
         app.playing.replace(app.player.play(song.music().await?)?);
 
+        app.game_ticks.clear();
+
         Ok(())
     }
 
@@ -386,6 +394,35 @@ impl Component for GameResult {
             return Ok(());
         }
 
+        let max_latency = app
+            .game_ticks
+            .iter()
+            .enumerate()
+            .map(|(i, tick)| {
+                if i == 0 {
+                    return 0;
+                }
+                let last_tick = app.game_ticks.get(i - 1).unwrap();
+                let duration = tick.duration_since(*last_tick);
+                duration.as_millis()
+            })
+            .max()
+            .unwrap_or(0);
+        let avg_latency = app
+            .game_ticks
+            .iter()
+            .enumerate()
+            .map(|(i, tick)| {
+                if i == 0 {
+                    return 0;
+                }
+                let last_tick = app.game_ticks.get(i - 1).unwrap();
+                let duration = tick.duration_since(*last_tick);
+                duration.as_millis()
+            })
+            .sum::<u128>()
+            / app.game_ticks.len() as u128;
+
         let result = self.result.as_ref().unwrap();
 
         let table = Table::new(
@@ -414,6 +451,13 @@ impl Component for GameResult {
                         },
                     )),
                 ]),
+                Row::new(vec![
+                    Cell::from("Max Latency"),
+                    Cell::from(format!("{} ms", max_latency)),
+                    Cell::from("Avg Latency"),
+                    Cell::from(format!("{} ms", avg_latency)),
+                ])
+                .style(Style::default().dim()),
             ],
             vec![
                 Constraint::Fill(1),
