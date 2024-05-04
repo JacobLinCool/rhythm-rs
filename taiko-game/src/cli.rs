@@ -21,7 +21,7 @@ pub struct AppArgs {
         long,
         value_name = "TICK_RATE",
         help = "The tick rate of the game",
-        default_value_t = 200
+        default_value_t = 400
     )]
     pub tps: u16,
 
