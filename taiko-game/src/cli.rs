@@ -49,4 +49,20 @@ pub struct AppArgs {
         default_value_t = 100
     )]
     pub songvol: u8,
+
+    #[arg(
+        long,
+        value_name = "LATENCY_GATE",
+        help = "The latency gate of the game, if the latency is higher than this value, the game will panic",
+        default_value_t = 10000
+    )]
+    pub latency_gate: u16,
+
+    #[arg(
+        long,
+        value_name = "ECO",
+        help = "Enable eco mode. In the ECO mode, the CPU usage will be about 10% of the normal mode, however, latency will be higher in some cases.",
+        default_value_t = false
+    )]
+    pub eco: bool,
 }

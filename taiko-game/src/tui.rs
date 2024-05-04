@@ -223,8 +223,12 @@ impl Tui {
         Ok(())
     }
 
-    pub async fn next(&mut self) -> Option<Event> {
-        self.event_rx.recv().await
+    pub async fn next(&mut self, blocking: bool) -> Option<Event> {
+        if blocking {
+            self.event_rx.recv().await
+        } else {
+            self.event_rx.try_recv().ok()
+        }
     }
 }
 

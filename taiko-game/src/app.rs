@@ -76,6 +76,7 @@ pub struct AppGlobalState {
     pub output: OutputState,
     pub enter_countdown: i16,
     pub game_ticks: Vec<Instant>,
+    pub latency_gate: Duration,
 }
 
 impl AppGlobalState {
@@ -155,6 +156,7 @@ impl App {
             )?,
         );
 
+        let latency_gate = Duration::from_millis(args.latency_gate as u64);
         let state = AppGlobalState {
             args,
             songs: None,
@@ -184,6 +186,7 @@ impl App {
             loader,
             next_demo: None,
             game_ticks: Vec::new(),
+            latency_gate,
         };
 
         let topbar = TopBar::new();
@@ -219,7 +222,8 @@ impl App {
                 action_tx.send(Action::Switch(Page::SongMenu))?;
             }
 
-            if let Some(e) = tui.next().await {
+            if let Some(e) = tui.next(self.state.args.eco).await {
+                let start = std::time::Instant::now();
                 match e {
                     tui::Event::Quit => action_tx.send(Action::Quit)?,
                     tui::Event::Tick => action_tx.send(Action::Tick)?,
@@ -247,7 +251,14 @@ impl App {
                     },
                     _ => {}
                 }
-            }
+                if start.elapsed() > self.state.latency_gate && self.state.enter_countdown > 0 {
+                    panic!(
+                        "High Latency Detected: {:?} > {:?}",
+                        start.elapsed(),
+                        self.state.latency_gate
+                    );
+                }
+            };
 
             while let Ok(action) = action_rx.try_recv() {
                 if action != Action::Tick && action != Action::Render {
@@ -255,14 +266,8 @@ impl App {
                 }
                 match action {
                     Action::Tick => {
+                        let start = std::time::Instant::now();
                         self.state.lm.tick();
-
-                        if self.state.enter_countdown < 0 {
-                            self.state.enter_countdown += 1;
-                        } else if self.state.enter_countdown == 0 {
-                            self.state.player.resume(Tween::default())?;
-                            self.state.enter_countdown = 1;
-                        }
 
                         if self.state.next_demo.is_some() {
                             if self.page == Page::SongMenu || self.page == Page::CourseMenu {
@@ -293,12 +298,22 @@ impl App {
                             }
                             Page::None => {}
                         }
+                        if start.elapsed() > self.state.latency_gate
+                            && self.state.enter_countdown > 0
+                        {
+                            panic!(
+                                "High Latency Detected: {:?} > {:?}",
+                                start.elapsed(),
+                                self.state.latency_gate
+                            );
+                        }
                     }
                     Action::Quit => self.state.pending_quit = true,
                     Action::Suspend => self.state.pending_suspend = true,
                     Action::Resume => self.state.pending_suspend = false,
                     Action::Resize(w, h) => tui.resize(Rect::new(0, 0, w, h))?,
                     Action::Render => {
+                        let start = std::time::Instant::now();
                         tui.draw(|f| {
                             let size = f.size();
                             let chunks = Layout::default()
@@ -332,6 +347,15 @@ impl App {
                                 Page::None => {}
                             }
                         })?;
+                        if start.elapsed() > self.state.latency_gate
+                            && self.state.enter_countdown > 0
+                        {
+                            panic!(
+                                "High Latency Detected: {:?} > {:?}",
+                                start.elapsed(),
+                                self.state.latency_gate
+                            );
+                        }
                     }
                     Action::Switch(page) => {
                         if self.page != page {

@@ -17,7 +17,7 @@ use ratatui::{
 };
 use rhythm_core::Note;
 use taiko_core::{
-    constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT},
+    constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT, RANGE_OK},
     DefaultTaikoEngine, Final, GameSource, Hit, InputState, Judgement, TaikoEngine,
 };
 use tja::{TaikoNote, TaikoNoteType, TaikoNoteVariant};
@@ -244,10 +244,17 @@ impl Component for GameScreen {
                 _ => {}
             },
             Event::Tick => {
+                if app.enter_countdown < 0 {
+                    app.enter_countdown += 1;
+                } else if app.enter_countdown == 0 {
+                    app.player.resume(Tween::default())?;
+                    app.enter_countdown = 1;
+                }
+
                 let player_time = app.player_time();
                 if self.last_player_time == player_time {
                     self.player_frozen += 1;
-                    if self.player_frozen >= app.args.tps / 2 && app.output.finished {
+                    if self.player_frozen >= app.args.tps / 2 {
                         tx.send(Action::Switch(Page::GameResult))?;
                     }
                 } else {
@@ -267,7 +274,9 @@ impl Component for GameScreen {
                         }
 
                         if note.variant == TaikoNoteVariant::Don {
-                            if (note.start - player_time).abs() < RANGE_GREAT {
+                            if (note.start - player_time) < 0.02
+                                && (player_time - note.start) < 0.05
+                            {
                                 app.player.play(app.sounds["don"].clone())?;
                                 self.hit.replace(Hit::Don);
                                 self.last_hit_type.replace(Hit::Don);
@@ -277,7 +286,9 @@ impl Component for GameScreen {
                                 break;
                             }
                         } else if note.variant == TaikoNoteVariant::Kat {
-                            if (note.start - player_time).abs() < RANGE_GREAT {
+                            if (note.start - player_time) < 0.02
+                                && (player_time - note.start) < 0.05
+                            {
                                 app.player.play(app.sounds["kat"].clone())?;
                                 self.hit.replace(Hit::Kat);
                                 self.last_hit_type.replace(Hit::Kat);
@@ -369,6 +380,7 @@ impl Component for GameScreen {
     }
 
     async fn leave(&mut self, app: &mut AppGlobalState, next: Page) -> Result<()> {
+        app.enter_countdown = -1;
         if next == Page::CourseMenu {
             app.taiko.take();
             app.selected_course.take();
