@@ -29,7 +29,10 @@ impl TJAParser {
         let mut segments: Vec<(f32, f32, Vec<char>)> = Vec::new();
         let mut current_combo: Option<TaikoNote> = None;
 
-        for line in tja_content.as_ref().lines() {
+        for mut line in tja_content.as_ref().lines() {
+            if let Some(pair) = line.split_once("//") {
+                line = pair.0;
+            }
             let line = line.trim();
             if line.is_empty() {
                 continue;
