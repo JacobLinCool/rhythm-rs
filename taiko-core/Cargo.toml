@@ -13,4 +13,5 @@ name = "taiko_core"
 
 [dependencies]
 rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
+serde = { version = "1.0.203", features = ["derive"] }
 tja = { path = "../tja", version = "0.2.1" }

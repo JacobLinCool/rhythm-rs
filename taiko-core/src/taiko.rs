@@ -1,5 +1,6 @@
 use rhythm_core::{Note, Rhythm};
 use tja::{TaikoNote, TaikoNoteVariant};
+use serde::{Deserialize, Serialize};
 
 use crate::constant::{
     GUAGE_FULL_THRESHOLD, GUAGE_MISS_FACTOR, GUAGE_PASS_THRESHOLD, RANGE_GREAT, RANGE_MISS,
@@ -7,12 +8,14 @@ use crate::constant::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[derive(Serialize, Deserialize)]
 pub enum Hit {
     Don,
     Kat,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Serialize, Deserialize)]
 pub enum Judgement {
     Great,
     Ok,
@@ -22,6 +25,7 @@ pub enum Judgement {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct CalculatedNote {
     pub inner: TaikoNote,
     pub idx: usize,
@@ -115,6 +119,7 @@ impl Note for CalculatedNote {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct GameSource {
     pub difficulty: u8,
     pub level: u8,
@@ -124,6 +129,7 @@ pub struct GameSource {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct InputState<H> {
     /// The current time played in the music, in seconds.
     pub time: f64,
@@ -132,6 +138,7 @@ pub struct InputState<H> {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct OutputState {
     /// If the game is finished. (All notes are passed)
     pub finished: bool,
@@ -152,6 +159,7 @@ pub struct OutputState {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct Final {
     pub score: u32,
     pub max_combo: u32,
