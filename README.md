@@ -2,4 +2,4 @@
 
 Rhythm game engine written in Rust.
 
-![taiko](./images/taiko.gif)
+https://github.com/JacobLinCool/rhythm-rs/assets/28478594/4fc28356-0ec5-4e20-8ee0-269cc55ec361
