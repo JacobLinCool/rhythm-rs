@@ -17,11 +17,20 @@ crate-type = ["cdylib", "rlib"]
 name = "ryan"
 path = "examples/ryan.rs"
 
+[[example]]
+name = "hitseq"
+path = "examples/hitseq.rs"
+required-features = ["serde", "glob", "encoding_rs"]
+
 [features]
 default = ["serde"]
 serde = ["dep:serde", "dep:serde_json"]
+glob = ["dep:glob"]
+encoding_rs = ["dep:encoding_rs"]
 
 [dependencies]
+encoding_rs = { version = "0.8.34", optional = true }
+glob = { version = "0.3.1", optional = true }
 rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
 serde = { version = "1.0.197", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }

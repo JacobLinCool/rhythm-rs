@@ -5,6 +5,7 @@ members = [
     "tja",
     "taiko-core",
     "taiko-game",
+    "taiko-wasm",
 ]
 
 [profile.release]
