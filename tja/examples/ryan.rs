@@ -4,7 +4,6 @@
 
 use rhythm_core::Note;
 use serde::{Deserialize, Serialize};
-
 use std::fs;
 use tja::{TJAParser, TaikoNoteType, TaikoNoteVariant};
 
@@ -26,7 +25,7 @@ fn main() {
         return;
     }
     let filepath = &args.get(1).unwrap();
-    let raw = fs::read_to_string(filepath).unwrap();
+    let raw = read_utf8_or_shiftjis(filepath).unwrap();
 
     let parser = TJAParser::new();
     let tja = parser.parse(&raw).unwrap();
@@ -112,4 +111,17 @@ fn main() {
         let json = serde_json::to_string_pretty(&ryan_chart).unwrap();
         fs::write(args.get(2).unwrap_or(&"output.json".to_string()), json).unwrap();
     }
+}
+
+pub fn read_utf8_or_shiftjis<P: AsRef<std::path::Path>>(path: P) -> Result<String, std::io::Error> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let encoding = if !encoding_rs::UTF_8.decode_without_bom_handling(&bytes).1 {
+        encoding_rs::UTF_8
+    } else {
+        encoding_rs::SHIFT_JIS
+    };
+
+    let (cow, _, _) = encoding.decode(&bytes);
+    Ok(cow.into_owned())
 }

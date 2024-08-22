@@ -18,10 +18,12 @@ name = "ryan"
 path = "examples/ryan.rs"
 
 [features]
-default = ["serde"]
+default = ["serde", "encoding"]
 serde = ["dep:serde", "dep:serde_json"]
+encoding = ["dep:encoding_rs"]
 
 [dependencies]
+encoding_rs = { version = "0.8.34", optional = true }
 rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
 serde = { version = "1.0.197", features = ["derive"], optional = true }
 serde_json = { version = "1.0.114", optional = true }
