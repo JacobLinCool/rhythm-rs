@@ -65,7 +65,7 @@ pub enum TaikoNoteType {
     BarLine,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub struct TaikoNote {
@@ -135,5 +135,11 @@ impl Eq for TaikoNote {}
 impl Ord for TaikoNote {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.start.partial_cmp(&other.start).unwrap()
+    }
+}
+
+impl PartialOrd for TaikoNote {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.start.partial_cmp(&other.start)
     }
 }

@@ -72,17 +72,8 @@ fn main() {
                 ));
                 0
             } else if note.variant() == TaikoNoteVariant::Both
-                && (note.note_type == TaikoNoteType::Balloon)
-            {
-                chart.push((
-                    7,
-                    note.start as f32 - tja.header.offset.unwrap(),
-                    note.start as f32 - tja.header.offset.unwrap() + note.duration() as f32,
-                    note.volume(),
-                ));
-                0
-            } else if note.variant() == TaikoNoteVariant::Both
-                && (note.note_type == TaikoNoteType::Yam)
+                && (note.note_type == TaikoNoteType::Balloon
+                    || note.note_type == TaikoNoteType::Yam)
             {
                 chart.push((
                     7,

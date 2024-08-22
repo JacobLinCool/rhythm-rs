@@ -56,7 +56,7 @@ pub trait Note: std::fmt::Debug + Ord + Clone {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 pub struct SimpleNote {
@@ -115,5 +115,11 @@ impl Note for SimpleNote {
 impl Ord for SimpleNote {
     fn cmp(&self, other: &Self) -> Ordering {
         Note::cmp(self, other)
+    }
+}
+
+impl PartialOrd for SimpleNote {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(Note::cmp(self, other))
     }
 }
