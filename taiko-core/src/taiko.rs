@@ -234,9 +234,16 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             .filter(|note| {
                 note.variant() == TaikoNoteVariant::Don || note.variant() == TaikoNoteVariant::Kat
             })
-            .count();
+            .count()
+            .max(1);
         let rhythm = Rhythm::new(notes.clone());
-        let scoreinit = src.scoreinit.unwrap_or(100_000 / total_notes as i32 * 10);
+        let scoreinit = if let Some(s) = src.scoreinit {
+            s
+        } else {
+            let s = (1_000_000 + total_notes - 1) / total_notes;
+            let s = (s + 9) / 10 * 10;
+            s as i32
+        };
 
         DefaultTaikoEngine {
             rhythm,
