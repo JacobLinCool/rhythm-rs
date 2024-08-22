@@ -42,7 +42,7 @@ impl<T: Note> Rhythm<T> {
 
     pub fn set_time(&mut self, time: impl Into<f64>) {
         self.time = time.into();
-        self.availables = self.notes.clone();
+        self.availables.clone_from(&self.notes);
         self.availables.sort_unstable();
         self.update_availables();
     }

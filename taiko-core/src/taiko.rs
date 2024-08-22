@@ -22,7 +22,7 @@ pub enum Judgement {
     Nothing,
 }
 
-#[derive(Clone, PartialEq, PartialOrd, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct CalculatedNote {
     pub inner: TaikoNote,
     pub idx: usize,
@@ -39,6 +39,12 @@ impl Ord for CalculatedNote {
     }
 }
 
+impl PartialOrd for CalculatedNote {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.inner.start.partial_cmp(&other.inner.start)
+    }
+}
+
 impl CalculatedNote {
     pub fn visible(&self, time: f64) -> bool {
         if self.inner.volume == 0 {
@@ -51,7 +57,7 @@ impl CalculatedNote {
             return false;
         }
 
-        return time > self.visible_start && time < self.visible_end;
+        time > self.visible_start && time < self.visible_end
     }
 
     pub fn position(&self, time: f64) -> Option<(f64, f64)> {
@@ -357,8 +363,8 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             _ => {}
         };
 
-        if judgement.is_some() {
-            self.judgements.push(judgement.unwrap());
+        if let Some(judgement) = judgement {
+            self.judgements.push(judgement);
         }
 
         self.gauge = self.gauge.max(0.0).min(1.0);
