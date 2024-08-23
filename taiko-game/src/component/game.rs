@@ -7,7 +7,7 @@ use crate::{
 };
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kira::tween::Tween;
+use kira::{sound::static_sound::StaticSoundSettings, tween::Tween};
 use ratatui::{
     prelude::*,
     widgets::{
@@ -372,7 +372,11 @@ impl Component for GameScreen {
             playing.stop(Tween::default())?;
         }
         app.player.pause(Tween::default())?;
-        app.playing.replace(app.player.play(song.music().await?)?);
+        let settings = StaticSoundSettings::new().volume(app.args.songvol as f64 / 100.0);
+        app.playing.replace(
+            app.player
+                .play(song.music().await?.with_settings(settings))?,
+        );
 
         app.game_ticks.clear();
 

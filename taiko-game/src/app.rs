@@ -114,7 +114,8 @@ impl AppGlobalState {
         let demostart = song.tja().header.demostart.unwrap_or(0.0) as f64;
         let settings = StaticSoundSettings::new()
             .loop_region(demostart..)
-            .playback_region(demostart..);
+            .playback_region(demostart..)
+            .volume(self.args.songvol as f64 / 100.0);
         let music = song.music().await?;
         if let Some(mut playing) = self.playing.take() {
             playing.stop(Tween::default())?;
