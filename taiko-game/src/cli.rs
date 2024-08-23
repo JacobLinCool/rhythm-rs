@@ -52,6 +52,14 @@ pub struct AppArgs {
 
     #[arg(
         long,
+        value_name = "TRACK_OFFSET",
+        help = "The track offset of the game, this is used to adjust the timing of the notes, if the notes are too early, increase this value, if the notes are too late, decrease this value. The unit is in seconds.",
+        default_value_t = 0.0
+    )]
+    pub track_offset: f64,
+
+    #[arg(
+        long,
         value_name = "LATENCY_GATE",
         help = "The latency gate of the game, if the latency is higher than this value, the game will panic",
         default_value_t = 10000

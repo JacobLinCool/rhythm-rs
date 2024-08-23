@@ -351,6 +351,7 @@ impl Component for GameScreen {
         let offset = song.tja().header.offset.unwrap_or(0.0) as f64;
         for note in course.notes.iter_mut() {
             note.start -= offset;
+            note.start += app.args.track_offset;
         }
 
         let source = GameSource {
