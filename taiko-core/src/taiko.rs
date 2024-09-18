@@ -13,6 +13,12 @@ pub enum Hit {
     Kat,
 }
 
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
+pub struct Personalization {
+    pub course: u8,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Judgement {
     Great,

@@ -1,8 +1,11 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{
     action::Action,
-    app::{App, AppGlobalState, Page},
+    app::AppGlobalState,
+    loader::Song,
     tui::{Event, Frame},
-    utils::{select_next, select_prev},
+    uix::{Page, PageStates},
 };
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,17 +13,67 @@ use ratatui::{prelude::*, widgets::*};
 use taiko_core::constant::COURSE_TYPE;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::Component;
+#[derive(Debug, Clone)]
+pub struct SongMenuState {
+    pub songs: Vec<Song>,
+    pub song_selector: Arc<Mutex<ListState>>,
+}
 
-pub struct SongMenu {}
+impl Default for SongMenuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl Component for SongMenu {
-    fn new() -> Self {
-        Self {}
+impl SongMenuState {
+    pub fn load(&mut self, songs: Vec<Song>) {
+        self.songs = songs;
     }
 
-    fn render(&mut self, app: &mut AppGlobalState, f: &mut Frame<'_>, area: Rect) -> Result<()> {
-        let items = app.songs.as_ref().unwrap().iter().map(|s| {
+    pub fn new() -> Self {
+        let mut song_selector = ListState::default();
+        song_selector.select(Some(0));
+        let song_selector = Arc::new(Mutex::new(song_selector));
+
+        Self {
+            songs: vec![],
+            song_selector,
+        }
+    }
+
+    fn schedule_demo(&self, app: &mut AppGlobalState, idx: usize) {
+        app.schedule_demo(self.songs[idx].clone());
+    }
+
+    fn select_prev(&mut self, app: &mut AppGlobalState) {
+        let mut selector = self.song_selector.lock().unwrap();
+        let idx = (selector.selected().unwrap_or(0) + self.songs.len() - 1) % self.songs.len();
+        selector.select(Some(idx));
+        self.schedule_demo(app, idx);
+    }
+
+    fn select_next(&mut self, app: &mut AppGlobalState) {
+        let mut selector = self.song_selector.lock().unwrap();
+        let idx = (selector.selected().unwrap_or(0) + 1) % self.songs.len();
+        selector.select(Some(idx));
+        self.schedule_demo(app, idx);
+    }
+}
+
+pub(crate) trait SongMenu {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()>;
+    async fn handle(
+        &mut self,
+        app: &mut AppGlobalState,
+        event: Event,
+        tx: UnboundedSender<Action>,
+    ) -> Result<()>;
+    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()>;
+}
+
+impl SongMenu for PageStates {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        let items = self.songmenu.songs.iter().map(|s| {
             let title = Span::styled(
                 s.tja().header.title.as_ref().unwrap().to_string(),
                 Style::default(),
@@ -50,16 +103,13 @@ impl Component for SongMenu {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
-        app.song_selector.select(Some(
-            app.song_selector.selected().unwrap_or(0) % app.songs.as_ref().unwrap().len(),
-        ));
 
-        f.render_stateful_widget(list, area, &mut app.song_selector);
+        f.render_stateful_widget(list, area, &mut self.songmenu.song_selector.lock().unwrap());
 
         Ok(())
     }
 
-    fn handle(
+    async fn handle(
         &mut self,
         app: &mut AppGlobalState,
         event: Event,
@@ -79,7 +129,20 @@ impl Component for SongMenu {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => tx.send(Action::Switch(Page::CourseMenu))?,
+                } => {
+                    app.audio.play_effect(app.audio.effects.don()).await?;
+                    self.coursemenu.song.replace(
+                        self.songmenu.songs[self
+                            .songmenu
+                            .song_selector
+                            .lock()
+                            .unwrap()
+                            .selected()
+                            .unwrap()]
+                        .clone(),
+                    );
+                    tx.send(Action::Switch(Page::CourseMenu))?;
+                }
 
                 KeyEvent {
                     code: KeyCode::Left,
@@ -88,9 +151,8 @@ impl Component for SongMenu {
                 | KeyEvent {
                     code: KeyCode::Up, ..
                 } => {
-                    app.player.play(app.sounds["kat"].clone())?;
-                    select_prev(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
-                    app.schedule_demo();
+                    app.audio.play_effect(app.audio.effects.kat()).await?;
+                    self.songmenu.select_prev(app);
                 }
 
                 KeyEvent {
@@ -101,9 +163,8 @@ impl Component for SongMenu {
                     code: KeyCode::Down,
                     ..
                 } => {
-                    app.player.play(app.sounds["kat"].clone())?;
-                    select_next(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
-                    app.schedule_demo();
+                    app.audio.play_effect(app.audio.effects.kat()).await?;
+                    self.songmenu.select_next(app);
                 }
 
                 KeyEvent {
@@ -111,18 +172,26 @@ impl Component for SongMenu {
                     ..
                 } => match c {
                     ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
-                        app.player.play(app.sounds["don"].clone())?;
+                        app.audio.play_effect(app.audio.effects.don()).await?;
+                        self.coursemenu.song.replace(
+                            self.songmenu.songs[self
+                                .songmenu
+                                .song_selector
+                                .lock()
+                                .unwrap()
+                                .selected()
+                                .unwrap()]
+                            .clone(),
+                        );
                         tx.send(Action::Switch(Page::CourseMenu))?;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' => {
-                        app.player.play(app.sounds["kat"].clone())?;
-                        select_prev(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
-                        app.schedule_demo();
+                        app.audio.play_effect(app.audio.effects.kat()).await?;
+                        self.songmenu.select_prev(app);
                     }
                     'k' | 'l' | ';' | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
-                        app.player.play(app.sounds["kat"].clone())?;
-                        select_next(&mut app.song_selector, 0..app.songs.as_ref().unwrap().len())?;
-                        app.schedule_demo();
+                        app.audio.play_effect(app.audio.effects.kat()).await?;
+                        self.songmenu.select_next(app);
                     }
                     _ => {}
                 },
@@ -134,26 +203,78 @@ impl Component for SongMenu {
     }
 
     async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
-        let songs = app.loader.list().await?;
-        app.songs.replace(songs);
-
-        if app.playing.is_none() {
-            app.schedule_demo();
-        }
-
+        let idx = self
+            .songmenu
+            .song_selector
+            .lock()
+            .unwrap()
+            .selected()
+            .unwrap();
+        self.songmenu.schedule_demo(app, idx);
+        self.topbar.set_default_text();
         Ok(())
     }
 }
 
-pub struct CourseMenu {}
+#[derive(Debug, Clone)]
+pub struct CourseMenuState {
+    pub song: Option<Song>,
+    pub course_selector: Arc<Mutex<ListState>>,
+}
 
-impl Component for CourseMenu {
-    fn new() -> Self {
-        Self {}
+impl Default for CourseMenuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CourseMenuState {
+    pub fn new() -> Self {
+        let mut course_selector = ListState::default();
+        course_selector.select(Some(0));
+        let course_selector = Arc::new(Mutex::new(course_selector));
+
+        Self {
+            song: None,
+            course_selector,
+        }
     }
 
-    fn render(&mut self, app: &mut AppGlobalState, f: &mut Frame<'_>, area: Rect) -> Result<()> {
-        let song = app.selected_song.as_ref().unwrap();
+    fn select_prev(&mut self) {
+        let mut selector = self.course_selector.lock().unwrap();
+        let idx = (selector.selected().unwrap_or(0)
+            + self.song.as_ref().unwrap().tja().courses.len()
+            - 1)
+            % self.song.as_ref().unwrap().tja().courses.len();
+        selector.select(Some(idx));
+    }
+
+    fn select_next(&mut self) {
+        let mut selector = self.course_selector.lock().unwrap();
+        let idx = (selector.selected().unwrap_or(0) + 1)
+            % self.song.as_ref().unwrap().tja().courses.len();
+        selector.select(Some(idx));
+    }
+}
+
+pub(crate) trait CourseMenu {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()>;
+    async fn handle(
+        &mut self,
+        app: &mut AppGlobalState,
+        event: Event,
+        tx: UnboundedSender<Action>,
+    ) -> Result<()>;
+    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()>;
+}
+
+impl CourseMenu for PageStates {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        if self.coursemenu.song.is_none() {
+            return Ok(());
+        }
+
+        let song = self.coursemenu.song.as_ref().unwrap();
         let names = song.tja().courses.iter().map(|course| {
             (if course.course < COURSE_TYPE.len() as i32 {
                 format!(
@@ -177,16 +298,16 @@ impl Component for CourseMenu {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
-        app.course_selector.select(Some(
-            app.course_selector.selected().unwrap_or(0) % song.tja().courses.len(),
-        ));
 
-        f.render_stateful_widget(list, area, &mut app.course_selector);
-
+        f.render_stateful_widget(
+            list,
+            area,
+            &mut self.coursemenu.course_selector.lock().unwrap(),
+        );
         Ok(())
     }
 
-    fn handle(
+    async fn handle(
         &mut self,
         app: &mut AppGlobalState,
         event: Event,
@@ -206,7 +327,31 @@ impl Component for CourseMenu {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => tx.send(Action::Switch(Page::GameScreen))?,
+                } => {
+                    app.audio.play_effect(app.audio.effects.don()).await?;
+                    self.game
+                        .song
+                        .replace(self.coursemenu.song.as_ref().unwrap().clone());
+                    self.game.course.replace(
+                        self.coursemenu
+                            .song
+                            .as_ref()
+                            .unwrap()
+                            .tja()
+                            .courses
+                            .get(
+                                self.coursemenu
+                                    .course_selector
+                                    .lock()
+                                    .unwrap()
+                                    .selected()
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                            .clone(),
+                    );
+                    tx.send(Action::Switch(Page::Game))?;
+                }
 
                 KeyEvent {
                     code: KeyCode::Left,
@@ -215,11 +360,8 @@ impl Component for CourseMenu {
                 | KeyEvent {
                     code: KeyCode::Up, ..
                 } => {
-                    app.player.play(app.sounds["kat"].clone())?;
-                    select_prev(
-                        &mut app.course_selector,
-                        0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                    )?;
+                    app.audio.play_effect(app.audio.effects.kat()).await?;
+                    self.coursemenu.select_prev();
                 }
 
                 KeyEvent {
@@ -230,11 +372,8 @@ impl Component for CourseMenu {
                     code: KeyCode::Down,
                     ..
                 } => {
-                    app.player.play(app.sounds["kat"].clone())?;
-                    select_next(
-                        &mut app.course_selector,
-                        0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                    )?;
+                    app.audio.play_effect(app.audio.effects.kat()).await?;
+                    self.coursemenu.select_next();
                 }
 
                 KeyEvent {
@@ -242,22 +381,37 @@ impl Component for CourseMenu {
                     ..
                 } => match c {
                     ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
-                        app.player.play(app.sounds["don"].clone())?;
-                        tx.send(Action::Switch(Page::GameScreen))?;
+                        app.audio.play_effect(app.audio.effects.don()).await?;
+                        self.game
+                            .song
+                            .replace(self.coursemenu.song.as_ref().unwrap().clone());
+                        self.game.course.replace(
+                            self.coursemenu
+                                .song
+                                .as_ref()
+                                .unwrap()
+                                .tja()
+                                .courses
+                                .get(
+                                    self.coursemenu
+                                        .course_selector
+                                        .lock()
+                                        .unwrap()
+                                        .selected()
+                                        .unwrap(),
+                                )
+                                .unwrap()
+                                .clone(),
+                        );
+                        tx.send(Action::Switch(Page::Game))?;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' => {
-                        app.player.play(app.sounds["kat"].clone())?;
-                        select_prev(
-                            &mut app.course_selector,
-                            0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                        )?;
+                        app.audio.play_effect(app.audio.effects.kat()).await?;
+                        self.coursemenu.select_prev();
                     }
                     'k' | 'l' | ';' | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
-                        app.player.play(app.sounds["kat"].clone())?;
-                        select_next(
-                            &mut app.course_selector,
-                            0..app.selected_song.as_ref().unwrap().tja().courses.len(),
-                        )?;
+                        app.audio.play_effect(app.audio.effects.kat()).await?;
+                        self.coursemenu.select_next();
                     }
                     _ => {}
                 },
@@ -269,19 +423,22 @@ impl Component for CourseMenu {
     }
 
     async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
-        let selected = app.song_selector.selected().unwrap_or(0);
-        let song = app.songs.as_ref().unwrap()[selected].clone();
-        app.selected_song.replace(song);
-        if app.playing.is_none() {
-            app.schedule_demo();
+        if self.page == Page::Game {
+            let idx = self
+                .songmenu
+                .song_selector
+                .lock()
+                .unwrap()
+                .selected()
+                .unwrap();
+            self.songmenu.schedule_demo(app, idx);
         }
-        Ok(())
-    }
 
-    async fn leave(&mut self, app: &mut AppGlobalState, next: Page) -> Result<()> {
-        if next == Page::SongMenu {
-            app.selected_song.take();
-        }
+        let tja = self.coursemenu.song.as_ref().unwrap().tja();
+        self.topbar.set_song_text(
+            tja.header.title.as_ref().unwrap(),
+            tja.header.subtitle.as_ref().unwrap(),
+        );
         Ok(())
     }
 }

@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{fs, io, io::Read, path::PathBuf};
 
 use color_eyre::eyre::Result;
 use glob::glob;
 use kira::sound::static_sound::StaticSoundData;
+use sha2::{Digest, Sha256};
 use tja::{TJAParser, TJA};
 
 use crate::utils::read_utf8_or_shiftjis;
@@ -44,7 +45,11 @@ impl PlaylistLoader {
                 path.with_extension("ogg")
             };
 
-            playlists.push(Song { tja, music_path });
+            playlists.push(Song {
+                tja,
+                music_path,
+                music_sha256: None,
+            });
         }
 
         Ok(playlists)
@@ -55,6 +60,7 @@ impl PlaylistLoader {
 pub struct Song {
     tja: TJA,
     music_path: PathBuf,
+    music_sha256: Option<String>,
 }
 
 impl Song {
@@ -72,5 +78,38 @@ impl Song {
 
         let data = StaticSoundData::from_file(&self.music_path, Default::default())?;
         Ok(data)
+    }
+
+    pub async fn music_bin(&self) -> Result<Vec<u8>> {
+        let mut file = fs::File::open(&self.music_path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    pub async fn music_sha256(&mut self) -> Result<String> {
+        if let Some(sha256) = &self.music_sha256 {
+            return Ok(sha256.clone());
+        }
+
+        let input = fs::File::open(&self.music_path)?;
+        let mut reader = io::BufReader::new(input);
+
+        let digest = {
+            let mut hasher = Sha256::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            hasher.finalize()
+        };
+
+        let sha256 = format!("{:x}", digest);
+        self.music_sha256.replace(sha256.clone());
+        Ok(sha256)
     }
 }
