@@ -11,7 +11,8 @@ use kira::sound::static_sound::StaticSoundSettings;
 use ratatui::{
     prelude::*,
     widgets::{
-        canvas::{Canvas, Rectangle}, Block, Borders, Cell, Paragraph, Row, Table
+        canvas::{Canvas, Rectangle},
+        Block, Borders, Cell, Paragraph, Row, Table,
     },
 };
 use rhythm_core::note::Note;
@@ -21,6 +22,13 @@ use taiko_core::{
 };
 use tja::{TJACourse, TaikoNote, TaikoNoteType, TaikoNoteVariant};
 use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameStatus {
+    Playing,
+    Paused,
+    AutoPaused,
+}
 
 pub struct GameState {
     pub song: Option<Song>,
@@ -40,6 +48,7 @@ pub struct GameState {
     enter_countdown: i32,
     guage_color: Color,
     song_title: String,
+    status: GameStatus,
 }
 
 impl Default for GameState {
@@ -76,6 +85,7 @@ impl GameState {
             enter_countdown: 0,
             guage_color: Color::White,
             song_title: String::new(),
+            status: GameStatus::Playing,
         }
     }
 }
@@ -239,6 +249,19 @@ impl GameScreen for PageStates {
                     app.audio.stop().await?;
                     tx.send(Action::Switch(Page::CourseMenu))?
                 }
+
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    ..
+                } => {
+                    if self.game.status == GameStatus::Playing {
+                        app.audio.pause().await?;
+                        self.game.status = GameStatus::Paused;
+                    } else if self.game.status == GameStatus::Paused {
+                        app.audio.resume().await?;
+                        self.game.status = GameStatus::Playing;
+                    }
+                }
                 KeyEvent {
                     code: KeyCode::Char(c),
                     ..
@@ -250,7 +273,7 @@ impl GameScreen for PageStates {
                         self.game.hit_show = app.args.tps as i32 / 4;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' | 'k' | 'l' | ';'
-                    | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
+                    | '\'' | 'y' | 'u' | 'i' | 'o' | ',' | '.' | '/' => {
                         app.audio.play_effect(app.audio.effects.kat()).await?;
                         self.game.hit.replace(Hit::Kat);
                         self.game.last_hit_type.replace(Hit::Kat);
@@ -276,7 +299,9 @@ impl GameScreen for PageStates {
                     0.0
                 };
 
-                if self.game.last_player_time == player_time {
+                if self.game.status == GameStatus::Playing
+                    && self.game.last_player_time == player_time
+                {
                     self.game.player_frozen += 1;
                     if self.game.player_frozen >= app.args.tps / 2 {
                         app.audio.stop().await?;
@@ -289,7 +314,7 @@ impl GameScreen for PageStates {
                 }
                 self.game.last_player_time = player_time;
 
-                if self.game.auto_play.is_some() {
+                if self.game.status == GameStatus::Playing && self.game.auto_play.is_some() {
                     while let Some(note) = self.game.auto_play.as_mut().unwrap().first() {
                         if player_time > note.start + note.duration {
                             self.game.auto_play.as_mut().unwrap().remove(0);
@@ -399,6 +424,18 @@ impl GameScreen for PageStates {
                     self.game.output.current_combo,
                     self.game.output.max_combo,
                 );
+            }
+            Event::FocusLost => {
+                if self.game.status == GameStatus::Playing {
+                    app.audio.pause().await?;
+                    self.game.status = GameStatus::AutoPaused;
+                }
+            }
+            Event::FocusGained => {
+                if self.game.status == GameStatus::AutoPaused {
+                    app.audio.resume().await?;
+                    self.game.status = GameStatus::Playing;
+                }
             }
             _ => {}
         }

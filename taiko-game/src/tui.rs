@@ -4,8 +4,7 @@ use color_eyre::eyre::Result;
 use crossterm::{
     cursor,
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyEvent, MouseEvent,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, KeyEvent, MouseEvent
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -65,6 +64,7 @@ impl Tui {
     pub fn enter(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(io(), EnterAlternateScreen, cursor::Hide)?;
+        crossterm::execute!(io(), EnableFocusChange)?;
         if self.mouse {
             crossterm::execute!(io(), EnableMouseCapture)?;
         }
@@ -83,6 +83,7 @@ impl Tui {
             if self.mouse {
                 crossterm::execute!(io(), DisableMouseCapture)?;
             }
+            crossterm::execute!(io(), DisableFocusChange)?;
             crossterm::execute!(io(), LeaveAlternateScreen, cursor::Show)?;
             crossterm::terminal::disable_raw_mode()?;
         }
