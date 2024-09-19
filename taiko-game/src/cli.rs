@@ -21,9 +21,9 @@ pub struct AppArgs {
         long,
         value_name = "TICK_RATE",
         help = "The tick rate of the game",
-        default_value_t = 400
+        default_value_t = 500
     )]
-    pub tps: u16,
+    pub tps: u64,
 
     #[arg(
         short,
@@ -38,17 +38,17 @@ pub struct AppArgs {
         long,
         value_name = "SEVOL",
         help = "The volume of the sound effects",
-        default_value_t = 100
+        default_value_t = 1.0
     )]
-    pub sevol: u8,
+    pub sevol: f64,
 
     #[arg(
         long,
         value_name = "SONGVOL",
         help = "The volume of the song music",
-        default_value_t = 100
+        default_value_t = 1.0
     )]
-    pub songvol: u8,
+    pub songvol: f64,
 
     #[arg(
         long,
@@ -73,4 +73,10 @@ pub struct AppArgs {
         default_value_t = false
     )]
     pub eco: bool,
+
+    #[arg(long, value_name = "ADDR", help = "Host a multiplayer game")]
+    pub host: Option<String>,
+
+    #[arg(long, value_name = "ADDR", help = "Connect to a multiplayer game")]
+    pub connect: Option<String>,
 }

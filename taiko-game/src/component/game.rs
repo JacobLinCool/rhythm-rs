@@ -1,31 +1,40 @@
-use std::time::Instant;
-
 use crate::{
     action::Action,
-    app::{App, AppGlobalState, Page},
+    app::AppGlobalState,
+    loader::Song,
     tui::{Event, Frame},
+    uix::{Page, PageStates},
 };
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kira::{sound::static_sound::StaticSoundSettings, tween::Tween};
+use kira::sound::static_sound::StaticSoundSettings;
 use ratatui::{
     prelude::*,
     widgets::{
         canvas::{Canvas, Rectangle},
-        *,
+        Block, Borders, Cell, Paragraph, Row, Table,
     },
 };
-use rhythm_core::Note;
+use rhythm_core::note::Note;
 use taiko_core::{
-    constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD, RANGE_GREAT, RANGE_OK},
-    DefaultTaikoEngine, Final, GameSource, Hit, InputState, Judgement, TaikoEngine,
+    constant::{COURSE_TYPE, GUAGE_FULL_THRESHOLD, GUAGE_PASS_THRESHOLD},
+    DefaultTaikoEngine, Final, GameSource, Hit, InputState, Judgement, OutputState, TaikoEngine,
 };
-use tja::{TaikoNote, TaikoNoteType, TaikoNoteVariant};
+use tja::{TJACourse, TaikoNote, TaikoNoteType, TaikoNoteVariant};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::Component;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameStatus {
+    Playing,
+    Paused,
+    AutoPaused,
+}
 
-pub struct GameScreen {
+pub struct GameState {
+    pub song: Option<Song>,
+    pub course: Option<TJACourse>,
+    taiko: Option<DefaultTaikoEngine>,
+    output: OutputState,
     last_hit: i32,
     last_hit_show: i32,
     hit: Option<Hit>,
@@ -33,14 +42,28 @@ pub struct GameScreen {
     last_hit_type: Option<Hit>,
     hit_show: i32,
     auto_play: Option<Vec<TaikoNote>>,
-    auto_play_combo_sleep: u16,
+    auto_play_combo_sleep: u64,
     last_player_time: f64,
-    player_frozen: u16,
+    player_frozen: u64,
+    enter_countdown: i32,
+    guage_color: Color,
+    song_title: String,
+    status: GameStatus,
 }
 
-impl Component for GameScreen {
-    fn new() -> Self {
+impl Default for GameState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GameState {
+    pub fn new() -> Self {
         Self {
+            song: None,
+            course: None,
+            taiko: None,
+            output: OutputState::default(),
             last_hit: 0,
             last_hit_show: 0,
             hit: None,
@@ -51,10 +74,31 @@ impl Component for GameScreen {
             auto_play_combo_sleep: 0,
             last_player_time: 0.0,
             player_frozen: 0,
+            enter_countdown: 0,
+            guage_color: Color::White,
+            song_title: String::new(),
+            status: GameStatus::Playing,
         }
     }
+}
 
-    fn render(&mut self, app: &mut AppGlobalState, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+pub(crate) trait GameScreen {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()>;
+    async fn handle(
+        &mut self,
+        app: &mut AppGlobalState,
+        event: Event,
+        tx: UnboundedSender<Action>,
+    ) -> Result<()>;
+    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()>;
+}
+
+impl GameScreen for PageStates {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        if self.game.course.is_none() || self.game.song.is_none() {
+            return Ok(());
+        }
+
         let vertical_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(5)].as_ref())
@@ -62,30 +106,6 @@ impl Component for GameScreen {
 
         let guage_chunk = vertical_chunks[0];
         let game_zone = vertical_chunks[1];
-
-        let difficulty = app.selected_course.as_ref().unwrap().course as usize;
-        let level = app.selected_course.as_ref().unwrap().level.unwrap_or(0) as usize;
-        let guage_color = if app.output.gauge == 1.0 {
-            self.guage_color_change += 1;
-            if self.guage_color_change >= 20 {
-                self.guage_color_change = 0;
-            }
-            if self.guage_color_change >= 15 {
-                Color::Cyan
-            } else if self.guage_color_change >= 10 {
-                Color::Yellow
-            } else if self.guage_color_change >= 5 {
-                Color::Green
-            } else {
-                Color::White
-            }
-        } else if app.output.gauge
-            >= (GUAGE_PASS_THRESHOLD[difficulty][level] / GUAGE_FULL_THRESHOLD[difficulty][level])
-        {
-            Color::Yellow
-        } else {
-            Color::White
-        };
 
         let guage_splits = Layout::default()
             .direction(Direction::Horizontal)
@@ -97,9 +117,9 @@ impl Component for GameScreen {
                 ctx.draw(&Rectangle {
                     x: 0.0,
                     y: 0.0,
-                    width: app.output.gauge,
+                    width: self.game.output.gauge,
                     height: 1.0,
-                    color: guage_color,
+                    color: self.game.guage_color,
                 });
             })
             .x_bounds([0.0, 1.0])
@@ -108,27 +128,24 @@ impl Component for GameScreen {
 
         let soul = Text::styled(
             " 魂",
-            Style::default().fg(if app.output.gauge == 1.0 {
-                guage_color
+            Style::default().fg(if self.game.output.gauge == 1.0 {
+                self.game.guage_color
             } else {
                 Color::Black
             }),
         );
         f.render_widget(soul, guage_splits[1]);
 
-        let hit_color = if self.last_hit_show == 0 {
+        let hit_color = if self.game.last_hit_show == 0 {
             Color::Black
         } else {
-            match self.last_hit {
+            match self.game.last_hit {
                 1 => Color::Yellow,
                 2 => Color::White,
                 3 => Color::Blue,
                 _ => Color::Black,
             }
         };
-        if self.last_hit_show > 0 {
-            self.last_hit_show -= 1;
-        }
 
         let mut spans: Vec<Span> = vec![Span::raw(" "); game_zone.width as usize];
         let hit_span = (0.1 * game_zone.width as f64) as usize;
@@ -139,8 +156,8 @@ impl Component for GameScreen {
         if hit_span < game_zone.width as usize - 1 {
             spans[hit_span + 1] = Span::styled(" ", Style::default().bg(hit_color));
         }
-        for note in app.output.display.iter() {
-            let pos = note.position(app.player_time());
+        for note in self.game.output.display.iter() {
+            let pos = note.position(self.game.last_player_time);
             if pos.is_none() {
                 continue;
             }
@@ -176,11 +193,20 @@ impl Component for GameScreen {
             }
         }
 
+        if let Some(c) = self.game.output.drumroll {
+            let str = format!("{}", c);
+            for (i, c) in str.chars().enumerate() {
+                spans[hit_span + i] = Span::styled(
+                    format!("{}", c),
+                    Style::default().bold().magenta().on_yellow(),
+                );
+            }
+        }
+
         let note_line = Line::from(spans);
 
-        let hit_reflection_color = if self.last_hit_type.is_some() && self.hit_show > 0 {
-            self.hit_show -= 1;
-            match self.last_hit_type.as_ref().unwrap() {
+        let hit_reflection_color = if self.game.last_hit_type.is_some() && self.game.hit_show > 0 {
+            match self.game.last_hit_type.as_ref().unwrap() {
                 Hit::Don => Color::Red,
                 Hit::Kat => Color::Cyan,
             }
@@ -206,7 +232,7 @@ impl Component for GameScreen {
         Ok(())
     }
 
-    fn handle(
+    async fn handle(
         &mut self,
         app: &mut AppGlobalState,
         event: Event,
@@ -221,55 +247,79 @@ impl Component for GameScreen {
                 }
                 | KeyEvent {
                     code: KeyCode::Esc, ..
-                } => tx.send(Action::Switch(Page::CourseMenu))?,
+                } => {
+                    app.audio.stop().await?;
+                    tx.send(Action::Switch(Page::CourseMenu))?
+                }
+
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    ..
+                } => {
+                    if self.game.status == GameStatus::Playing {
+                        app.audio.pause().await?;
+                        self.game.status = GameStatus::Paused;
+                    } else if self.game.status == GameStatus::Paused {
+                        app.audio.resume().await?;
+                        self.game.status = GameStatus::Playing;
+                    }
+                }
                 KeyEvent {
                     code: KeyCode::Char(c),
                     ..
                 } => match c {
                     ' ' | 'f' | 'g' | 'h' | 'j' | 'c' | 'v' | 'b' | 'n' | 'm' => {
-                        app.player.play(app.sounds["don"].clone())?;
-                        self.hit.replace(Hit::Don);
-                        self.last_hit_type.replace(Hit::Don);
-                        self.hit_show = app.args.tps as i32 / 40;
+                        app.audio.play_effect(app.audio.effects.don()).await?;
+                        self.game.hit.replace(Hit::Don);
+                        self.game.last_hit_type.replace(Hit::Don);
+                        self.game.hit_show = app.args.tps as i32 / 4;
                     }
                     'd' | 's' | 'a' | 't' | 'r' | 'e' | 'w' | 'q' | 'x' | 'z' | 'k' | 'l' | ';'
-                    | '\'' | 'y' | 'u' | 'i' | 'o' | 'p' | ',' | '.' | '/' => {
-                        app.player.play(app.sounds["kat"].clone())?;
-                        self.hit.replace(Hit::Kat);
-                        self.last_hit_type.replace(Hit::Kat);
-                        self.hit_show = app.args.tps as i32 / 40;
+                    | '\'' | 'y' | 'u' | 'i' | 'o' | ',' | '.' | '/' => {
+                        app.audio.play_effect(app.audio.effects.kat()).await?;
+                        self.game.hit.replace(Hit::Kat);
+                        self.game.last_hit_type.replace(Hit::Kat);
+                        self.game.hit_show = app.args.tps as i32 / 4;
                     }
                     _ => {}
                 },
                 _ => {}
             },
             Event::Tick => {
-                if app.enter_countdown < 0 {
-                    app.enter_countdown += 1;
-                } else if app.enter_countdown == 0 {
-                    app.player.resume(Tween::default())?;
-                    app.enter_countdown = 1;
+                if self.game.enter_countdown < 0 {
+                    self.game.enter_countdown += 1;
+                } else if self.game.enter_countdown == 0 {
+                    app.audio.resume().await?;
+                    self.game.enter_countdown = 1;
                 }
 
-                let player_time = app.player_time();
-                if self.last_player_time == player_time {
-                    self.player_frozen += 1;
-                    if self.player_frozen >= app.args.tps / 2 {
-                        tx.send(Action::Switch(Page::GameResult))?;
+                let player_time = if self.game.enter_countdown <= 0 {
+                    self.game.enter_countdown as f64 / app.args.tps as f64
+                } else if let Some(pos) = app.audio.playing_time() {
+                    pos
+                } else {
+                    0.0
+                };
+
+                if self.game.status == GameStatus::Playing
+                    && self.game.last_player_time == player_time
+                {
+                    self.game.player_frozen += 1;
+                    if self.game.player_frozen >= app.args.tps / 2 {
+                        app.audio.stop().await?;
+                        let result = self.game.taiko.as_ref().unwrap().finalize();
+                        self.result.result.replace(result);
+                        tx.send(Action::Switch(Page::Result))?;
                     }
                 } else {
-                    self.player_frozen = 0;
+                    self.game.player_frozen = 0;
                 }
-                self.last_player_time = player_time;
+                self.game.last_player_time = player_time;
 
-                if player_time >= 0.0 && !app.output.finished {
-                    app.game_ticks.push(Instant::now());
-                }
-
-                if self.auto_play.is_some() {
-                    while let Some(note) = self.auto_play.as_mut().unwrap().first() {
+                if self.game.status == GameStatus::Playing && self.game.auto_play.is_some() {
+                    while let Some(note) = self.game.auto_play.as_mut().unwrap().first() {
                         if player_time > note.start + note.duration {
-                            self.auto_play.as_mut().unwrap().remove(0);
+                            self.game.auto_play.as_mut().unwrap().remove(0);
                             continue;
                         }
 
@@ -277,11 +327,11 @@ impl Component for GameScreen {
                             if (note.start - player_time) < 0.02
                                 && (player_time - note.start) < 0.05
                             {
-                                app.player.play(app.sounds["don"].clone())?;
-                                self.hit.replace(Hit::Don);
-                                self.last_hit_type.replace(Hit::Don);
-                                self.hit_show = app.args.tps as i32 / 40;
-                                self.auto_play.as_mut().unwrap().remove(0);
+                                app.audio.play_effect(app.audio.effects.don()).await?;
+                                self.game.hit.replace(Hit::Don);
+                                self.game.last_hit_type.replace(Hit::Don);
+                                self.game.hit_show = app.args.tps as i32 / 4;
+                                self.game.auto_play.as_mut().unwrap().remove(0);
                             } else {
                                 break;
                             }
@@ -289,49 +339,104 @@ impl Component for GameScreen {
                             if (note.start - player_time) < 0.02
                                 && (player_time - note.start) < 0.05
                             {
-                                app.player.play(app.sounds["kat"].clone())?;
-                                self.hit.replace(Hit::Kat);
-                                self.last_hit_type.replace(Hit::Kat);
-                                self.hit_show = app.args.tps as i32 / 40;
-                                self.auto_play.as_mut().unwrap().remove(0);
+                                app.audio.play_effect(app.audio.effects.kat()).await?;
+                                self.game.hit.replace(Hit::Kat);
+                                self.game.last_hit_type.replace(Hit::Kat);
+                                self.game.hit_show = app.args.tps as i32 / 4;
+                                self.game.auto_play.as_mut().unwrap().remove(0);
                             } else {
                                 break;
                             }
                         } else if note.variant == TaikoNoteVariant::Both {
                             if player_time > note.start {
-                                if self.auto_play_combo_sleep == 0 {
-                                    app.player.play(app.sounds["don"].clone())?;
-                                    self.hit.replace(Hit::Don);
-                                    self.last_hit_type.replace(Hit::Don);
-                                    self.hit_show = app.args.tps as i32 / 40;
-                                    self.auto_play_combo_sleep = app.args.tps / 20;
+                                if self.game.auto_play_combo_sleep == 0 {
+                                    app.audio.play_effect(app.audio.effects.don()).await?;
+                                    self.game.hit.replace(Hit::Don);
+                                    self.game.last_hit_type.replace(Hit::Don);
+                                    self.game.hit_show = app.args.tps as i32 / 4;
+                                    self.game.auto_play_combo_sleep = app.args.tps / 20;
                                 } else {
-                                    self.auto_play_combo_sleep -= 1;
+                                    self.game.auto_play_combo_sleep -= 1;
                                 }
                                 break;
                             } else {
                                 break;
                             }
                         } else {
-                            self.auto_play.as_mut().unwrap().remove(0);
+                            self.game.auto_play.as_mut().unwrap().remove(0);
                         }
                     }
                 }
 
                 let input: InputState<Hit> = InputState {
                     time: player_time,
-                    hit: self.hit.take(),
+                    hit: self.game.hit.take(),
                 };
 
-                app.output = app.taiko.as_mut().unwrap().forward(input);
-                if app.output.judgement.is_some() {
-                    self.last_hit = match app.output.judgement.unwrap() {
+                self.game.output = self.game.taiko.as_mut().unwrap().forward(input);
+                if self.game.output.judgement.is_some() {
+                    self.game.last_hit = match self.game.output.judgement.unwrap() {
                         Judgement::Great => 1,
                         Judgement::Ok => 2,
                         Judgement::Miss => 3,
                         _ => 0,
                     };
-                    self.last_hit_show = 6;
+                    self.game.last_hit_show = app.args.tps as i32 / 10;
+                }
+
+                let course = self.game.course.as_ref().unwrap();
+                let difficulty = course.course as usize;
+                let level = course.level.unwrap_or(0) as usize;
+                let interval = app.args.tps as i32 / 3;
+                self.game.guage_color = if self.game.output.gauge == 1.0 {
+                    self.game.guage_color_change += 1;
+                    if self.game.guage_color_change >= interval {
+                        self.game.guage_color_change = 0;
+                    }
+                    if self.game.guage_color_change >= interval * 3 / 4 {
+                        Color::Cyan
+                    } else if self.game.guage_color_change >= interval * 2 / 4 {
+                        Color::Yellow
+                    } else if self.game.guage_color_change >= interval / 4 {
+                        Color::Green
+                    } else {
+                        Color::White
+                    }
+                } else if self.game.output.gauge
+                    >= (GUAGE_PASS_THRESHOLD[difficulty][level]
+                        / GUAGE_FULL_THRESHOLD[difficulty][level])
+                {
+                    Color::Yellow
+                } else {
+                    Color::White
+                };
+
+                if self.game.last_hit_show > 0 {
+                    self.game.last_hit_show -= 1;
+                }
+                if self.game.last_hit_type.is_some() && self.game.hit_show > 0 {
+                    self.game.hit_show -= 1;
+                }
+
+                self.topbar.set_game_text(
+                    &self.game.song_title,
+                    COURSE_TYPE[course.course as usize],
+                    player_time,
+                    self.game.output.score,
+                    self.game.output.current_combo,
+                    self.game.output.max_combo,
+                );
+            }
+            Event::FocusLost => {
+                if self.game.status == GameStatus::Playing {
+                    app.audio.pause().await?;
+                    self.game.status = GameStatus::AutoPaused;
+                }
+            }
+            Event::FocusGained => {
+                if self.game.status == GameStatus::AutoPaused {
+                    app.audio.resume().await?;
+                    self.game.status = GameStatus::Playing;
                 }
             }
             _ => {}
@@ -341,12 +446,8 @@ impl Component for GameScreen {
     }
 
     async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
-        app.enter_countdown = app.args.tps as i16 * -3;
-
-        let song = app.selected_song.as_ref().unwrap();
-
-        let selected = app.course_selector.selected().unwrap_or(0);
-        let mut course = song.tja().courses.get(selected).unwrap().clone();
+        let song = self.game.song.as_ref().unwrap();
+        let course = self.game.course.as_mut().unwrap();
 
         let offset = song.tja().header.offset.unwrap_or(0.0) as f64;
         for note in course.notes.iter_mut() {
@@ -361,86 +462,71 @@ impl Component for GameScreen {
             scorediff: course.scorediff,
             notes: course.notes.clone(),
         };
+        self.game.taiko.replace(DefaultTaikoEngine::new(source));
 
         if app.args.auto {
-            self.auto_play.replace(course.notes.clone());
+            self.game.auto_play.replace(course.notes.clone());
+        } else {
+            self.game.auto_play.take();
         }
 
-        app.selected_course.replace(course);
-        app.taiko.replace(DefaultTaikoEngine::new(source));
-
-        if let Some(mut playing) = app.playing.take() {
-            playing.stop(Tween::default())?;
+        if let Some(token) = &app.schedule_cancellation {
+            token.cancel();
         }
-        app.player.pause(Tween::default())?;
-        let settings = StaticSoundSettings::new().volume(app.args.songvol as f64 / 100.0);
-        app.playing.replace(
-            app.player
-                .play(song.music().await?.with_settings(settings))?,
-        );
 
-        app.game_ticks.clear();
-
-        Ok(())
-    }
-
-    async fn leave(&mut self, app: &mut AppGlobalState, next: Page) -> Result<()> {
-        app.enter_countdown = -1;
-        if next == Page::CourseMenu {
-            app.taiko.take();
-            app.selected_course.take();
+        if app.audio.is_playing() {
+            app.audio.stop().await?;
         }
-        if let Some(mut playing) = app.playing.take() {
-            playing.stop(Tween::default())?;
-        }
+
+        let settings = StaticSoundSettings::new().volume(app.args.songvol);
+        app.audio
+            .play(song.music().await?.with_settings(settings))
+            .await?;
+        app.audio.pause().await?;
+
+        self.game.enter_countdown = app.args.tps as i32 * -3;
+
+        self.game.song_title = song.tja().header.title.clone().unwrap();
+
         Ok(())
     }
 }
 
-pub struct GameResult {
+#[derive(Debug, Clone)]
+pub struct GameResultState {
     result: Option<Final>,
 }
 
-impl Component for GameResult {
-    fn new() -> Self {
+impl Default for GameResultState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GameResultState {
+    pub fn new() -> Self {
         Self { result: None }
     }
+}
 
-    fn render(&mut self, app: &mut AppGlobalState, f: &mut Frame<'_>, area: Rect) -> Result<()> {
-        if self.result.is_none() {
+pub(crate) trait GameResult {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()>;
+    async fn handle(
+        &mut self,
+        app: &mut AppGlobalState,
+        event: Event,
+        tx: UnboundedSender<Action>,
+    ) -> Result<()>;
+    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()>;
+}
+
+impl GameResult for PageStates {
+    fn render(&self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        if self.result.result.is_none() {
             return Ok(());
         }
 
-        let max_latency = app
-            .game_ticks
-            .iter()
-            .enumerate()
-            .map(|(i, tick)| {
-                if i == 0 {
-                    return 0;
-                }
-                let last_tick = app.game_ticks.get(i - 1).unwrap();
-                let duration = tick.duration_since(*last_tick);
-                duration.as_millis()
-            })
-            .max()
-            .unwrap_or(0);
-        let avg_latency = app
-            .game_ticks
-            .iter()
-            .enumerate()
-            .map(|(i, tick)| {
-                if i == 0 {
-                    return 0;
-                }
-                let last_tick = app.game_ticks.get(i - 1).unwrap();
-                let duration = tick.duration_since(*last_tick);
-                duration.as_millis()
-            })
-            .sum::<u128>()
-            / app.game_ticks.len() as u128;
-
-        let result = self.result.as_ref().unwrap();
+        let result = self.result.result.as_ref().unwrap();
 
         let table = Table::new(
             vec![
@@ -468,13 +554,6 @@ impl Component for GameResult {
                         },
                     )),
                 ]),
-                Row::new(vec![
-                    Cell::from("Max Latency"),
-                    Cell::from(format!("{} ms", max_latency)),
-                    Cell::from("Avg Latency"),
-                    Cell::from(format!("{} ms", avg_latency)),
-                ])
-                .style(Style::default().dim()),
             ],
             vec![
                 Constraint::Fill(1),
@@ -489,9 +568,9 @@ impl Component for GameResult {
         Ok(())
     }
 
-    fn handle(
+    async fn handle(
         &mut self,
-        app: &mut AppGlobalState,
+        _app: &mut AppGlobalState,
         event: Event,
         tx: UnboundedSender<Action>,
     ) -> Result<()> {
@@ -526,20 +605,13 @@ impl Component for GameResult {
         Ok(())
     }
 
-    async fn enter(&mut self, app: &mut AppGlobalState) -> Result<()> {
-        self.result.replace(app.taiko.as_mut().unwrap().finalize());
-        Ok(())
-    }
-
-    async fn leave(&mut self, app: &mut AppGlobalState, next: Page) -> Result<()> {
-        if next == Page::SongMenu {
-            app.taiko.take();
-            app.selected_course.take();
-            app.selected_song.take();
-        }
-        if let Some(mut playing) = app.playing.take() {
-            playing.stop(Tween::default())?;
-        }
+    async fn enter(&mut self, _app: &mut AppGlobalState) -> Result<()> {
+        let tja = self.game.song.as_ref().unwrap().tja();
+        self.topbar.set_text(format!(
+            "{} ({})",
+            tja.header.title.as_ref().unwrap(),
+            COURSE_TYPE[self.game.course.as_ref().unwrap().course as usize]
+        ));
         Ok(())
     }
 }
