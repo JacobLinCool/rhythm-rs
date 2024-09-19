@@ -63,15 +63,7 @@ impl GameState {
             song: None,
             course: None,
             taiko: None,
-            output: OutputState {
-                finished: false,
-                score: 0,
-                current_combo: 0,
-                max_combo: 0,
-                gauge: 0.0,
-                judgement: None,
-                display: vec![],
-            },
+            output: OutputState::default(),
             last_hit: 0,
             last_hit_show: 0,
             hit: None,
@@ -198,6 +190,16 @@ impl GameScreen for PageStates {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        if let Some(c) = self.game.output.drumroll {
+            let str = format!("{}", c);
+            for (i, c) in str.chars().enumerate() {
+                spans[hit_span + i] = Span::styled(
+                    format!("{}", c),
+                    Style::default().bold().magenta().on_yellow(),
+                );
             }
         }
 

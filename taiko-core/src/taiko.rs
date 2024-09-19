@@ -13,7 +13,6 @@ pub enum Hit {
     Kat,
 }
 
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct Personalization {
     pub course: u8,
@@ -162,6 +161,24 @@ pub struct OutputState {
 
     /// Display state
     pub display: Vec<CalculatedNote>,
+
+    // Current drumroll state
+    pub drumroll: Option<u32>,
+}
+
+impl Default for OutputState {
+    fn default() -> Self {
+        Self {
+            finished: false,
+            score: 0,
+            current_combo: 0,
+            max_combo: 0,
+            gauge: 0.0,
+            judgement: None,
+            display: vec![],
+            drumroll: None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Debug, Serialize, Deserialize)]
@@ -386,6 +403,23 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             .cloned()
             .collect::<Vec<_>>();
 
+        let drumroll = available_display
+            .first()
+            .map(|note| {
+                if note.variant() == TaikoNoteVariant::Both {
+                    let (head, _) = note.position(input.time).unwrap();
+                    // if can be hit
+                    if head < 0.1 && note.inner.volume < 1000 && note.inner.volume > 0 {
+                        Some(note.inner.volume as u32)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .flatten();
+
         let mut display = self.passed_display.clone();
         display.extend(available_display);
 
@@ -397,6 +431,7 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             gauge: self.gauge,
             judgement,
             display,
+            drumroll,
         }
     }
 
