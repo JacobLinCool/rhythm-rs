@@ -25,3 +25,5 @@ Cargo.lock
 
 #/target
 .DS_Store
+
+taiko-game/profile.csv

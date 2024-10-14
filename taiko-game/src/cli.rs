@@ -79,4 +79,11 @@ pub struct AppArgs {
 
     #[arg(long, value_name = "ADDR", help = "Connect to a multiplayer game")]
     pub connect: Option<String>,
+
+    #[arg(
+        long,
+        help = "Enable the profile mode, this will print the profile information of the game to profile.csv",
+        default_value_t = false
+    )]
+    pub profile: bool,
 }

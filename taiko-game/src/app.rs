@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use taiko_core::Hit;
 
 use crate::cli::AppArgs;
+use crate::trace_dbg;
 use crate::{
     action::Action,
     audio::AppAudio,
@@ -164,14 +165,29 @@ impl App {
 
         self.ui.enter()?;
 
+        let mut csv_writer = if self.state.args.profile {
+            Some(csv::Writer::from_path("profile.csv")?)
+        } else {
+            None
+        };
+
+        if let Some(writer) = csv_writer.as_mut() {
+            writer.write_record(&["type", "latency_ms", "absolute_time_ms"])?;
+        }
+
+        let start_time = std::time::Instant::now();
+
         loop {
+            let start = tokio::time::Instant::now();
+            let mut act = None;
             tokio::select! {
                 _ = token.cancelled() => {
                     break;
                 }
-                e = input_rx.recv() => {
-                    if let Ok(e) = e {
-                        match e {
+                input = input_rx.recv() => {
+                    trace_dbg!(&input);
+                    if let Ok(input) = input {
+                        match input {
                             crossterm::event::Event::Key(k) => {
                                 self.ui.handle(&mut self.state, tui::Event::Key(k), action_tx.clone()).await?;
                             },
@@ -188,9 +204,19 @@ impl App {
                             crossterm::event::Event::Paste(_) => {},
                         }
                     }
+                    if let Some(writer) = csv_writer.as_mut() {
+                        let elapsed = start.elapsed();
+                        let absolute_time = start_time.elapsed();
+                        writer.write_record(&[
+                            "Input",
+                            &format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
+                            &format!("{:.3}", absolute_time.as_secs_f64() * 1000.0)
+                        ])?;
+                    }
                 }
                 action = action_rx.recv() => {
                     if let Some(action) = action {
+                        act.replace(action.clone());
                         match action {
                             Action::Quit => {
                                 token.cancel();
@@ -209,12 +235,42 @@ impl App {
                                 self.ui.tui.resize(Rect::new(0, 0, w, h))?;
                             }
                         }
+                        if let Some(writer) = csv_writer.as_mut() {
+                            let elapsed = start.elapsed();
+                            let absolute_time = start_time.elapsed();
+                            writer.write_record(&[
+                                action.to_string(),
+                                format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
+                                format!("{:.3}", absolute_time.as_secs_f64() * 1000.0)
+                            ])?;
+                        }
                     }
                 }
             }
+            let elapsed = start.elapsed();
+            if elapsed.as_millis() > 5 {
+                trace_dbg!(act);
+                trace_dbg!(elapsed);
+            }
         }
 
+        if let Some(mut writer) = csv_writer {
+            writer.flush()?;
+        }
         self.ui.exit()?;
         Ok(())
+    }
+}
+
+// Add this trait implementation to convert Action to String
+impl ToString for Action {
+    fn to_string(&self) -> String {
+        match self {
+            Action::Quit => "Quit".to_string(),
+            Action::Switch(_) => "Switch".to_string(),
+            Action::Tick => "Tick".to_string(),
+            Action::Render => "Render".to_string(),
+            Action::Resize(_, _) => "Resize".to_string(),
+        }
     }
 }

@@ -44,10 +44,8 @@ impl AppAudio {
                             handle.write().unwrap().stop(Tween::default()).unwrap();
                         }
                         let handle = player.play(*sound).unwrap();
-                        playing_tx
-                            .send(Some(Arc::new(RwLock::new(handle))))
-                            .unwrap();
-                        player.resume(Tween::default()).unwrap();
+                        let _ = playing_tx.send(Some(Arc::new(RwLock::new(handle))));
+                        let _ = player.resume(Tween::default());
                     }
                     MusicInstruction::Stop => {
                         if let Some(handle) = playing_tx.borrow().clone() {
@@ -56,10 +54,10 @@ impl AppAudio {
                         playing_tx.send(None).unwrap();
                     }
                     MusicInstruction::Pause => {
-                        player.pause(Tween::default()).unwrap();
+                        let _ = player.pause(Tween::default());
                     }
                     MusicInstruction::Resume => {
-                        player.resume(Tween::default()).unwrap();
+                        let _ = player.resume(Tween::default());
                     }
                 }
             }
