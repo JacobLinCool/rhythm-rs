@@ -8,8 +8,8 @@ use crate::{
     tui::{Event, Tui},
 };
 use color_eyre::eyre::Result;
-use ratatui::layout::{Constraint, Direction, Layout};
-use tokio::sync::mpsc::UnboundedSender;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -20,6 +20,7 @@ pub enum Page {
     Result,
 }
 
+#[derive(Clone)]
 pub struct PageStates {
     pub topbar: TopBar,
 
@@ -30,52 +31,104 @@ pub struct PageStates {
     pub result: GameResultState,
 }
 
-pub struct UI {
-    pub tui: Tui,
-    pub state: PageStates,
+pub enum RendererAction {
+    Render(PageStates),
+    Resize(u16, u16),
+    Exit,
 }
 
-impl UI {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            tui: Tui::new()?,
-            state: PageStates {
-                topbar: TopBar::new(),
-                page: Page::None,
-                songmenu: SongMenuState::new(),
-                coursemenu: CourseMenuState::new(),
-                game: GameState::new(),
-                result: GameResultState::new(),
-            },
-        })
+pub struct Renderer {
+    rx: UnboundedReceiver<RendererAction>,
+}
+
+impl Renderer {
+    pub fn new(rx: UnboundedReceiver<RendererAction>) -> Result<Self> {
+        Ok(Self { rx })
     }
 
-    pub fn render(&mut self) -> Result<()> {
-        self.tui.draw(|f| {
+    pub async fn run(&mut self) -> Result<()> {
+        let mut tui = Tui::new()?;
+
+        tui.enter()?;
+
+        while let Some(action) = self.rx.recv().await {
+            match action {
+                RendererAction::Exit => {
+                    break;
+                }
+                RendererAction::Render(state) => {
+                    self.render(&mut tui, state)?;
+                }
+                RendererAction::Resize(w, h) => {
+                    tui.resize(Rect::new(0, 0, w, h));
+                }
+            }
+        }
+
+        tui.exit()?;
+
+        Ok(())
+    }
+
+    pub fn render(&mut self, tui: &mut Tui, state: PageStates) -> Result<()> {
+        tui.draw(|f| {
             let size = f.size();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Fill(size.height - 1)].as_ref())
                 .split(size);
 
-            self.state.topbar.render(f, chunks[0]).unwrap();
+            state.topbar.render(f, chunks[0]).unwrap();
 
-            match self.state.page {
+            match state.page {
                 Page::SongMenu => {
-                    SongMenu::render(&self.state, f, chunks[1]).unwrap();
+                    SongMenu::render(&state, f, chunks[1]).unwrap();
                 }
                 Page::CourseMenu => {
-                    CourseMenu::render(&self.state, f, chunks[1]).unwrap();
+                    CourseMenu::render(&state, f, chunks[1]).unwrap();
                 }
                 Page::Game => {
-                    GameScreen::render(&self.state, f, chunks[1]).unwrap();
+                    GameScreen::render(&state, f, chunks[1]).unwrap();
                 }
                 Page::Result => {
-                    GameResult::render(&self.state, f, chunks[1]).unwrap();
+                    GameResult::render(&state, f, chunks[1]).unwrap();
                 }
                 _ => {}
             }
         })?;
+
+        Ok(())
+    }
+}
+
+pub struct UI {
+    pub state: PageStates,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    action_tx: Option<UnboundedSender<RendererAction>>,
+}
+
+impl UI {
+    pub fn new() -> Result<Self> {
+        let state = PageStates {
+            topbar: TopBar::new(),
+            page: Page::None,
+            songmenu: SongMenuState::new(),
+            coursemenu: CourseMenuState::new(),
+            game: GameState::new(),
+            result: GameResultState::new(),
+        };
+
+        Ok(Self {
+            state,
+            handle: None,
+            action_tx: None,
+        })
+    }
+
+    pub fn render(&mut self) -> Result<()> {
+        if let Some(tx) = self.action_tx.as_ref() {
+            tx.send(RendererAction::Render(self.state.clone()))?;
+        }
 
         Ok(())
     }
@@ -125,12 +178,33 @@ impl UI {
         Ok(())
     }
 
+    pub fn resize(&mut self, w: u16, h: u16) -> Result<()> {
+        if let Some(tx) = self.action_tx.as_ref() {
+            tx.send(RendererAction::Resize(w, h))?;
+        }
+
+        Ok(())
+    }
+
     pub fn enter(&mut self) -> Result<()> {
-        self.tui.enter()?;
+        if self.handle.is_none() {
+            let (tx, rx) = unbounded_channel();
+            let mut renderer = Renderer::new(rx)?;
+            let handle = tokio::task::spawn(async move {
+                renderer.run().await.unwrap();
+            });
+            self.handle = Some(handle);
+            self.action_tx = Some(tx);
+        }
+
         Ok(())
     }
 
     pub fn exit(&mut self) -> Result<()> {
-        self.tui.exit()
+        if let Some(tx) = self.action_tx.take() {
+            tx.send(RendererAction::Exit).unwrap();
+        }
+
+        Ok(())
     }
 }

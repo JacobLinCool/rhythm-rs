@@ -30,6 +30,7 @@ pub enum GameStatus {
     AutoPaused,
 }
 
+#[derive(Clone)]
 pub struct GameState {
     pub song: Option<Song>,
     pub course: Option<TJACourse>,

@@ -199,6 +199,7 @@ pub trait TaikoEngine<H> {
     fn finalize(&self) -> Final;
 }
 
+#[derive(Clone)]
 pub struct DefaultTaikoEngine {
     rhythm: Rhythm<CalculatedNote>,
 
@@ -403,22 +404,19 @@ impl TaikoEngine<Hit> for DefaultTaikoEngine {
             .cloned()
             .collect::<Vec<_>>();
 
-        let drumroll = available_display
-            .first()
-            .map(|note| {
-                if note.variant() == TaikoNoteVariant::Both {
-                    let (head, _) = note.position(input.time).unwrap();
-                    // if can be hit
-                    if head < 0.1 && note.inner.volume < 1000 && note.inner.volume > 0 {
-                        Some(note.inner.volume as u32)
-                    } else {
-                        None
-                    }
+        let drumroll = available_display.first().and_then(|note| {
+            if note.variant() == TaikoNoteVariant::Both {
+                let (head, _) = note.position(input.time).unwrap();
+                // if can be hit
+                if head < 0.1 && note.inner.volume < 1000 && note.inner.volume > 0 {
+                    Some(note.inner.volume as u32)
                 } else {
                     None
                 }
-            })
-            .flatten();
+            } else {
+                None
+            }
+        });
 
         let mut display = self.passed_display.clone();
         display.extend(available_display);

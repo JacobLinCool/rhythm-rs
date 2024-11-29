@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use taiko_core::Hit;
 
 use crate::cli::AppArgs;
-use crate::trace_dbg;
 use crate::{
     action::Action,
     audio::AppAudio,
@@ -172,49 +171,59 @@ impl App {
         };
 
         if let Some(writer) = csv_writer.as_mut() {
-            writer.write_record(&["type", "latency_ms", "absolute_time_ms"])?;
+            writer.write_record(&["timestamp_s", "type", "duration_ms"])?;
         }
 
         let start_time = std::time::Instant::now();
 
         loop {
-            let start = tokio::time::Instant::now();
             let mut act = None;
             tokio::select! {
                 _ = token.cancelled() => {
                     break;
                 }
                 input = input_rx.recv() => {
-                    trace_dbg!(&input);
+                    let timestamp = start_time.elapsed().as_secs_f64();
+                    let start = tokio::time::Instant::now();
+                    let mut input_type = "None";
                     if let Ok(input) = input {
                         match input {
                             crossterm::event::Event::Key(k) => {
+                                input_type = "Key";
                                 self.ui.handle(&mut self.state, tui::Event::Key(k), action_tx.clone()).await?;
                             },
                             crossterm::event::Event::FocusGained => {
+                                input_type = "FocusGained";
                                 self.ui.handle(&mut self.state, tui::Event::FocusGained, action_tx.clone()).await?;
                             },
                             crossterm::event::Event::FocusLost => {
+                                input_type = "FocusLost";
                                 self.ui.handle(&mut self.state, tui::Event::FocusLost, action_tx.clone()).await?;
                             },
                             crossterm::event::Event::Resize(w, h) => {
+                                input_type = "Resize";
                                 action_tx.send(Action::Resize(w, h))?;
                             },
-                            crossterm::event::Event::Mouse(_) => {},
-                            crossterm::event::Event::Paste(_) => {},
+                            crossterm::event::Event::Mouse(_) => {
+                                input_type = "Mouse";
+                            },
+                            crossterm::event::Event::Paste(_) => {
+                                input_type = "Paste";
+                            },
                         }
                     }
                     if let Some(writer) = csv_writer.as_mut() {
-                        let elapsed = start.elapsed();
-                        let absolute_time = start_time.elapsed();
+                        let duration = start.elapsed().as_secs_f64() * 1000.0;
                         writer.write_record(&[
-                            "Input",
-                            &format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
-                            &format!("{:.3}", absolute_time.as_secs_f64() * 1000.0)
+                            format!("{:.3}", timestamp),
+                            input_type.to_string(),
+                            format!("{:.3}", duration)
                         ])?;
                     }
                 }
                 action = action_rx.recv() => {
+                    let timestamp = start_time.elapsed().as_secs_f64();
+                    let start = tokio::time::Instant::now();
                     if let Some(action) = action {
                         act.replace(action.clone());
                         match action {
@@ -232,25 +241,19 @@ impl App {
                                 self.ui.render()?;
                             }
                             Action::Resize(w, h) => {
-                                self.ui.tui.resize(Rect::new(0, 0, w, h))?;
+                                self.ui.resize(w, h)?;
                             }
                         }
                         if let Some(writer) = csv_writer.as_mut() {
-                            let elapsed = start.elapsed();
-                            let absolute_time = start_time.elapsed();
+                            let duration = start.elapsed().as_secs_f64() * 1000.0;
                             writer.write_record(&[
+                                format!("{:.3}", timestamp),
                                 action.to_string(),
-                                format!("{:.3}", elapsed.as_secs_f64() * 1000.0),
-                                format!("{:.3}", absolute_time.as_secs_f64() * 1000.0)
+                                format!("{:.3}", duration)
                             ])?;
                         }
                     }
                 }
-            }
-            let elapsed = start.elapsed();
-            if elapsed.as_millis() > 5 {
-                trace_dbg!(act);
-                trace_dbg!(elapsed);
             }
         }
 

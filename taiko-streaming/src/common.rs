@@ -10,8 +10,14 @@ use tokio::sync::broadcast;
 pub type SongHash = String;
 pub type SentEvent<H, P> = (String, StreamingEvent<H, P>);
 
-pub trait StreamableData: Clone + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync {}
-impl<T> StreamableData for T where T: Clone + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync {}
+pub trait StreamableData:
+    Clone + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync
+{
+}
+impl<T> StreamableData for T where
+    T: Clone + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync
+{
+}
 
 /// `StreamingEvent` represents the types of events that can occur in the streaming session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,11 +94,7 @@ pub trait StreamingServer {
 
 /// Trait representing a client in a streaming session that can send and receive game events.
 #[async_trait]
-pub trait StreamingClient<
-    H: StreamableData,
-    P: StreamableData,
->
-{
+pub trait StreamingClient<H: StreamableData, P: StreamableData> {
     /// Creates a new `StreamingClient` with the specified address and unique client ID.
     ///
     /// # Arguments
