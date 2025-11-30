@@ -95,19 +95,21 @@ impl<T: Note> Rhythm<T> {
 
     /// Binary search to find first note index where start + duration >= time
     /// (the note could still be active)
-    fn find_first_potentially_hitable(&self) -> usize {
+    fn find_first_potentially_hitable(&mut self) -> usize {
         // Start from the cached scan_start_idx to avoid re-scanning already-passed notes
         let time = self.time;
-        let slice = &self.availables[self.scan_start_idx..];
+        let len = self.availables.len();
 
-        // Linear scan from scan_start_idx since we're advancing forward in time
-        // This is O(1) amortized as we only advance, never go back
-        for (i, note) in slice.iter().enumerate() {
+        // Advance scan_start_idx past notes that have definitely ended
+        while self.scan_start_idx < len {
+            let note = &self.availables[self.scan_start_idx];
             if note.start() + note.duration() >= time {
-                return self.scan_start_idx + i;
+                break;
             }
+            self.scan_start_idx += 1;
         }
-        self.availables.len()
+
+        self.scan_start_idx
     }
 
     /// Binary search to find last note index where start <= time
@@ -127,16 +129,6 @@ impl<T: Note> Rhythm<T> {
         let mut removed = vec![];
         let time = self.time;
 
-        // Update scan_start_idx to skip notes that have definitely passed
-        // A note has passed if start + duration < time
-        while self.scan_start_idx < self.availables.len() {
-            let note = &self.availables[self.scan_start_idx];
-            if note.start() + note.duration() >= time || note.volume() == 0 {
-                break;
-            }
-            self.scan_start_idx += 1;
-        }
-
         self.availables.retain(|note| {
             let keep = note.start() + note.duration() >= time && note.volume() > 0;
             if !keep && note.volume() > 0 {
@@ -145,7 +137,7 @@ impl<T: Note> Rhythm<T> {
             keep
         });
 
-        // Reset scan_start_idx after retain since indices may have shifted
+        // Reset scan_start_idx after retain since indices have shifted
         self.scan_start_idx = 0;
 
         removed
