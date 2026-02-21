@@ -1,49 +1,28 @@
 [package]
 name = "taiko-game"
-description = "A taiko game written in Rust."
-version = "0.0.8"
-license = "MIT"
-authors = ["JacobLinCool <jacob@csie.cool>"]
-homepage = "https://github.com/JacobLinCool/rhythm-rs"
-repository = "https://github.com/JacobLinCool/rhythm-rs"
-edition = "2021"
-build = "build.rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Playable TUI taiko client backed by the deterministic rhythm engine"
 
 [[bin]]
 name = "taiko"
 path = "src/main.rs"
 
 [dependencies]
-rhythm-core = { path = "../rhythm-core", version = "0.2.0" }
-tja = { path = "../tja", version = "0.2.3" }
-taiko-core = { path = "../taiko-core", version = "0.0.2" }
-better-panic = "0.3.0"
-clap = { version = "4.5.4", features = ["derive", "cargo", "wrap_help", "unicode", "string", "unstable-styles"] }
-color-eyre = "0.6.3"
-config = "0.14.0"
-crossterm = { version = "0.27.0", features = ["serde", "event-stream"] }
-derive_deref = "1.1.1"
-directories = "5.0.1"
-futures = "0.3.30"
-human-panic = "2.0.0"
-lazy_static = "1.4.0"
-log = "0.4.21"
-pretty_assertions = "1.4.0"
-ratatui = { version = "=0.26.1", features = ["serde", "macros"] }
-serde = { version = "1.0.188", features = ["derive"] }
-serde_json = "1.0.107"
-signal-hook = "0.3.17"
-strip-ansi-escapes = "0.2.0"
-strum = { version = "0.26.1", features = ["derive"] }
-tokio = { version = "1.32.0", features = ["full"] }
-tokio-util = "0.7.9"
-tracing = "0.1.37"
-tracing-error = "0.2.0"
-tracing-subscriber = { version = "0.3.17", features = ["env-filter", "serde"] }
-anyhow = "1.0.82"
-encoding_rs = "0.8.34"
-kira = "0.8.7"
-glob = "0.3.1"
-
-[build-dependencies]
-vergen = { version = "8.3.1", features = [ "build", "git", "gitoxide", "cargo" ]}
+anyhow = "1.0.98"
+clap = { version = "4.5.32", features = ["derive"] }
+crossterm = "0.28.1"
+kira = "0.9.6"
+ratatui = "0.29.0"
+rayon = "1.11.0"
+rhythm-chart = { path = "../rhythm-chart", version = "0.1.0" }
+rhythm-core = { path = "../rhythm-core", version = "0.3.0" }
+rhythm-importer-tja = { path = "../rhythm-importer-tja", version = "0.1.0" }
+rhythm-mode-taiko = { path = "../rhythm-mode-taiko", version = "0.1.0" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+walkdir = "2.5.0"

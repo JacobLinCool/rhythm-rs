@@ -1,47 +1,57 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+mod app;
+mod audio;
+#[cfg(test)]
+mod bench;
+mod branch;
+mod cli;
+mod input;
+mod loader;
+mod perf;
+mod screen;
+mod song_filter;
+mod theme;
+mod tui;
 
-pub mod action;
-pub mod app;
-pub mod assets;
-pub mod cli;
-pub mod component;
-pub mod latency;
-pub mod loader;
-pub mod tui;
-pub mod utils;
+use std::time::Instant;
 
+use anyhow::Result;
+use app::App;
 use clap::Parser;
-use cli::AppArgs;
-use color_eyre::eyre::Result;
+use crossterm::event::KeyEventKind;
+use tui::{Tui, UiEvent};
 
-use crate::{
-    app::App,
-    utils::{initialize_logging, initialize_panic_handler, version},
-};
+use crate::cli::CliArgs;
 
-async fn tokio_main() -> Result<()> {
-    initialize_logging()?;
-
-    initialize_panic_handler()?;
-
-    let args = AppArgs::parse();
+fn main() -> Result<()> {
+    let args = CliArgs::parse();
     let mut app = App::new(args)?;
-    app.run().await?;
 
-    Ok(())
-}
+    let mut tui = Tui::new(app.args.tps, 120)?;
+    tui.enter()?;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    if let Err(e) = tokio_main().await {
-        eprintln!(
-            "{} error: Application failed to start",
-            env!("CARGO_PKG_NAME")
-        );
-        Err(e)
-    } else {
-        Ok(())
+    loop {
+        if app.should_quit() {
+            break;
+        }
+
+        match tui.next_event()? {
+            UiEvent::Tick => app.handle_tick(),
+            UiEvent::Frame => {
+                let start = Instant::now();
+                tui.draw(|frame| app.render(frame))?;
+                app.record_frame_time(start.elapsed());
+            }
+            UiEvent::Key(key) => {
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    app.handle_key(key);
+                }
+            }
+            UiEvent::Resize(width, height) => {
+                tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
+            }
+        }
     }
+
+    tui.exit()?;
+    Ok(())
 }

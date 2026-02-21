@@ -1,76 +1,64 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
-use crate::utils::version;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BranchPolicy {
+    Auto,
+    Accuracy,
+    Roll,
+    Score,
+    FixedRoute,
+    None,
+}
 
-#[derive(Parser, Debug)]
-#[command(author, version = version(), about)]
-pub struct AppArgs {
+#[derive(Debug, Parser)]
+#[command(author, version, about = "Playable TUI taiko game")]
+pub struct CliArgs {
     #[arg(
-        short,
         long,
         value_name = "PATH",
-        help = "Path to the song directory",
-        default_value = "./songs"
+        default_value = "./taiko-game/songs",
+        help = "Song directory; scanned recursively for .tja"
     )]
     pub songdir: PathBuf,
 
     #[arg(
-        short,
         long,
-        value_name = "TICK_RATE",
-        help = "The tick rate of the game",
-        default_value_t = 400
+        value_name = "N",
+        default_value_t = 240,
+        help = "Logic ticks per second"
     )]
-    pub tps: u16,
-
-    #[arg(
-        short,
-        long,
-        value_name = "AUTO",
-        help = "Enable auto mode",
-        default_value_t = false
-    )]
-    pub auto: bool,
+    pub tps: u32,
 
     #[arg(
         long,
-        value_name = "SEVOL",
-        help = "The volume of the sound effects",
-        default_value_t = 100
-    )]
-    pub sevol: u8,
-
-    #[arg(
-        long,
-        value_name = "SONGVOL",
-        help = "The volume of the song music",
-        default_value_t = 100
-    )]
-    pub songvol: u8,
-
-    #[arg(
-        long,
-        value_name = "TRACK_OFFSET",
-        help = "The track offset of the game, this is used to adjust the timing of the notes, if the notes are too early, increase this value, if the notes are too late, decrease this value. The unit is in seconds.",
-        default_value_t = 0.0
+        default_value_t = 0.0,
+        help = "Initial note offset in seconds (positive delays notes; adjustable in Course Menu)"
     )]
     pub track_offset: f64,
 
     #[arg(
         long,
-        value_name = "LATENCY_GATE",
-        help = "The latency gate of the game, if the latency is higher than this value, the game will panic",
-        default_value_t = 10000
+        action = clap::ArgAction::Set,
+        default_value_t = true,
+        help = "Enable song demo preview in song/course menu"
     )]
-    pub latency_gate: u16,
+    pub demo: bool,
 
     #[arg(
         long,
-        value_name = "ECO",
-        help = "Enable eco mode. In the ECO mode, the CPU usage will be about 10% of the normal mode, however, latency will be higher in some cases.",
-        default_value_t = false
+        default_value_t = 100,
+        value_parser = clap::value_parser!(u8).range(0..=100),
+        help = "Song volume percentage"
     )]
-    pub eco: bool,
+    pub songvol: u8,
+
+    #[arg(
+        long,
+        default_value_t = 100,
+        value_parser = clap::value_parser!(u8).range(0..=100),
+        help = "SE volume percentage"
+    )]
+    pub sevol: u8,
 }

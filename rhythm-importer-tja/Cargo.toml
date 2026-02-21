@@ -1,18 +1,22 @@
 [package]
-name = "rhythm-core"
-version = "0.3.0"
+name = "rhythm-importer-tja"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Deterministic headless runtime for rhythm games"
+description = "TJA importer adapter from crates.io tja to rhythm-chart CanonicalChart"
 
 [lib]
-name = "rhythm_core"
+name = "rhythm_importer_tja"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+encoding_rs = "0.8.35"
 rhythm-chart = { path = "../rhythm-chart", version = "0.1.0" }
-thiserror.workspace = true
+tja = "=0.5.0"
+
+[dev-dependencies]
+serde_json = "1.0.140"
