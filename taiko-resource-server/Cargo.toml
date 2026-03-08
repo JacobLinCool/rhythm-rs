@@ -1,0 +1,26 @@
+[package]
+name = "taiko-resource-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "HTTP resource server for taiko-game song libraries"
+
+[[bin]]
+name = "taiko-resource-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+axum = "0.8.6"
+clap = { version = "4.5.32", features = ["derive"] }
+hex = "0.4.3"
+rayon = "1.11.0"
+rhythm-importer-tja = { path = "../rhythm-importer-tja", version = "0.1.0" }
+serde = { workspace = true }
+sha2 = "0.10.9"
+taiko-resource-protocol = { path = "../taiko-resource-protocol", version = "0.1.0" }
+tokio = { version = "1.47.1", features = ["fs", "macros", "rt-multi-thread", "signal"] }
+walkdir = "2.5.0"

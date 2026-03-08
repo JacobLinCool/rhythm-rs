@@ -7,6 +7,8 @@ members = [
     "rhythm-mode-lane",
     "rhythm-mode-radial",
     "rhythm-importer-tja",
+    "taiko-resource-protocol",
+    "taiko-resource-server",
     "taiko-game",
 ]
 

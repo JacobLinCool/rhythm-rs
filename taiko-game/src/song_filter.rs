@@ -403,6 +403,12 @@ mod tests {
         }
 
         SongEntry {
+            source_locator: crate::loader::ResourceLocator::LocalPath(PathBuf::from(format!(
+                "/songs/{title}.tja"
+            ))),
+            audio_locator: crate::loader::ResourceLocator::LocalPath(PathBuf::from(format!(
+                "/songs/{title}.ogg"
+            ))),
             source_path: PathBuf::from(format!("/songs/{title}.tja")),
             audio_path: PathBuf::from(format!("/songs/{title}.ogg")),
             title: title.to_owned(),

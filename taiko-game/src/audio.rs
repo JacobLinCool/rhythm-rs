@@ -1,11 +1,12 @@
 use std::io::Cursor;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use kira::manager::{backend::DefaultBackend, AudioManager, AudioManagerSettings};
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::sound::PlaybackState;
 use kira::tween::Tween;
+
+use crate::resource::SongAudioSource;
 
 pub struct AudioEngine {
     manager: AudioManager<DefaultBackend>,
@@ -40,11 +41,20 @@ impl AudioEngine {
         })
     }
 
-    pub fn play_song(&mut self, path: &Path, start_seconds: f64, looping: bool) -> Result<()> {
+    pub fn play_song(
+        &mut self,
+        source: SongAudioSource,
+        start_seconds: f64,
+        looping: bool,
+    ) -> Result<()> {
         self.stop_song()?;
 
-        let base = StaticSoundData::from_file(path)
-            .with_context(|| format!("failed to open audio file {}", path.display()))?;
+        let base = match source {
+            SongAudioSource::FilePath(path) => StaticSoundData::from_file(&path)
+                .with_context(|| format!("failed to open audio file {}", path.display()))?,
+            SongAudioSource::Bytes(bytes) => StaticSoundData::from_cursor(Cursor::new(bytes))
+                .context("failed to decode remote audio stream")?,
+        };
         let mut data = base.volume(self.song_volume);
 
         if start_seconds > 0.0 {

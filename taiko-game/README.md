@@ -17,12 +17,31 @@ cargo run -p taiko-game --release -- \
   --songdir ./taiko-game/songs
 ```
 
+Remote resource mode:
+
+```bash
+cargo run -p taiko-game --release -- server \
+  --songdir ./taiko-game/songs --host 127.0.0.1 --port 4150
+
+cargo run -p taiko-game --release -- \
+  --resource-endpoint http://127.0.0.1:4150/
+```
+
 ## CLI
 
 ```text
-taiko --songdir <PATH> --tps <N> --track-offset <SEC> \
-      --demo <true|false> --songvol <0..100> --sevol <0..100>
+taiko --songdir <PATH> [--resource-endpoint <URL>] --tps <N> --track-offset <SEC> \
+      --demo <true|false> --songvol <0..100> --sevol <0..100> \
+      [--resource-cache-memory-only]
+taiko server --songdir <PATH> [--host <HOST>] [--port <PORT>]
+taiko cache path
+taiko cache list
+taiko cache clear --endpoint <URL>
+taiko cache clear --all
 ```
+
+When `--resource-endpoint` is set, song list/chart/audio are loaded through HTTP and `--songdir` is ignored by the client.
+Remote mode uses app-data disk cache by default (`charts`/`audio` keyed by content hash). Use `--resource-cache-memory-only` to disable disk cache.
 
 ## Controls
 

@@ -14,8 +14,9 @@ use crate::audio::AudioEngine;
 use crate::branch::BranchController;
 use crate::cli::{BranchPolicy, CliArgs};
 use crate::input::{map_game_hit, map_menu_intent, MenuIntent};
-use crate::loader::{load_course_chart, load_song_library, CourseEntry, SongEntry};
+use crate::loader::{CourseEntry, SongEntry};
 use crate::perf::{PerfMeter, PerfSnapshot};
+use crate::resource::ResourceBackend;
 use crate::screen;
 use crate::song_filter::SongFilter;
 use crate::theme::Theme;
@@ -176,6 +177,7 @@ pub struct App {
     pub(crate) demo_pending: Option<(Instant, usize)>,
     pub(crate) demo_playing_song: Option<usize>,
     loaded_course_chart: Option<LoadedCourseChart>,
+    resource_backend: ResourceBackend,
     audio: AudioEngine,
 }
 
@@ -185,8 +187,11 @@ impl App {
             bail!("--tps must be > 0");
         }
 
-        let library = load_song_library(&args.songdir)
-            .with_context(|| format!("failed to load song directory {}", args.songdir.display()))?;
+        let using_remote_resources = args.resource_endpoint.is_some();
+        let resource_backend = ResourceBackend::from_cli(&args)?;
+        let library = resource_backend
+            .load_song_library()
+            .context("failed to load song library")?;
 
         let mut app = Self {
             branch_policy: BranchPolicy::Auto,
@@ -198,6 +203,7 @@ impl App {
             note_offset_ms: quantize_offset_ms(args.track_offset),
             music_offset_ms: 0,
             viewport_width: 120,
+            resource_backend,
             audio: AudioEngine::new(args.songvol, args.sevol)?,
             args,
             page: Page::SongMenu,
@@ -223,7 +229,11 @@ impl App {
         if app.songs.is_empty() {
             app.page = Page::Error;
             app.error_message = Some(if app.load_warnings.is_empty() {
-                "no .tja charts found in song directory".to_owned()
+                if using_remote_resources {
+                    "no playable charts found from remote resource endpoint".to_owned()
+                } else {
+                    "no .tja charts found in song directory".to_owned()
+                }
             } else {
                 format!(
                     "no playable charts loaded, first error: {}",
@@ -623,7 +633,7 @@ impl App {
         let selected_song_index = self
             .selected_song_index()
             .ok_or_else(|| anyhow!("no selected song"))?;
-        let (audio_path, course_name, branch_decisions, engine, initial_output, autoplay_inputs) = {
+        let (audio_source, course_name, branch_decisions, engine, initial_output, autoplay_inputs) = {
             let song = self
                 .selected_song()
                 .ok_or_else(|| anyhow!("no selected song"))?;
@@ -644,9 +654,10 @@ impl App {
             } else {
                 Vec::new()
             };
+            let audio_source = self.resource_backend.load_song_audio(song)?;
 
             (
-                song.audio_path.clone(),
+                audio_source,
                 course.name.clone(),
                 course.branch_decisions.clone(),
                 engine,
@@ -656,7 +667,7 @@ impl App {
         };
 
         self.audio.stop_song()?;
-        self.audio.play_song(&audio_path, 0.0, false)?;
+        self.audio.play_song(audio_source, 0.0, false)?;
 
         let branch_controller =
             BranchController::new(self.branch_policy, self.fixed_route, branch_decisions);
@@ -720,9 +731,10 @@ impl App {
             .songs
             .get(song_index)
             .ok_or_else(|| anyhow!("invalid demo song index {song_index}"))?;
+        let audio_source = self.resource_backend.load_song_audio(song)?;
 
         self.audio
-            .play_song(&song.audio_path, song.demo_start_seconds, true)?;
+            .play_song(audio_source, song.demo_start_seconds, true)?;
         self.demo_playing_song = Some(song_index);
         self.demo_pending = None;
         Ok(())
@@ -1071,7 +1083,9 @@ impl App {
             .get(song_index)
             .ok_or_else(|| anyhow!("invalid song index {song_index}"))?;
         let importer = rhythm_importer_tja::TjaImporter;
-        let chart = load_course_chart(&song.source_path, course_index, &importer)?;
+        let chart = self
+            .resource_backend
+            .load_course_chart(song, course_index, &importer)?;
 
         self.loaded_course_chart = Some(LoadedCourseChart {
             song_index,

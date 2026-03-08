@@ -25,6 +25,8 @@ pub struct CourseEntry {
 
 #[derive(Debug, Clone)]
 pub struct SongEntry {
+    pub source_locator: ResourceLocator,
+    pub audio_locator: ResourceLocator,
     pub source_path: PathBuf,
     pub audio_path: PathBuf,
     pub title: String,
@@ -40,6 +42,12 @@ impl SongEntry {
             .iter()
             .any(|course| !course.branch_decisions.is_empty())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceLocator {
+    LocalPath(PathBuf),
+    RemoteId(String),
 }
 
 #[derive(Debug)]
@@ -195,6 +203,8 @@ fn build_song_entry(source_path: PathBuf, imported: ImportedSong) -> Result<Song
     };
 
     Ok(SongEntry {
+        source_locator: ResourceLocator::LocalPath(source_path.clone()),
+        audio_locator: ResourceLocator::LocalPath(audio_path.clone()),
         source_path,
         audio_path,
         title,

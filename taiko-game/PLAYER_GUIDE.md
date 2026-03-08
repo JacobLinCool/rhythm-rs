@@ -10,6 +10,16 @@
 cargo run -p taiko-game --release -- --songdir ./taiko-game/songs
 ```
 
+若要改用遠端資源（HTTP endpoint）：
+
+```bash
+cargo run -p taiko-game --release -- server \
+  --songdir ./taiko-game/songs --host 127.0.0.1 --port 4150
+
+cargo run -p taiko-game --release -- \
+  --resource-endpoint http://127.0.0.1:4150/
+```
+
 如果你想看所有參數：
 
 ```bash
@@ -107,6 +117,9 @@ cargo run -p taiko-game -- --help
 - `--sevol 0..100`：打擊音效音量
 - `--tps N`：邏輯更新頻率（預設 240）
 - `--demo true|false`：Song/Course 頁是否播放 demo
+- `--resource-endpoint URL`：改由遠端 resource server 讀取歌單/譜面/音訊（設定後 client 端不再讀本地 `--songdir`）
+- `--resource-cache-memory-only`：遠端模式改成只用記憶體快取（預設會使用 app data 磁碟快取）
+- `cache` 子命令：檢查/清除遠端快取（`taiko cache path|list|clear --endpoint <URL>|--all`）
 
 建議：
 
