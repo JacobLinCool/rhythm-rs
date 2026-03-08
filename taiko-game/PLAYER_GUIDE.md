@@ -45,6 +45,7 @@ cargo run -p taiko-game -- --help
 - `Ctrl + C`：離開遊戲
 - `Esc`：返回上一層（在 Song Menu 會直接離開）
 - `Enter`：確認
+- `P`：在 Game 中切換暫停/繼續
 
 ## 打擊鍵（遊戲中）
 
@@ -55,7 +56,7 @@ cargo run -p taiko-game -- --help
 ### Kat 鍵組
 
 - 左側：`d s a t r e w q x z`
-- 右側：`k l ; ' y u i o p , . /`
+- 右側：`k l ; ' y u i o , . /`
 
 ## 選單操作
 

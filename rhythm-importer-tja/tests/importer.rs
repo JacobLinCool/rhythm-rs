@@ -414,6 +414,15 @@ LEVEL:6
 
     assert_eq!(chart.objects.len(), 1);
     assert_eq!(chart.objects[0].scroll_scaled, 2_500_000);
+    let barline_scrolls = chart
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            rhythm_chart::ChartEventKind::BarLine { scroll_scaled } => Some(scroll_scaled),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(barline_scrolls, vec![2_500_000]);
 }
 
 #[test]
@@ -445,7 +454,7 @@ LEVEL:6
     let chart = importer.import(raw.as_bytes()).expect("import");
     let serialized = serde_json::to_vec(&chart).expect("serialize");
 
-    assert_eq!(fnv1a64(&serialized), 14_516_551_949_098_834_758);
+    assert_eq!(fnv1a64(&serialized), 16_210_016_265_926_925_368);
 }
 
 #[test]

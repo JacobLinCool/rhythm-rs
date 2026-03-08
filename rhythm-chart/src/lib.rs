@@ -153,7 +153,13 @@ pub struct Object {
 pub enum ChartEventKind {
     GogoStart,
     GogoEnd,
-    BarLine,
+    BarLine {
+        #[serde(
+            default = "default_scroll_scaled",
+            skip_serializing_if = "is_default_scroll_scaled"
+        )]
+        scroll_scaled: i32,
+    },
     Marker(String),
 }
 

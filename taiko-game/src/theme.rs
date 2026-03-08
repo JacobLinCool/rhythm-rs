@@ -35,6 +35,7 @@ pub struct Theme {
     pub judge_miss: Style,
     pub judge_roll: Style,
     pub lane_track: Style,
+    pub lane_bar_line: Style,
     pub lane_note_don: Style,
     pub lane_note_kat: Style,
     pub lane_note_roll: Style,
@@ -97,6 +98,7 @@ impl Theme {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 lane_track: Style::default().bg(Color::DarkGray),
+                lane_bar_line: Style::default().bg(Color::DarkGray),
                 lane_note_don: Style::default()
                     .fg(Color::White)
                     .bg(Color::Red)
@@ -190,6 +192,9 @@ impl Theme {
                 lane_track: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM),
+                lane_bar_line: Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::DIM | Modifier::REVERSED),
                 lane_note_don: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED),

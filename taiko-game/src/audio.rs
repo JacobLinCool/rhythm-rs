@@ -77,6 +77,20 @@ impl AudioEngine {
         Ok(())
     }
 
+    pub fn pause_song(&mut self) -> Result<()> {
+        if let Some(song) = self.song.as_mut() {
+            song.pause(Tween::default());
+        }
+        Ok(())
+    }
+
+    pub fn resume_song(&mut self) -> Result<()> {
+        if let Some(song) = self.song.as_mut() {
+            song.resume(Tween::default());
+        }
+        Ok(())
+    }
+
     pub fn song_position_seconds(&self) -> f64 {
         self.song
             .as_ref()

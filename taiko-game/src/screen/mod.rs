@@ -43,7 +43,14 @@ pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Page::Game => {
             if let Some(game) = app.game.as_ref() {
                 let now_sec = game.last_output.now as f64 / 1_000_000.0;
-                format!("Taiko on Terminal | {} | t={now_sec:.2}s", game.course_name)
+                if game.paused {
+                    format!(
+                        "Taiko on Terminal | {} | t={now_sec:.2}s | PAUSED",
+                        game.course_name
+                    )
+                } else {
+                    format!("Taiko on Terminal | {} | t={now_sec:.2}s", game.course_name)
+                }
             } else {
                 "Taiko on Terminal | Game".to_owned()
             }

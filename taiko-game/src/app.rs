@@ -13,7 +13,7 @@ use rhythm_mode_taiko::{
 use crate::audio::AudioEngine;
 use crate::branch::BranchController;
 use crate::cli::{BranchPolicy, CliArgs};
-use crate::input::{map_game_hit, map_menu_intent, MenuIntent};
+use crate::input::{is_game_pause_toggle_key, map_game_hit, map_menu_intent, MenuIntent};
 use crate::loader::{CourseEntry, SongEntry};
 use crate::perf::{PerfMeter, PerfSnapshot};
 use crate::resource::ResourceBackend;
@@ -86,6 +86,7 @@ pub struct GameSession {
     pub judge_flash: Option<JudgeFlashState>,
     pub input_flash: Option<InputFlashState>,
     pub result_delay_deadline: Option<Instant>,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -575,6 +576,15 @@ impl App {
             return Ok(());
         }
 
+        if is_game_pause_toggle_key(key) {
+            self.toggle_game_pause()?;
+            return Ok(());
+        }
+
+        if self.game.as_ref().is_some_and(|game| game.paused) {
+            return Ok(());
+        }
+
         let Some(action) = map_game_hit(key) else {
             return Ok(());
         };
@@ -592,6 +602,24 @@ impl App {
         if let Some(game) = self.game.as_mut() {
             game.pending_inputs.push(TimedInput { tick, action });
         }
+        Ok(())
+    }
+
+    fn toggle_game_pause(&mut self) -> Result<()> {
+        let Some(game) = self.game.as_mut() else {
+            return Ok(());
+        };
+
+        if game.paused {
+            self.audio.resume_song()?;
+            game.paused = false;
+        } else {
+            self.audio.pause_song()?;
+            game.paused = true;
+            game.input_flash = None;
+            game.judge_flash = None;
+        }
+
         Ok(())
     }
 
@@ -693,6 +721,7 @@ impl App {
             judge_flash: None,
             input_flash: None,
             result_delay_deadline: None,
+            paused: false,
         });
 
         Ok(())
@@ -745,6 +774,11 @@ impl App {
             .game
             .take()
             .ok_or_else(|| anyhow!("game state is missing"))?;
+
+        if game.paused {
+            self.game = Some(game);
+            return Ok(());
+        }
 
         let now_tick = self.current_chart_tick(game.last_tick);
 

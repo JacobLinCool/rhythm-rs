@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::str;
 
 use encoding_rs::SHIFT_JIS;
@@ -255,9 +255,10 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
     let mut signature_by_tick = BTreeMap::<Tick, (u8, u8)>::new();
     signature_by_tick.insert(0, (4, 4));
 
-    let mut barline_ticks = BTreeSet::<Tick>::new();
+    let mut barline_by_tick = BTreeMap::<Tick, i32>::new();
     let mut gogo_by_tick = BTreeMap::<Tick, bool>::new();
     let mut gogo_by_stream_tick = HashMap::<(StreamKey, Tick), bool>::new();
+    let mut current_scroll_by_stream = HashMap::<StreamKey, i32>::new();
 
     let mut objects = Vec::<Object>::new();
     let mut next_object_id: u32 = 1;
@@ -266,10 +267,6 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
 
     for (seg_idx, segment) in chart.segments.iter().enumerate() {
         let seg_tick = ticks_from_seconds(segment.timestamp);
-
-        if segment.barline {
-            barline_ticks.insert(seg_tick);
-        }
 
         let numerator = u8::try_from(segment.measure_num).map_err(|_| {
             ImportError::InvalidFormat(format!(
@@ -299,9 +296,24 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
             segment_id: branch_meta.segment_id,
             route_id: branch_meta.route_id,
         };
+        let stream_scroll_scaled = current_scroll_by_stream
+            .get(&stream_key)
+            .copied()
+            .unwrap_or(SCROLL_SCALE);
+        let segment_scroll_scaled = segment
+            .notes
+            .first()
+            .map(|note| scroll_to_scaled(note.scroll))
+            .unwrap_or(stream_scroll_scaled);
+
+        // Canonical chart events are global; derive bar lines from the default route stream.
+        if segment.barline && stream_key.route_id == 0 {
+            barline_by_tick.insert(seg_tick, segment_scroll_scaled);
+        }
 
         for note in &segment.notes {
             let tick = ticks_from_seconds(note.timestamp);
+            let note_scroll_scaled = scroll_to_scaled(note.scroll);
             // TJA allows in-measure BPM edits, and timestamp rounding may collapse adjacent
             // notes with different BPM onto the same tick. Keep the latest BPM at that tick.
             if stream_key.route_id == 0 {
@@ -333,7 +345,7 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
                         flags,
                         required_hits: 0,
                         slide_to: None,
-                        scroll_scaled: scroll_to_scaled(note.scroll),
+                        scroll_scaled: note_scroll_scaled,
                         branch_segment_id: branch_meta.segment_id,
                         branch_route_id: branch_meta.route_id,
                     });
@@ -360,7 +372,7 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
                             start_tick: tick,
                             flags,
                             required_hits,
-                            scroll_scaled: scroll_to_scaled(note.scroll),
+                            scroll_scaled: note_scroll_scaled,
                         },
                     );
                 }
@@ -388,6 +400,8 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
                     next_object_id = next_object_id.saturating_add(1);
                 }
             }
+
+            current_scroll_by_stream.insert(stream_key, note_scroll_scaled);
         }
     }
 
@@ -401,10 +415,10 @@ fn build_chart(metadata: &TjaMetadata, chart: &TjaChart) -> Result<CanonicalChar
     let signatures = build_signature_map(&signature_by_tick);
 
     let mut events = Vec::new();
-    for tick in barline_ticks {
+    for (tick, scroll_scaled) in barline_by_tick {
         events.push(ChartEvent {
             tick,
-            kind: ChartEventKind::BarLine,
+            kind: ChartEventKind::BarLine { scroll_scaled },
         });
     }
 

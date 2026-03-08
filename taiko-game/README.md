@@ -52,6 +52,7 @@ Remote mode uses app-data disk cache by default (`charts`/`audio` keyed by conte
 - `Tab/Shift+Tab`: focus setting
 - `Arrow Left/Right`: adjust focused setting (Auto Play/Volumes/Note Offset/Music Offset/Scroll; offset step is `5ms` in `[-500ms, +500ms]`; scroll is cyclic and includes `V-Sync (S)`)
 - `Enter`/Don: start
+- Game: Don/Kat hit, `P` pause/resume, `Esc` back to Course Menu
 - Back: `Esc`
 - Quit: `Ctrl+C`
 
@@ -62,7 +63,7 @@ Don key group:
 Kat key groups:
 
 - Left: `d s a t r e w q x z`
-- Right: `k l ; ' y u i o p , . /`
+- Right: `k l ; ' y u i o , . /`
 
 ## Song Filter (Magic Words)
 

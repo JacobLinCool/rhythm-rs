@@ -72,6 +72,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled("Auto: ", app.theme.label),
             Span::styled(app.auto_play.to_string(), app.theme.value),
+            Span::styled(" | Paused: ", app.theme.label),
+            Span::styled(
+                game.paused.to_string(),
+                if game.paused {
+                    app.theme.warning
+                } else {
+                    app.theme.value
+                },
+            ),
             Span::styled(" | Replay: ", app.theme.label),
             Span::styled(
                 format!("{:016x}", game.last_output.replay_hash),
@@ -88,7 +97,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled("Controls: ", app.theme.label),
             Span::styled(
-                "Don keys/Space, Kat keys, Esc=back, Ctrl+C=quit",
+                "Don keys/Space, Kat keys, P=pause, Esc=back, Ctrl+C=quit",
                 app.theme.metadata,
             ),
         ]),
@@ -120,13 +129,26 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let view = &game.last_output.frame_view;
     let width = usize::from(area.width.saturating_sub(2).max(1));
     let hit_x = hit_x_for_width(width);
+    // Shared row: balloon labels and top-side bar lines.
+    // Draw bar lines first, then labels so labels stay visually on top.
     let mut label = vec![Span::styled(" ", app.theme.text_primary); width];
     let mut top = vec![Span::styled(" ", app.theme.text_primary); width];
     let mut middle = vec![Span::styled(" ", app.theme.lane_track); width];
     let mut bottom = vec![Span::styled(" ", app.theme.text_primary); width];
+    let mut bar_bottom = vec![Span::styled(" ", app.theme.text_primary); width];
 
     let base_style = judge_base_style(app, view.now);
     paint_hit_zone_base(&mut top, &mut middle, &mut bottom, hit_x, width, base_style);
+    let global_scroll_speed = app.effective_scroll_speed();
+    paint_bar_lines(
+        &mut label,
+        &mut bar_bottom,
+        width,
+        hit_x,
+        view,
+        global_scroll_speed,
+        app.theme.lane_bar_line,
+    );
 
     paint_notes(
         app,
@@ -137,7 +159,11 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         width,
         hit_x,
         view,
+        global_scroll_speed,
     );
+    if game.paused {
+        paint_centered_label(&mut label, "PAUSED", app.theme.warning);
+    }
 
     let marker_style = input_marker_style(app, view.now);
     let marker_base_style = marker_base_style_for_hit_zone(&middle, hit_x, base_style);
@@ -155,9 +181,34 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(top),
         Line::from(middle),
         Line::from(bottom),
+        Line::from(bar_bottom),
     ])
     .block(themed_block_plain(app));
     frame.render_widget(lane, area);
+}
+
+fn paint_bar_lines(
+    above: &mut [Span<'static>],
+    below: &mut [Span<'static>],
+    width: usize,
+    hit_x: usize,
+    view: &rhythm_mode_taiko::TaikoFrameView,
+    scroll_speed: f32,
+    style: Style,
+) {
+    for bar_line in &view.bar_lines {
+        let bar_line_scroll_speed = scroll_speed * bar_line.scroll_multiplier();
+        let Some(x) = to_x(
+            bar_line.tick - view.now,
+            width,
+            hit_x,
+            bar_line_scroll_speed,
+        ) else {
+            continue;
+        };
+        above[x] = Span::styled(" ", style);
+        below[x] = Span::styled(" ", style);
+    }
 }
 
 fn paint_notes(
@@ -169,8 +220,8 @@ fn paint_notes(
     width: usize,
     hit_x: usize,
     view: &rhythm_mode_taiko::TaikoFrameView,
+    global_scroll_speed: f32,
 ) {
-    let global_scroll_speed = app.effective_scroll_speed();
     for note in &view.notes {
         let scroll_speed = global_scroll_speed * note.scroll_multiplier();
         match note.kind {
@@ -217,6 +268,22 @@ fn paint_notes(
                 }
             }
         }
+    }
+}
+
+fn paint_centered_label(label: &mut [Span<'static>], text: &str, style: Style) {
+    if label.is_empty() || text.is_empty() {
+        return;
+    }
+
+    let text_chars = text.chars().collect::<Vec<_>>();
+    let start = label.len().saturating_sub(text_chars.len()) / 2;
+    for (idx, ch) in text_chars.into_iter().enumerate() {
+        let col = start + idx;
+        if col >= label.len() {
+            break;
+        }
+        label[col] = Span::styled(ch.to_string(), style);
     }
 }
 
@@ -455,8 +522,8 @@ mod tests {
     };
 
     use super::{
-        hit_x_for_width, marker_base_style_for_hit_zone, paint_hit_markers_overlay,
-        paint_hit_zone_base, paint_note_blob, projected_span_x, to_x,
+        hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
+        paint_hit_markers_overlay, paint_hit_zone_base, paint_note_blob, projected_span_x, to_x,
     };
 
     #[test]
@@ -620,6 +687,115 @@ mod tests {
         let hit_x = hit_x_for_width(width);
         let future = to_x(500_000, width, hit_x, -1.0).expect("reverse projection");
         assert!(future < hit_x);
+    }
+
+    #[test]
+    fn bar_lines_render_as_background_blocks_on_outer_rows() {
+        let width = 40usize;
+        let hit_x = hit_x_for_width(width);
+        let bar_line_style = Style::default().bg(Color::DarkGray);
+        let mut above = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let mut below = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let view = rhythm_mode_taiko::TaikoFrameView {
+            now: 0,
+            notes: Vec::new(),
+            bar_lines: vec![rhythm_mode_taiko::TaikoFrameBarLine {
+                tick: 1_000_000,
+                scroll_scaled: 1_000_000,
+            }],
+            score: 0,
+            combo: 0,
+            gauge: 0.0,
+        };
+
+        paint_bar_lines(
+            &mut above,
+            &mut below,
+            width,
+            hit_x,
+            &view,
+            1.0,
+            bar_line_style,
+        );
+
+        let x = to_x(1_000_000, width, hit_x, 1.0).expect("bar line x");
+        assert_eq!(above[x].content.as_ref(), " ");
+        assert_eq!(below[x].content.as_ref(), " ");
+        assert_eq!(above[x].style, bar_line_style);
+        assert_eq!(below[x].style, bar_line_style);
+    }
+
+    #[test]
+    fn label_overrides_top_bar_line_when_sharing_same_row() {
+        let width = 40usize;
+        let hit_x = hit_x_for_width(width);
+        let bar_line_style = Style::default().bg(Color::DarkGray);
+        let label_style = Style::default().fg(Color::Yellow);
+        let mut shared_top = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let mut below = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let view = rhythm_mode_taiko::TaikoFrameView {
+            now: 0,
+            notes: Vec::new(),
+            bar_lines: vec![rhythm_mode_taiko::TaikoFrameBarLine {
+                tick: 1_000_000,
+                scroll_scaled: 1_000_000,
+            }],
+            score: 0,
+            combo: 0,
+            gauge: 0.0,
+        };
+
+        paint_bar_lines(
+            &mut shared_top,
+            &mut below,
+            width,
+            hit_x,
+            &view,
+            1.0,
+            bar_line_style,
+        );
+
+        let x = to_x(1_000_000, width, hit_x, 1.0).expect("bar line x");
+        shared_top[x] = ratatui::text::Span::styled("7", label_style);
+
+        assert_eq!(shared_top[x].content.as_ref(), "7");
+        assert_eq!(shared_top[x].style, label_style);
+        assert_eq!(below[x].style, bar_line_style);
+    }
+
+    #[test]
+    fn bar_line_scroll_multiplier_affects_projection() {
+        let width = 40usize;
+        let hit_x = hit_x_for_width(width);
+        let base_style = Style::default().bg(Color::DarkGray);
+        let mut above = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let mut below = vec![ratatui::text::Span::styled(" ", Style::default()); width];
+        let view = rhythm_mode_taiko::TaikoFrameView {
+            now: 0,
+            notes: Vec::new(),
+            bar_lines: vec![
+                rhythm_mode_taiko::TaikoFrameBarLine {
+                    tick: 500_000,
+                    scroll_scaled: 1_000_000,
+                },
+                rhythm_mode_taiko::TaikoFrameBarLine {
+                    tick: 500_000,
+                    scroll_scaled: 2_000_000,
+                },
+            ],
+            score: 0,
+            combo: 0,
+            gauge: 0.0,
+        };
+
+        paint_bar_lines(&mut above, &mut below, width, hit_x, &view, 1.0, base_style);
+
+        let base_x = to_x(500_000, width, hit_x, 1.0).expect("base x");
+        let fast_x = to_x(500_000, width, hit_x, 2.0).expect("fast x");
+        assert!(fast_x > base_x);
+        assert_eq!(above[base_x].style, base_style);
+        assert_eq!(above[fast_x].style, base_style);
+        assert_eq!(below[fast_x].style, base_style);
     }
 
     fn cell(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> &Cell {

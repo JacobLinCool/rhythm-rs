@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rhythm_chart::{CanonicalChart, LaneOrRegion, ObjectKind, SCROLL_SCALE};
+use rhythm_chart::{CanonicalChart, ChartEventKind, LaneOrRegion, ObjectKind, SCROLL_SCALE};
 use rhythm_core::{
     BranchControl, CompileError, ControlError, ControlledMode, Mode, Tick, TimedControl, TimedInput,
 };
@@ -22,6 +22,8 @@ const BASE_SCORE_POOL: u64 = 1_000_000;
 const ROLL_HIT_SCORE: u32 = 100;
 const ROLL_HITS_PER_SECOND: u64 = 16;
 const SCORE_ROUND_UNIT: u64 = 10;
+const FRAME_VIEW_BARLINE_LOOKBACK_TICKS: Tick = 1_000_000;
+const FRAME_VIEW_BARLINE_LOOKAHEAD_TICKS: Tick = 8_000_000;
 
 // Legacy taiko gauge coefficients (difficulty x level).
 const GAUGE_MISS_FACTOR: [[f32; 11]; 5] = [
@@ -246,10 +248,23 @@ impl TaikoFrameNote {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaikoFrameBarLine {
+    pub tick: Tick,
+    pub scroll_scaled: i32,
+}
+
+impl TaikoFrameBarLine {
+    pub fn scroll_multiplier(self) -> f32 {
+        self.scroll_scaled as f32 / SCROLL_SCALE as f32
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaikoFrameView {
     pub now: Tick,
     pub notes: Vec<TaikoFrameNote>,
+    pub bar_lines: Vec<TaikoFrameBarLine>,
     pub score: u32,
     pub combo: u32,
     pub gauge: f32,
@@ -309,9 +324,16 @@ struct GaugeProfile {
     ok_score_gain: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaikoBarLineState {
+    tick: Tick,
+    scroll_scaled: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaikoCompiled {
     notes: Vec<TaikoNoteState>,
+    bar_lines: Vec<TaikoBarLineState>,
     active: Vec<usize>,
     cursor: usize,
     gauge_profile: GaugeProfile,
@@ -449,10 +471,25 @@ impl Mode for TaikoMode {
             });
         }
 
+        let mut bar_lines = chart
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ChartEventKind::BarLine { scroll_scaled } => Some(TaikoBarLineState {
+                    tick: event.tick,
+                    scroll_scaled,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        bar_lines.sort_by_key(|bar_line| bar_line.tick);
+        bar_lines.dedup_by_key(|bar_line| bar_line.tick);
+
         let gauge_profile = gauge_profile_for_chart(chart, &notes)?;
 
         Ok(TaikoCompiled {
             notes,
+            bar_lines,
             active: Vec::with_capacity(128),
             cursor: 0,
             gauge_profile,
@@ -668,6 +705,7 @@ impl Mode for TaikoMode {
         TaikoFrameView {
             now,
             notes,
+            bar_lines: frame_bar_lines(compiled, now),
             score: score.score,
             combo: score.combo,
             gauge: score.gauge,
@@ -805,6 +843,24 @@ fn to_frame_note(note: &TaikoNoteState) -> TaikoFrameNote {
         remaining_hits: note.required_hits.saturating_sub(note.hits),
         scroll_scaled: note.scroll_scaled,
     }
+}
+
+fn frame_bar_lines(compiled: &TaikoCompiled, now: Tick) -> Vec<TaikoFrameBarLine> {
+    let from_tick = now.saturating_sub(FRAME_VIEW_BARLINE_LOOKBACK_TICKS);
+    let to_tick = now.saturating_add(FRAME_VIEW_BARLINE_LOOKAHEAD_TICKS);
+    let start = compiled
+        .bar_lines
+        .partition_point(|bar_line| bar_line.tick < from_tick);
+    let end = compiled
+        .bar_lines
+        .partition_point(|bar_line| bar_line.tick <= to_tick);
+    compiled.bar_lines[start..end]
+        .iter()
+        .map(|bar_line| TaikoFrameBarLine {
+            tick: bar_line.tick,
+            scroll_scaled: bar_line.scroll_scaled,
+        })
+        .collect()
 }
 
 fn gauge_profile_for_chart(
@@ -955,8 +1011,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use rhythm_chart::{
-        BranchSegment, CanonicalChart, ChartMetadata, Lane, LaneRole, Object, TempoChange,
-        TimeSignatureChange,
+        BranchSegment, CanonicalChart, ChartEvent, ChartEventKind, ChartMetadata, Lane, LaneRole,
+        Object, TempoChange, TimeSignatureChange, SCROLL_SCALE,
     };
     use rhythm_core::{BasicEngine, ControlledEngine};
 
@@ -1218,6 +1274,55 @@ mod tests {
         let result = engine.finalize();
         assert_eq!(result.great, 1);
         assert_eq!(result.miss, 0);
+    }
+
+    #[test]
+    fn frame_view_exposes_visible_bar_lines() {
+        let mut chart = chart();
+        chart.events = vec![
+            ChartEvent {
+                tick: 500_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: SCROLL_SCALE,
+                },
+            },
+            ChartEvent {
+                tick: 1_000_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: SCROLL_SCALE,
+                },
+            },
+            ChartEvent {
+                tick: 1_000_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: SCROLL_SCALE * 2,
+                },
+            },
+            ChartEvent {
+                tick: 1_200_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            ChartEvent {
+                tick: 9_500_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: SCROLL_SCALE,
+                },
+            },
+        ];
+
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        let output = engine.step_to(1_000_000, &[]).expect("step");
+        let bar_lines = output
+            .frame_view
+            .bar_lines
+            .iter()
+            .map(|bar_line| (bar_line.tick, bar_line.scroll_scaled))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            bar_lines,
+            vec![(500_000, SCROLL_SCALE), (1_000_000, SCROLL_SCALE)]
+        );
     }
 
     #[test]
