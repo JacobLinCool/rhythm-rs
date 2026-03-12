@@ -3,19 +3,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Args;
+use futures_util::{SinkExt, StreamExt};
 use rayon::prelude::*;
 use rhythm_importer_tja::{ImportedSong, TjaImporter};
 use sha2::{Digest, Sha256};
+use taiko_multiplayer_protocol::{ClientMessage, PingPayload, ServerMessage};
 use taiko_resource_protocol::{
     ResourceBranchDecisionPoint, ResourceCourse, ResourceLibraryDocument, ResourceSong, API_VERSION,
 };
+use tokio::sync::mpsc;
 use walkdir::WalkDir;
+
+mod multiplayer;
+
+use crate::multiplayer::MultiplayerRegistry;
 
 #[derive(Debug, Clone, Args)]
 pub struct ServerArgs {
@@ -39,12 +47,13 @@ struct ServerState {
     library: Arc<ResourceLibraryDocument>,
     chart_files: Arc<HashMap<String, PathBuf>>,
     audio_files: Arc<HashMap<String, PathBuf>>,
+    multiplayer: MultiplayerRegistry,
 }
 
 #[derive(Debug)]
 enum IndexResult {
     Song {
-        song: ResourceSong,
+        song: Box<ResourceSong>,
         chart_path: PathBuf,
         audio_path: PathBuf,
     },
@@ -74,6 +83,8 @@ pub async fn run_server_async(args: ServerArgs) -> Result<()> {
         .route("/v1/library", get(get_library))
         .route("/v1/charts/{id}", get(get_chart))
         .route("/v1/audio/{id}", get(get_audio))
+        .route("/v1/multiplayer/healthz", get(multiplayer_healthz))
+        .route("/v1/multiplayer/ws", get(multiplayer_ws))
         .with_state(state.clone());
 
     let bind_addr = format!("{}:{}", args.host, args.port);
@@ -146,7 +157,7 @@ fn build_state(songdir: &Path) -> Result<ServerState> {
                 audio_files
                     .entry(song.audio_id.clone())
                     .or_insert(audio_path);
-                songs.push(song);
+                songs.push(*song);
             }
             IndexResult::Warning(warning) => warnings.push(warning),
         }
@@ -154,12 +165,15 @@ fn build_state(songdir: &Path) -> Result<ServerState> {
 
     songs.sort_by_cached_key(|song| (song.title.to_lowercase(), song.source_path.clone()));
 
+    let library = Arc::new(ResourceLibraryDocument {
+        api_version: API_VERSION,
+        songs,
+        warnings,
+    });
+
     Ok(ServerState {
-        library: Arc::new(ResourceLibraryDocument {
-            api_version: API_VERSION,
-            songs,
-            warnings,
-        }),
+        multiplayer: MultiplayerRegistry::new(library.as_ref()),
+        library,
         chart_files: Arc::new(chart_files),
         audio_files: Arc::new(audio_files),
     })
@@ -181,9 +195,9 @@ fn index_song(songdir: &Path, chart_path: PathBuf) -> IndexResult {
         }
     };
 
-    match build_song(songdir, chart_path.clone(), imported) {
+    match build_song(songdir, chart_path.clone(), raw, imported) {
         Ok((song, audio_path)) => IndexResult::Song {
-            song,
+            song: Box::new(song),
             chart_path,
             audio_path,
         },
@@ -194,6 +208,7 @@ fn index_song(songdir: &Path, chart_path: PathBuf) -> IndexResult {
 fn build_song(
     songdir: &Path,
     source_path: PathBuf,
+    chart_raw: Vec<u8>,
     imported: ImportedSong,
 ) -> Result<(ResourceSong, PathBuf)> {
     if imported.courses.is_empty() {
@@ -209,6 +224,10 @@ fn build_song(
 
     let source_rel = normalized_rel_path(songdir, &source_path);
     let audio_rel = normalized_rel_path(songdir, &audio_path);
+    let chart_content_hash = sha256_hex(&chart_raw);
+    let audio_raw = std::fs::read(&audio_path)
+        .with_context(|| format!("failed to read audio file {}", audio_path.display()))?;
+    let audio_content_hash = sha256_hex(&audio_raw);
 
     let courses = imported
         .courses
@@ -260,8 +279,10 @@ fn build_song(
     let song = ResourceSong {
         source_path: source_rel.clone(),
         source_id: make_resource_id("chart", &source_rel),
+        chart_content_hash,
         audio_path: audio_rel.clone(),
         audio_id: make_resource_id("audio", &audio_rel),
+        audio_content_hash,
         title,
         subtitle: imported.subtitle,
         artist: imported.artist,
@@ -282,6 +303,12 @@ fn make_resource_id(kind: &str, rel_path: &str) -> String {
     hasher.update(kind.as_bytes());
     hasher.update([0]);
     hasher.update(rel_path.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
@@ -309,6 +336,78 @@ async fn get_audio(
     };
     let content_type = audio_content_type(path);
     serve_binary(&state.audio_files, &id, content_type).await
+}
+
+async fn multiplayer_healthz(State(state): State<ServerState>) -> Result<String, StatusCode> {
+    let uptime = state.multiplayer.uptime();
+    Ok(format!("ok uptime_ms={}", uptime.as_millis()))
+}
+
+async fn multiplayer_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_multiplayer_socket(state, socket))
+}
+
+async fn handle_multiplayer_socket(state: ServerState, socket: WebSocket) {
+    let (sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let session_id = state.multiplayer.register_session(tx).await;
+
+    let mut sender = sender;
+    let write_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            let raw = match serde_json::to_string(&message) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    eprintln!("failed to encode multiplayer message: {error}");
+                    break;
+                }
+            };
+            if sender.send(WsMessage::Text(raw.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(incoming) = receiver.next().await {
+        let Ok(incoming) = incoming else {
+            break;
+        };
+        match incoming {
+            WsMessage::Text(raw) => match serde_json::from_str::<ClientMessage>(&raw) {
+                Ok(message) => {
+                    state
+                        .multiplayer
+                        .handle_client_message(session_id, message)
+                        .await
+                }
+                Err(error) => {
+                    eprintln!("failed to decode multiplayer message: {error}");
+                    break;
+                }
+            },
+            WsMessage::Ping(payload) => {
+                let _ = state
+                    .multiplayer
+                    .handle_client_message(
+                        session_id,
+                        ClientMessage::Ping(PingPayload {
+                            nonce: payload.len() as u64,
+                            client_send_ms: None,
+                            server_send_ms: None,
+                        }),
+                    )
+                    .await;
+            }
+            WsMessage::Close(_) => break,
+            WsMessage::Binary(_) | WsMessage::Pong(_) => {}
+        }
+    }
+
+    write_task.abort();
+    state.multiplayer.remove_session(session_id).await;
 }
 
 async fn serve_binary(

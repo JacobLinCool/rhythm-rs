@@ -29,8 +29,10 @@ Client 會嚴格檢查 `api_version == 1`，不符合即拒絕連線。
     {
       "source_path": "pack1/demo.tja",
       "source_id": "<chart-id>",
+      "chart_content_hash": "<sha256-of-chart-bytes>",
       "audio_path": "pack1/demo.ogg",
       "audio_id": "<audio-id>",
+      "audio_content_hash": "<sha256-of-audio-bytes>",
       "title": "Demo Song",
       "subtitle": "",
       "artist": "Alice",
@@ -76,7 +78,18 @@ Client 會嚴格檢查 `api_version == 1`，不符合即拒絕連線。
 - 遞迴尋找 `.tja`
 - 解析 metadata/courses，計算課程摘要
 - 產生 `source_id` / `audio_id`（由 `kind + 相對路徑` 做 SHA-256）
+- 計算 `chart_content_hash` / `audio_content_hash`（由檔案內容做 SHA-256）
 - 收集不可用檔案為 `warnings`
+
+## Multiplayer Endpoints
+
+- `GET /v1/multiplayer/healthz`
+- `WS /v1/multiplayer/ws`
+
+多人房間使用獨立 WS 協議（`taiko-multiplayer-protocol` crate）：
+
+- server 權威：房間狀態、host、phase、start time、room snapshot
+- client 權威：判定/分數與 replay hash（透過 `PlayerStateUpdate` / `FinalResult` 上報）
 
 ## Client Behavior
 

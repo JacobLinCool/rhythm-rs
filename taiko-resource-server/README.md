@@ -1,6 +1,6 @@
 # taiko-resource-server
 
-HTTP server for delivering taiko resources (`library`, `chart`, `audio`) to `taiko-game` remote mode.
+HTTP + WebSocket server for delivering taiko resources (`library`, `chart`, `audio`) and multiplayer rooms to `taiko-game`.
 
 You can run it either as:
 - `taiko server ...` (subcommand on `taiko-game`)
@@ -23,10 +23,17 @@ cargo run -p taiko-resource-server --release -- \
 - `GET /v1/library`
 - `GET /v1/charts/{id}`
 - `GET /v1/audio/{id}`
+- `GET /v1/multiplayer/healthz`
+- `WS /v1/multiplayer/ws`
 
 ## Client
 
 ```bash
 cargo run -p taiko-game --release -- \
   --resource-endpoint http://127.0.0.1:4150/
+
+# create room / join / spectate
+cargo run -p taiko-game --release -- online create --server http://127.0.0.1:4150 --name host
+cargo run -p taiko-game --release -- online join --server http://127.0.0.1:4150 --room <CODE> --name p2
+cargo run -p taiko-game --release -- online spectate --server http://127.0.0.1:4150 --room <CODE> --name viewer
 ```

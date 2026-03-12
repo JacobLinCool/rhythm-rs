@@ -28,7 +28,11 @@ serde_json = "1.0.140"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 directories = "6.0.0"
 hex = "0.4.3"
+futures-util = "0.3.31"
 sha2 = "0.10.9"
+taiko-multiplayer-protocol = { path = "../taiko-multiplayer-protocol", version = "0.1.0" }
 taiko-resource-server = { path = "../taiko-resource-server", version = "0.1.0" }
 taiko-resource-protocol = { path = "../taiko-resource-protocol", version = "0.1.0" }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.27.0", features = ["rustls-tls-webpki-roots"] }
 walkdir = "2.5.0"

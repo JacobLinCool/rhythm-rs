@@ -6,6 +6,7 @@ mod branch;
 mod cli;
 mod input;
 mod loader;
+mod online;
 mod perf;
 mod resource;
 mod screen;
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         return match subcommand {
             CliSubcommand::Server(server_args) => taiko_resource_server::run_server(server_args),
             CliSubcommand::Cache(cache_args) => run_cache_command(cache_args),
+            CliSubcommand::Online(online_args) => online::run_online_command(online_args),
         };
     }
 

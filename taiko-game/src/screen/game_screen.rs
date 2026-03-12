@@ -2,16 +2,45 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use rhythm_mode_taiko::{TaikoDisplayKind, TaikoJudge, LANE_BOTH, LANE_DON, LANE_KAT};
+use rhythm_mode_taiko::{
+    TaikoAction, TaikoDisplayKind, TaikoFrameView, TaikoJudge, LANE_BOTH, LANE_DON, LANE_KAT,
+};
 
 use super::render_gauge_bar_line;
 use crate::app::App;
+use crate::theme::Theme;
 use crate::tui::Frame;
 
 const LOOKAHEAD_TICKS: i64 = 2_000_000;
 const LOOKBACK_TICKS: i64 = 300_000;
 const HIT_X_DIVISOR: usize = 6;
 const HIT_X_LEFT_SHIFT: usize = 1;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LaneRenderOptions {
+    pub scroll_speed: f32,
+    pub paused: bool,
+    pub judge_flash: Option<TaikoJudge>,
+    pub input_flash: Option<TaikoAction>,
+}
+
+impl LaneRenderOptions {
+    pub fn standard(scroll_speed: f32) -> Self {
+        Self {
+            scroll_speed,
+            paused: false,
+            judge_flash: None,
+            input_flash: None,
+        }
+    }
+}
+
+struct LaneRows<'a> {
+    label: &'a mut [Span<'static>],
+    top: &'a mut [Span<'static>],
+    middle: &'a mut [Span<'static>],
+    bottom: &'a mut [Span<'static>],
+}
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some(game) = app.game.as_ref() else {
@@ -126,46 +155,61 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     };
 
-    let view = &game.last_output.frame_view;
+    render_lane_view(
+        &app.theme,
+        frame,
+        area,
+        &game.last_output.frame_view,
+        LaneRenderOptions {
+            scroll_speed: app.effective_scroll_speed(),
+            paused: game.paused,
+            judge_flash: game.judge_flash.map(|flash| flash.judge),
+            input_flash: game.input_flash.map(|flash| flash.action),
+        },
+    );
+}
+
+pub fn render_lane_view(
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &TaikoFrameView,
+    options: LaneRenderOptions,
+) {
     let width = usize::from(area.width.saturating_sub(2).max(1));
     let hit_x = hit_x_for_width(width);
     // Shared row: balloon labels and top-side bar lines.
     // Draw bar lines first, then labels so labels stay visually on top.
-    let mut label = vec![Span::styled(" ", app.theme.text_primary); width];
-    let mut top = vec![Span::styled(" ", app.theme.text_primary); width];
-    let mut middle = vec![Span::styled(" ", app.theme.lane_track); width];
-    let mut bottom = vec![Span::styled(" ", app.theme.text_primary); width];
-    let mut bar_bottom = vec![Span::styled(" ", app.theme.text_primary); width];
+    let mut label = vec![Span::styled(" ", theme.text_primary); width];
+    let mut top = vec![Span::styled(" ", theme.text_primary); width];
+    let mut middle = vec![Span::styled(" ", theme.lane_track); width];
+    let mut bottom = vec![Span::styled(" ", theme.text_primary); width];
+    let mut bar_bottom = vec![Span::styled(" ", theme.text_primary); width];
 
-    let base_style = judge_base_style(app, view.now);
+    let base_style = judge_base_style(theme, options.judge_flash);
     paint_hit_zone_base(&mut top, &mut middle, &mut bottom, hit_x, width, base_style);
-    let global_scroll_speed = app.effective_scroll_speed();
     paint_bar_lines(
         &mut label,
         &mut bar_bottom,
         width,
         hit_x,
         view,
-        global_scroll_speed,
-        app.theme.lane_bar_line,
+        options.scroll_speed,
+        theme.lane_bar_line,
     );
 
-    paint_notes(
-        app,
-        &mut label,
-        &mut top,
-        &mut middle,
-        &mut bottom,
-        width,
-        hit_x,
-        view,
-        global_scroll_speed,
-    );
-    if game.paused {
-        paint_centered_label(&mut label, "PAUSED", app.theme.warning);
+    let mut rows = LaneRows {
+        label: &mut label,
+        top: &mut top,
+        middle: &mut middle,
+        bottom: &mut bottom,
+    };
+    paint_notes(theme, &mut rows, width, hit_x, view, options.scroll_speed);
+    if options.paused {
+        paint_centered_label(&mut label, "PAUSED", theme.warning);
     }
 
-    let marker_style = input_marker_style(app, view.now);
+    let marker_style = input_marker_style(theme, options.input_flash);
     let marker_base_style = marker_base_style_for_hit_zone(&middle, hit_x, base_style);
     paint_hit_markers_overlay(
         &mut top,
@@ -183,7 +227,7 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(bottom),
         Line::from(bar_bottom),
     ])
-    .block(themed_block_plain(app));
+    .block(themed_block_plain_theme(theme));
     frame.render_widget(lane, area);
 }
 
@@ -212,11 +256,8 @@ fn paint_bar_lines(
 }
 
 fn paint_notes(
-    app: &App,
-    label: &mut [Span<'static>],
-    top: &mut [Span<'static>],
-    middle: &mut [Span<'static>],
-    bottom: &mut [Span<'static>],
+    theme: &Theme,
+    rows: &mut LaneRows<'_>,
     width: usize,
     hit_x: usize,
     view: &rhythm_mode_taiko::TaikoFrameView,
@@ -232,12 +273,12 @@ fn paint_notes(
                 };
                 let symbol = if note.is_big { "O" } else { "o" };
                 paint_note_blob(
-                    top,
-                    middle,
-                    bottom,
+                    rows.top,
+                    rows.middle,
+                    rows.bottom,
                     start_x,
                     width,
-                    lane_style(app, note.lane),
+                    lane_style(theme, note.lane),
                     symbol,
                 );
             }
@@ -253,18 +294,18 @@ fn paint_notes(
                     continue;
                 };
 
-                for cell in top.iter_mut().take(r.min(width - 1) + 1).skip(l) {
-                    *cell = Span::styled(" ", app.theme.lane_note_roll);
+                for cell in rows.top.iter_mut().take(r.min(width - 1) + 1).skip(l) {
+                    *cell = Span::styled(" ", theme.lane_note_roll);
                 }
-                for cell in middle.iter_mut().take(r.min(width - 1) + 1).skip(l) {
-                    *cell = Span::styled("=", app.theme.lane_note_roll);
+                for cell in rows.middle.iter_mut().take(r.min(width - 1) + 1).skip(l) {
+                    *cell = Span::styled("=", theme.lane_note_roll);
                 }
-                for cell in bottom.iter_mut().take(r.min(width - 1) + 1).skip(l) {
-                    *cell = Span::styled(" ", app.theme.lane_note_roll);
+                for cell in rows.bottom.iter_mut().take(r.min(width - 1) + 1).skip(l) {
+                    *cell = Span::styled(" ", theme.lane_note_roll);
                 }
 
                 if matches!(note.kind, TaikoDisplayKind::Balloon) {
-                    label[l] = Span::styled(format!("{}", note.remaining_hits), app.theme.balloon);
+                    rows.label[l] = Span::styled(format!("{}", note.remaining_hits), theme.balloon);
                 }
             }
         }
@@ -293,12 +334,12 @@ pub(crate) fn projection_span_for_viewport_width(viewport_width: u16) -> usize {
     width.saturating_sub(hit_x + 1).max(1)
 }
 
-fn lane_style(app: &App, lane: u16) -> Style {
+fn lane_style(theme: &Theme, lane: u16) -> Style {
     match lane {
-        LANE_DON => app.theme.lane_note_don,
-        LANE_KAT => app.theme.lane_note_kat,
-        LANE_BOTH => app.theme.lane_note_roll,
-        _ => app.theme.value,
+        LANE_DON => theme.lane_note_don,
+        LANE_KAT => theme.lane_note_kat,
+        LANE_BOTH => theme.lane_note_roll,
+        _ => theme.value,
     }
 }
 
@@ -367,26 +408,16 @@ fn marker_base_style_for_hit_zone(
     }
 }
 
-fn judge_base_style(app: &App, now: i64) -> Style {
-    let Some(game) = app.game.as_ref() else {
-        return app.theme.hit_zone_base_style();
-    };
-
-    match game.judge_flash {
-        Some(flash) if now <= flash.until_tick => app.theme.judge_base_style(flash.judge),
-        _ => app.theme.hit_zone_base_style(),
-    }
+fn judge_base_style(theme: &Theme, judge_flash: Option<TaikoJudge>) -> Style {
+    judge_flash
+        .map(|judge| theme.judge_base_style(judge))
+        .unwrap_or_else(|| theme.hit_zone_base_style())
 }
 
-fn input_marker_style(app: &App, now: i64) -> Style {
-    let Some(game) = app.game.as_ref() else {
-        return app.theme.value;
-    };
-
-    match game.input_flash {
-        Some(flash) if now <= flash.until_tick => app.theme.marker_flash_style(flash.action),
-        _ => app.theme.value,
-    }
+fn input_marker_style(theme: &Theme, input_flash: Option<TaikoAction>) -> Style {
+    input_flash
+        .map(|action| theme.marker_flash_style(action))
+        .unwrap_or(theme.value)
 }
 
 fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
@@ -398,9 +429,13 @@ fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
 }
 
 fn themed_block_plain(app: &App) -> Block<'_> {
+    themed_block_plain_theme(&app.theme)
+}
+
+fn themed_block_plain_theme(theme: &Theme) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(app.theme.border)
+        .border_style(theme.border)
 }
 
 fn to_x(delta_tick: i64, width: usize, hit_x: usize, scroll_speed: f32) -> Option<usize> {

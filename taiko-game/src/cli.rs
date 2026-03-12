@@ -83,6 +83,8 @@ pub enum CliSubcommand {
     Server(taiko_resource_server::ServerArgs),
     /// Inspect or manage remote resource cache.
     Cache(CacheCommandArgs),
+    /// Play online multiplayer or spectate.
+    Online(OnlineCommandArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -120,6 +122,62 @@ pub struct CacheClearArgs {
         help = "Clear all endpoint caches"
     )]
     pub all: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OnlineCommandArgs {
+    #[command(subcommand)]
+    pub action: OnlineAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum OnlineAction {
+    /// Create a new private multiplayer room.
+    Create(OnlineCreateArgs),
+    /// Join a multiplayer room as player.
+    Join(OnlineJoinArgs),
+    /// Join a multiplayer room as spectator.
+    Spectate(OnlineSpectateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OnlineCreateArgs {
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Server base URL, e.g. https://example.com"
+    )]
+    pub server: String,
+    #[arg(long, value_name = "NICK", help = "Display name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OnlineJoinArgs {
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Server base URL, e.g. https://example.com"
+    )]
+    pub server: String,
+    #[arg(long, value_name = "CODE", help = "Room code")]
+    pub room: String,
+    #[arg(long, value_name = "NICK", help = "Display name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OnlineSpectateArgs {
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Server base URL, e.g. https://example.com"
+    )]
+    pub server: String,
+    #[arg(long, value_name = "CODE", help = "Room code")]
+    pub room: String,
+    #[arg(long, value_name = "NICK", help = "Display name")]
+    pub name: String,
 }
 
 #[derive(Debug, Parser)]

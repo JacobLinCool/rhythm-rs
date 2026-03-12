@@ -29,7 +29,7 @@ pub enum SongAudioSource {
 
 pub enum ResourceBackend {
     Local(LocalResourceBackend),
-    Remote(RemoteResourceBackend),
+    Remote(Box<RemoteResourceBackend>),
 }
 
 pub struct LocalResourceBackend {
@@ -105,11 +105,22 @@ impl ResourceBackend {
                 } else {
                     RemoteCacheMode::AppData
                 };
-                Ok(Self::Remote(RemoteResourceBackend::new(
+                Ok(Self::Remote(Box::new(RemoteResourceBackend::new(
                     endpoint, cache_mode,
-                )?))
+                )?)))
             }
         }
+    }
+
+    pub fn remote(endpoint: &str, memory_only_cache: bool) -> Result<Self> {
+        let cache_mode = if memory_only_cache {
+            RemoteCacheMode::MemoryOnly
+        } else {
+            RemoteCacheMode::AppData
+        };
+        Ok(Self::Remote(Box::new(RemoteResourceBackend::new(
+            endpoint, cache_mode,
+        )?)))
     }
 
     pub fn load_song_library(&self) -> Result<SongLibrary> {
@@ -310,6 +321,23 @@ impl RemoteResourceBackend {
 
         let mut songs = Vec::with_capacity(document.songs.len());
         for song in document.songs {
+            let chart_hash = validate_content_hash(&song.chart_content_hash)
+                .with_context(|| {
+                    format!(
+                        "library entry `{}` has invalid chart hash",
+                        song.source_path
+                    )
+                })?
+                .to_owned();
+            let audio_hash = validate_content_hash(&song.audio_content_hash)
+                .with_context(|| {
+                    format!(
+                        "library entry `{}` has invalid audio hash",
+                        song.source_path
+                    )
+                })?
+                .to_owned();
+
             if song.source_id.trim().is_empty() {
                 bail!("library entry `{}` has empty source_id", song.source_path);
             }
@@ -324,8 +352,10 @@ impl RemoteResourceBackend {
             }
 
             songs.push(SongEntry {
-                source_locator: ResourceLocator::RemoteId(song.source_id),
-                audio_locator: ResourceLocator::RemoteId(song.audio_id),
+                source_locator: ResourceLocator::RemoteId(song.source_id.clone()),
+                audio_locator: ResourceLocator::RemoteId(song.audio_id.clone()),
+                chart_content_hash: Some(chart_hash.clone()),
+                audio_content_hash: Some(audio_hash.clone()),
                 source_path: PathBuf::from(song.source_path),
                 audio_path: PathBuf::from(song.audio_path),
                 title: song.title,
@@ -355,6 +385,15 @@ impl RemoteResourceBackend {
                     })
                     .collect(),
             });
+
+            self.update_hash_index(
+                &RemoteResourceKind::Chart.resource_key(&song.source_id),
+                &chart_hash,
+            )?;
+            self.update_hash_index(
+                &RemoteResourceKind::Audio.resource_key(&song.audio_id),
+                &audio_hash,
+            )?;
         }
 
         songs.sort_by_cached_key(|song| (song.title.to_lowercase(), song.source_path.clone()));
@@ -375,7 +414,11 @@ impl RemoteResourceBackend {
             bail!("remote backend received non-remote source locator");
         };
 
-        let raw = self.fetch_cached_bytes(RemoteResourceKind::Chart, source_id)?;
+        let raw = self.fetch_cached_bytes(
+            RemoteResourceKind::Chart,
+            source_id,
+            song.chart_content_hash.as_deref(),
+        )?;
         let imported = importer.import_song(raw.as_ref()).with_context(|| {
             format!(
                 "failed to parse remote chart {}",
@@ -401,17 +444,33 @@ impl RemoteResourceBackend {
             bail!("remote backend received non-remote audio locator");
         };
 
-        let bytes = self.fetch_cached_bytes(RemoteResourceKind::Audio, audio_id)?;
+        let bytes = self.fetch_cached_bytes(
+            RemoteResourceKind::Audio,
+            audio_id,
+            song.audio_content_hash.as_deref(),
+        )?;
         Ok(SongAudioSource::Bytes(bytes))
     }
 
-    fn fetch_cached_bytes(&self, kind: RemoteResourceKind, resource_id: &str) -> Result<Arc<[u8]>> {
+    fn fetch_cached_bytes(
+        &self,
+        kind: RemoteResourceKind,
+        resource_id: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<Arc<[u8]>> {
         if resource_id.trim().is_empty() {
             bail!("remote resource id cannot be empty");
         }
 
         let resource_key = kind.resource_key(resource_id);
-        if let Some(content_hash) = self.lookup_cached_hash(&resource_key)? {
+        let content_hash = if let Some(expected_hash) = expected_hash {
+            validate_content_hash(expected_hash)?;
+            expected_hash.to_owned()
+        } else {
+            self.lookup_cached_hash(&resource_key)?.unwrap_or_default()
+        };
+
+        if !content_hash.is_empty() {
             if let Some(bytes) = self.get_memory_cached(&content_hash)? {
                 return Ok(bytes);
             }
@@ -423,7 +482,20 @@ impl RemoteResourceBackend {
         }
 
         let bytes = self.download_resource(kind, resource_id)?;
-        let content_hash = sha256_hex(bytes.as_ref());
+        let downloaded_hash = sha256_hex(bytes.as_ref());
+        let content_hash = if content_hash.is_empty() {
+            downloaded_hash
+        } else if downloaded_hash == content_hash {
+            content_hash
+        } else {
+            bail!(
+                "remote {} {} hash mismatch: expected {}, got {}",
+                kind.route_segment(),
+                resource_id,
+                content_hash,
+                downloaded_hash
+            );
+        };
 
         self.put_memory_cached(&content_hash, bytes.clone())?;
         self.update_hash_index(&resource_key, &content_hash)?;
@@ -708,6 +780,19 @@ fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
     hex::encode(hasher.finalize())
+}
+
+fn validate_content_hash(hash: &str) -> Result<&str> {
+    if hash.len() != 64 {
+        bail!(
+            "content hash must be 64 hex chars, got length {}",
+            hash.len()
+        );
+    }
+    if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("content hash must contain only hex characters");
+    }
+    Ok(hash)
 }
 
 fn cache_root_dir_internal() -> Result<PathBuf> {

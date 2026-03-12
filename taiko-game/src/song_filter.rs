@@ -409,6 +409,8 @@ mod tests {
             audio_locator: crate::loader::ResourceLocator::LocalPath(PathBuf::from(format!(
                 "/songs/{title}.ogg"
             ))),
+            chart_content_hash: None,
+            audio_content_hash: None,
             source_path: PathBuf::from(format!("/songs/{title}.tja")),
             audio_path: PathBuf::from(format!("/songs/{title}.ogg")),
             title: title.to_owned(),

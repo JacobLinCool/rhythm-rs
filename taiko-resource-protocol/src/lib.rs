@@ -14,8 +14,10 @@ pub struct ResourceLibraryDocument {
 pub struct ResourceSong {
     pub source_path: String,
     pub source_id: String,
+    pub chart_content_hash: String,
     pub audio_path: String,
     pub audio_id: String,
+    pub audio_content_hash: String,
     pub title: String,
     pub subtitle: String,
     pub artist: String,

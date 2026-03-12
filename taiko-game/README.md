@@ -25,6 +25,14 @@ cargo run -p taiko-game --release -- server \
 
 cargo run -p taiko-game --release -- \
   --resource-endpoint http://127.0.0.1:4150/
+
+# multiplayer / spectate (same server endpoint)
+cargo run -p taiko-game --release -- \
+  online create --server http://127.0.0.1:4150 --name host
+cargo run -p taiko-game --release -- \
+  online join --server http://127.0.0.1:4150 --room <CODE> --name p2
+cargo run -p taiko-game --release -- \
+  online spectate --server http://127.0.0.1:4150 --room <CODE> --name viewer
 ```
 
 ## CLI
@@ -38,6 +46,9 @@ taiko cache path
 taiko cache list
 taiko cache clear --endpoint <URL>
 taiko cache clear --all
+taiko online create --server <URL> --name <NICK>
+taiko online join --server <URL> --room <CODE> --name <NICK>
+taiko online spectate --server <URL> --room <CODE> --name <NICK>
 ```
 
 When `--resource-endpoint` is set, song list/chart/audio are loaded through HTTP and `--songdir` is ignored by the client.

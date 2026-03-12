@@ -27,6 +27,8 @@ pub struct CourseEntry {
 pub struct SongEntry {
     pub source_locator: ResourceLocator,
     pub audio_locator: ResourceLocator,
+    pub chart_content_hash: Option<String>,
+    pub audio_content_hash: Option<String>,
     pub source_path: PathBuf,
     pub audio_path: PathBuf,
     pub title: String,
@@ -52,7 +54,7 @@ pub enum ResourceLocator {
 
 #[derive(Debug)]
 enum LoadLibraryResult {
-    Song(SongEntry),
+    Song(Box<SongEntry>),
     Warning(String),
 }
 
@@ -97,7 +99,7 @@ pub fn load_song_library(songdir: &Path) -> Result<SongLibrary> {
 
     for entry in indexed_results {
         match entry.result {
-            LoadLibraryResult::Song(song) => songs.push(song),
+            LoadLibraryResult::Song(song) => songs.push(*song),
             LoadLibraryResult::Warning(warning) => warnings.push(warning),
         }
     }
@@ -147,7 +149,7 @@ fn load_single_song_entry(chart_path: PathBuf) -> LoadLibraryResult {
     };
 
     match build_song_entry(chart_path.clone(), imported) {
-        Ok(song) => LoadLibraryResult::Song(song),
+        Ok(song) => LoadLibraryResult::Song(Box::new(song)),
         Err(error) => LoadLibraryResult::Warning(format!("skip {}: {error}", chart_path.display())),
     }
 }
@@ -205,6 +207,8 @@ fn build_song_entry(source_path: PathBuf, imported: ImportedSong) -> Result<Song
     Ok(SongEntry {
         source_locator: ResourceLocator::LocalPath(source_path.clone()),
         audio_locator: ResourceLocator::LocalPath(audio_path.clone()),
+        chart_content_hash: None,
+        audio_content_hash: None,
         source_path,
         audio_path,
         title,

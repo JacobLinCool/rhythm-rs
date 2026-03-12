@@ -11,8 +11,9 @@ Deterministic, headless rhythm game engine in Rust.
 - `rhythm-mode-radial`: radial/touch/slide rules/scoring plugin.
 - `rhythm-importer-tja`: `.tja` importer adapter (`TjaImporter`) backed by crates.io `tja`.
 - `taiko-game`: playable TUI taiko game using `rhythm-core` + `rhythm-mode-taiko`.
+- `taiko-multiplayer-protocol`: shared websocket payload schema for taiko multiplayer/spectate.
 - `taiko-resource-protocol`: shared HTTP payload schema for remote resource delivery.
-- `taiko-resource-server`: HTTP server that exposes song list/chart/audio resources for `taiko-game`.
+- `taiko-resource-server`: HTTP+WS server that exposes song list/chart/audio resources and multiplayer rooms for `taiko-game`.
 
 ## Quick start
 
@@ -22,6 +23,9 @@ cargo run -p taiko-game  --release -- --songdir ./taiko-game/songs
 # or run with remote resources
 cargo run -p taiko-game --release -- server --songdir ./taiko-game/songs
 cargo run -p taiko-game --release -- --resource-endpoint http://127.0.0.1:4150/
+cargo run -p taiko-game --release -- online create --server http://127.0.0.1:4150 --name host
+cargo run -p taiko-game --release -- online join --server http://127.0.0.1:4150 --room <CODE> --name p2
+cargo run -p taiko-game --release -- online spectate --server http://127.0.0.1:4150 --room <CODE> --name viewer
 
 # inspect/clean remote cache
 cargo run -p taiko-game -- cache list
