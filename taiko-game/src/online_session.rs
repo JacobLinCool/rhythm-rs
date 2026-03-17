@@ -29,7 +29,6 @@ pub(crate) struct RemoteFlash {
 #[derive(Debug, Clone)]
 pub(crate) enum SessionAction {
     SongSelected {
-        title: String,
         source_id: String,
         course_index: usize,
     },
@@ -218,7 +217,6 @@ impl OnlineSession {
                     selection.title, selection.course_index
                 );
                 self.pending_actions.push(SessionAction::SongSelected {
-                    title: selection.title.clone(),
                     source_id: selection.source_id.clone(),
                     course_index: selection.course_index,
                 });

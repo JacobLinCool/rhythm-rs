@@ -832,16 +832,6 @@ impl OnlineApp {
         Ok(())
     }
 
-    pub fn room_code(&self) -> Option<&str> {
-        self.room_code.as_deref()
-    }
-
-    pub fn selected_song_title(&self) -> Option<&str> {
-        let snapshot = self.snapshot.as_ref()?;
-        let song = snapshot.song.as_ref()?;
-        Some(&song.title)
-    }
-
     fn headless_log(&self, event: &str) {
         if self.headless {
             println!("[{}] {event}", self.headless_label);
@@ -2521,10 +2511,6 @@ mod tests {
         fn send_char(&self, c: char) {
             self.send_key(KeyCode::Char(c));
         }
-
-        fn send_quit(&self) {
-            let _ = self.cmd_tx.send(HeadlessCommand::Quit);
-        }
     }
 
     impl Drop for TestClient {
@@ -2890,11 +2876,11 @@ mod tests {
 
         // Both threads should still be alive
         assert!(
-            host.thread.as_ref().unwrap().is_finished() == false,
+            !host.thread.as_ref().unwrap().is_finished(),
             "host thread should still be running"
         );
         assert!(
-            joiner.thread.as_ref().unwrap().is_finished() == false,
+            !joiner.thread.as_ref().unwrap().is_finished(),
             "joiner thread should still be running"
         );
     }

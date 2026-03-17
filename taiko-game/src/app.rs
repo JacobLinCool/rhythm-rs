@@ -921,7 +921,6 @@ impl App {
         for action in actions {
             match action {
                 crate::online_session::SessionAction::SongSelected {
-                    title: _,
                     source_id,
                     course_index,
                 } => {
