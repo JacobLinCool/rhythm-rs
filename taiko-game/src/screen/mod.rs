@@ -2,6 +2,11 @@ pub mod course_menu;
 pub mod error_screen;
 pub mod game_screen;
 pub mod load_warnings_screen;
+pub mod mp_connect;
+pub mod online_course;
+pub mod online_lobby;
+pub mod online_match;
+pub mod online_result;
 pub mod result_screen;
 pub mod song_menu;
 
@@ -57,6 +62,18 @@ pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
         Page::Result => "Taiko on Terminal | Result".to_owned(),
         Page::Error => "Taiko on Terminal | Error".to_owned(),
+        Page::MultiplayerConnect => "Taiko on Terminal | Multiplayer".to_owned(),
+        Page::OnlineLobby => {
+            let room = app
+                .online
+                .as_ref()
+                .and_then(|o| o.room_code.as_deref())
+                .unwrap_or("...");
+            format!("Taiko on Terminal | Online Lobby | Room: {room}")
+        }
+        Page::OnlineCourseSelect => "Taiko on Terminal | Online | Select Course".to_owned(),
+        Page::OnlineMatch => "Taiko on Terminal | Online | Playing".to_owned(),
+        Page::OnlineResult => "Taiko on Terminal | Online | Result".to_owned(),
     };
 
     let right = {

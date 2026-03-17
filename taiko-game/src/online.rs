@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::audio::AudioEngine;
 use crate::branch::BranchController;
 use crate::cli::{OnlineAction, OnlineCommandArgs};
+use crate::headless::HeadlessEventSource;
 use crate::input::{map_game_hit, map_menu_intent, MenuIntent};
 use crate::loader::{ResourceLocator, SongLibrary};
 use crate::resource::{ResourceBackend, SongAudioSource};
@@ -51,6 +52,10 @@ const LOBBY_DEMO_DELAY: Duration = Duration::from_millis(500);
 const LOBBY_FILTER_ROOT: &str = "/";
 
 pub fn run_online_command(args: OnlineCommandArgs) -> Result<()> {
+    if args.headless {
+        return run_online_headless(args);
+    }
+
     let mut app = OnlineApp::new(args)?;
     let mut tui = Tui::new(ONLINE_TPS, ONLINE_FPS)?;
     tui.enter()?;
@@ -76,25 +81,36 @@ pub fn run_online_command(args: OnlineCommandArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_online_headless(args: OnlineCommandArgs) -> Result<()> {
+    let label = match &args.action {
+        OnlineAction::Create(a) => a.name.clone(),
+        OnlineAction::Join(a) => a.name.clone(),
+        OnlineAction::Spectate(a) => a.name.clone(),
+    };
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    crate::headless::spawn_stdin_reader(cmd_tx);
+    OnlineApp::run_headless(args, label, None, None, cmd_rx)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClientMode {
+pub(crate) enum ClientMode {
     Player,
     Spectator,
 }
 
 #[derive(Debug)]
-enum NetworkEvent {
+pub(crate) enum NetworkEvent {
     Server(Box<ServerMessage>),
     Closed(String),
 }
 
-struct NetworkClient {
+pub(crate) struct NetworkClient {
     outbound: tokio_mpsc::UnboundedSender<ClientMessage>,
     inbound: Receiver<NetworkEvent>,
 }
 
 impl NetworkClient {
-    fn connect(server: &str, name: &str, action: &OnlineAction) -> Result<Self> {
+    pub(crate) fn connect(server: &str, name: &str, action: &OnlineAction) -> Result<Self> {
         let ws_url = multiplayer_ws_url(server)?;
         let (outbound_tx, outbound_rx) = tokio_mpsc::unbounded_channel::<ClientMessage>();
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
@@ -226,13 +242,13 @@ impl NetworkClient {
         })
     }
 
-    fn send(&self, message: ClientMessage) -> Result<()> {
+    pub(crate) fn send(&self, message: ClientMessage) -> Result<()> {
         self.outbound
             .send(message)
             .map_err(|_| anyhow!("online connection is closed"))
     }
 
-    fn try_recv(&self) -> Result<Option<NetworkEvent>> {
+    pub(crate) fn try_recv(&self) -> Result<Option<NetworkEvent>> {
         match self.inbound.try_recv() {
             Ok(message) => Ok(Some(message)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -244,28 +260,30 @@ impl NetworkClient {
 }
 
 #[derive(Clone)]
-struct PreparedMatch {
-    selection: MatchSongSelection,
-    branch_decisions: Vec<rhythm_importer_tja::BranchDecisionPoint>,
-    chart: rhythm_chart::CanonicalChart,
-    audio_source: SongAudioSource,
+pub(crate) struct PreparedMatch {
+    pub(crate) selection: MatchSongSelection,
+    pub(crate) branch_decisions: Vec<rhythm_importer_tja::BranchDecisionPoint>,
+    pub(crate) chart: rhythm_chart::CanonicalChart,
+    pub(crate) audio_source: SongAudioSource,
 }
 
-struct LocalPlayerRuntime {
-    engine: ControlledEngine<TaikoMode>,
-    branch_controller: BranchController,
-    pending_inputs: Vec<TimedInput<TaikoAction>>,
-    input_seq: u64,
-    state_seq: u64,
-    final_seq: u64,
-    last_tick: Tick,
-    last_output: rhythm_core::FrameOutput<TaikoMode>,
-    sent_final: bool,
-    music_started: bool,
+pub(crate) struct LocalPlayerRuntime {
+    pub(crate) engine: ControlledEngine<TaikoMode>,
+    pub(crate) branch_controller: BranchController,
+    pub(crate) pending_inputs: Vec<TimedInput<TaikoAction>>,
+    pub(crate) input_seq: u64,
+    pub(crate) state_seq: u64,
+    pub(crate) final_seq: u64,
+    pub(crate) last_tick: Tick,
+    pub(crate) last_output: rhythm_core::FrameOutput<TaikoMode>,
+    pub(crate) sent_final: bool,
+    pub(crate) music_started: bool,
+    pub(crate) judge_flash: Option<crate::app::JudgeFlashState>,
+    pub(crate) input_flash: Option<crate::app::InputFlashState>,
 }
 
 #[derive(Debug, Clone)]
-struct ClockSyncState {
+pub(crate) struct ClockSyncState {
     current_offset_ms: i64,
     target_offset_ms: i64,
     drift_ppm: f64,
@@ -285,7 +303,7 @@ struct ClockSyncState {
 }
 
 impl ClockSyncState {
-    fn observe_sample(&mut self, client_send_ms: u64, client_receive_ms: u64, server_send_ms: u64) {
+    pub(crate) fn observe_sample(&mut self, client_send_ms: u64, client_receive_ms: u64, server_send_ms: u64) {
         if client_receive_ms < client_send_ms {
             self.rejected_samples = self.rejected_samples.saturating_add(1);
             return;
@@ -368,7 +386,7 @@ impl ClockSyncState {
         self.drift_anchor_offset_ms = self.offset_median_ms;
     }
 
-    fn tick(&mut self, local_now_ms: u64) {
+    pub(crate) fn tick(&mut self, local_now_ms: u64) {
         let Some(last_slew_local_ms) = self.last_slew_local_ms else {
             self.last_slew_local_ms = Some(local_now_ms);
             if self.accepted_samples > 0 {
@@ -395,7 +413,7 @@ impl ClockSyncState {
         self.current_offset_ms = self.current_offset_ms.saturating_add(step_ms);
     }
 
-    fn estimated_server_now_ms(&self, local_now_ms: u64) -> u64 {
+    pub(crate) fn estimated_server_now_ms(&self, local_now_ms: u64) -> u64 {
         let mut server_now_ms = local_now_ms as i128 + self.current_offset_ms as i128;
         if let Some(anchor_local_ms) = self.drift_anchor_local_ms {
             let elapsed_ms = local_now_ms.saturating_sub(anchor_local_ms) as f64;
@@ -577,7 +595,28 @@ impl LobbySongBrowser {
     }
 }
 
-struct OnlineApp {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OnlineEvent {
+    Init { song_count: usize },
+    Connected { protocol_version: u32, session_id: String },
+    Error { code: String, message: String },
+    RoomCreated { room_code: String },
+    RoomJoined { room_code: String, role: RoomRole },
+    Snapshot { phase: RoomPhase, player_count: usize, song_title: Option<String> },
+    SongSelected { title: String, course_index: usize },
+    Ready,
+    Unready,
+    Countdown { start_at_ms: u64 },
+    MatchStarted { start_at_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LobbySubState {
+    BrowsingSongs,
+    SelectingCourse,
+}
+
+pub(crate) struct OnlineApp {
     mode: ClientMode,
     network: NetworkClient,
     theme: Theme,
@@ -593,6 +632,8 @@ struct OnlineApp {
     ready: bool,
     lobby_song_browser: LobbySongBrowser,
     host_course_index: usize,
+    lobby_sub_state: LobbySubState,
+    local_course_index: usize,
     lobby_demo_pending: Option<(Instant, usize)>,
     lobby_demo_playing_song: Option<usize>,
     resource_backend: ResourceBackend,
@@ -606,6 +647,10 @@ struct OnlineApp {
     clock_sync: ClockSyncState,
     last_ping_sent: Instant,
     last_drift_sync: Instant,
+    headless: bool,
+    headless_label: String,
+    headless_room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
+    headless_event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
 }
 
 impl OnlineApp {
@@ -643,6 +688,8 @@ impl OnlineApp {
             ready: false,
             lobby_song_browser: LobbySongBrowser::new(song_library.songs.len()),
             host_course_index: 0,
+            lobby_sub_state: LobbySubState::BrowsingSongs,
+            local_course_index: 0,
             lobby_demo_pending: None,
             lobby_demo_playing_song: None,
             resource_backend,
@@ -656,7 +703,124 @@ impl OnlineApp {
             clock_sync: ClockSyncState::default(),
             last_ping_sent: Instant::now(),
             last_drift_sync: Instant::now(),
+            headless: false,
+            headless_label: String::new(),
+            headless_room_code_tx: None,
+            headless_event_tx: None,
         })
+    }
+
+    pub fn new_headless(
+        args: OnlineCommandArgs,
+        label: String,
+        room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
+        event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
+    ) -> Result<Self> {
+        let (server, name, mode) = match &args.action {
+            OnlineAction::Create(args) => (&args.server, &args.name, ClientMode::Player),
+            OnlineAction::Join(args) => (&args.server, &args.name, ClientMode::Player),
+            OnlineAction::Spectate(args) => (&args.server, &args.name, ClientMode::Spectator),
+        };
+
+        let network = NetworkClient::connect(server, name, &args.action)?;
+        let resource_endpoint = resource_http_endpoint(server)?;
+        let resource_backend = ResourceBackend::remote(&resource_endpoint, true)
+            .context("failed to initialize remote resource backend")?;
+        let song_library = resource_backend
+            .load_song_library()
+            .context("failed to load song library from server")?;
+
+        let local_unix_base_ms = now_unix_ms();
+        let local_mono_base = Instant::now();
+
+        let song_count = song_library.songs.len();
+        println!("[{label}] INIT songs={song_count}");
+        if let Some(tx) = &event_tx {
+            let _ = tx.send(OnlineEvent::Init { song_count });
+        }
+
+        Ok(Self {
+            mode,
+            network,
+            theme: Theme::taiko_vivid(Theme::detect()),
+            should_quit: false,
+            status_message: "connecting...".to_owned(),
+            error_message: None,
+            room_code: None,
+            actor_id: None,
+            role: None,
+            snapshot: None,
+            live_states: HashMap::new(),
+            final_results: HashMap::new(),
+            ready: false,
+            lobby_song_browser: LobbySongBrowser::new(song_library.songs.len()),
+            host_course_index: 0,
+            lobby_sub_state: LobbySubState::BrowsingSongs,
+            local_course_index: 0,
+            lobby_demo_pending: None,
+            lobby_demo_playing_song: None,
+            resource_backend,
+            song_library,
+            importer: TjaImporter,
+            prepared_match: None,
+            local_player: None,
+            audio: AudioEngine::new_noop(),
+            local_unix_base_ms,
+            local_mono_base,
+            clock_sync: ClockSyncState::default(),
+            last_ping_sent: Instant::now(),
+            last_drift_sync: Instant::now(),
+            headless: true,
+            headless_label: label,
+            headless_room_code_tx: room_code_tx,
+            headless_event_tx: event_tx,
+        })
+    }
+
+    pub fn run_headless(
+        args: OnlineCommandArgs,
+        label: String,
+        room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
+        event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
+        command_rx: std::sync::mpsc::Receiver<crate::headless::HeadlessCommand>,
+    ) -> Result<()> {
+        let mut app = OnlineApp::new_headless(args, label, room_code_tx, event_tx)?;
+        let mut events = HeadlessEventSource::new(ONLINE_TPS, command_rx);
+
+        while !app.should_quit {
+            match events.next_event()? {
+                UiEvent::Tick => app.handle_tick()?,
+                UiEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                    app.handle_key(key)?;
+                }
+                _ => {}
+            }
+        }
+
+        app.shutdown();
+        Ok(())
+    }
+
+    pub fn room_code(&self) -> Option<&str> {
+        self.room_code.as_deref()
+    }
+
+    pub fn selected_song_title(&self) -> Option<&str> {
+        let snapshot = self.snapshot.as_ref()?;
+        let song = snapshot.song.as_ref()?;
+        Some(&song.title)
+    }
+
+    fn headless_log(&self, event: &str) {
+        if self.headless {
+            println!("[{}] {event}", self.headless_label);
+        }
+    }
+
+    fn emit_event(&self, event: OnlineEvent) {
+        if let Some(tx) = &self.headless_event_tx {
+            let _ = tx.send(event);
+        }
     }
 
     fn shutdown(&mut self) {
@@ -744,20 +908,13 @@ impl OnlineApp {
     }
 
     fn handle_lobby_key(&mut self, key: KeyEvent) -> Result<()> {
-        if matches!(key.code, KeyCode::Char('r' | 'R')) && self.role == Some(RoomRole::Player) {
-            self.ready = !self.ready;
-            self.network
-                .send(ClientMessage::Ready(ReadyRequest { ready: self.ready }))?;
-            self.status_message = if self.ready {
-                "ready sent".to_owned()
-            } else {
-                "unready sent".to_owned()
-            };
-            return Ok(());
+        match self.lobby_sub_state {
+            LobbySubState::BrowsingSongs => self.handle_lobby_browsing_key(key),
+            LobbySubState::SelectingCourse => self.handle_lobby_course_key(key),
         }
+    }
 
-        let is_host = self.is_local_host();
-
+    fn handle_lobby_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         if self
             .lobby_song_browser
             .handle_search_key(key, &self.song_library.songs)
@@ -770,16 +927,10 @@ impl OnlineApp {
             return Ok(());
         };
 
-        if matches!(intent, MenuIntent::Quit | MenuIntent::Back) {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        if self.lobby_song_browser.filtered_song_indices.is_empty() {
-            return Ok(());
-        }
-
         match intent {
+            MenuIntent::Quit | MenuIntent::Back => {
+                self.should_quit = true;
+            }
             MenuIntent::Up => {
                 let previous = self.lobby_song_browser.selected_song_index();
                 self.lobby_song_browser.move_selection(-1);
@@ -794,46 +945,98 @@ impl OnlineApp {
                     self.host_course_index = 0;
                 }
             }
-            MenuIntent::Left => {
-                let Some(song) = self.selected_lobby_song() else {
-                    return Ok(());
-                };
-                let course_len = song.courses.len();
+            MenuIntent::Confirm => {
+                if self.is_local_host() {
+                    // Host locks the song and enters course selection
+                    let Some(song) = self.selected_lobby_song() else {
+                        return Ok(());
+                    };
+                    let Some(source_id) = remote_locator_id(&song.source_locator) else {
+                        bail!("host selection song is not a remote song");
+                    };
+                    self.network
+                        .send(ClientMessage::HostSelectSong(HostSelectSongRequest {
+                            source_id: source_id.to_owned(),
+                            course_index: self.host_course_index,
+                        }))?;
+                    self.status_message = "song locked".to_owned();
+                    self.local_course_index = 0;
+                    self.lobby_sub_state = LobbySubState::SelectingCourse;
+                }
+                // Non-host: song is locked by server broadcast, sub_state
+                // transitions in sync_host_selection_from_song / ingest_snapshot
+            }
+            MenuIntent::Left | MenuIntent::Right => {
+                // Also move song selection (same as Up/Down)
+                let delta = if intent == MenuIntent::Left { -1 } else { 1 };
+                let previous = self.lobby_song_browser.selected_song_index();
+                self.lobby_song_browser.move_selection(delta);
+                if previous != self.lobby_song_browser.selected_song_index() {
+                    self.host_course_index = 0;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_lobby_course_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(intent) = map_menu_intent(key) else {
+            return Ok(());
+        };
+
+        let course_len = self
+            .selected_lobby_song()
+            .map(|s| s.courses.len())
+            .unwrap_or(0);
+
+        match intent {
+            MenuIntent::Back => {
+                // Go back to song browsing; cancel ready if was ready
+                if self.ready {
+                    self.ready = false;
+                    self.network
+                        .send(ClientMessage::Ready(ReadyRequest { ready: false }))?;
+                    self.headless_log("UNREADY");
+                    self.emit_event(OnlineEvent::Unready);
+                }
+                self.lobby_sub_state = LobbySubState::BrowsingSongs;
+                self.status_message = "back to song list".to_owned();
+            }
+            MenuIntent::Quit => {
+                self.should_quit = true;
+            }
+            MenuIntent::Up | MenuIntent::Left => {
                 if course_len > 0 {
-                    if self.host_course_index == 0 {
-                        self.host_course_index = course_len - 1;
+                    if self.local_course_index == 0 {
+                        self.local_course_index = course_len - 1;
                     } else {
-                        self.host_course_index = self.host_course_index.saturating_sub(1);
+                        self.local_course_index -= 1;
                     }
                 }
             }
-            MenuIntent::Right => {
-                let Some(song) = self.selected_lobby_song() else {
-                    return Ok(());
-                };
-                let course_len = song.courses.len();
+            MenuIntent::Down | MenuIntent::Right => {
                 if course_len > 0 {
-                    self.host_course_index = (self.host_course_index + 1) % course_len;
+                    self.local_course_index = (self.local_course_index + 1) % course_len;
                 }
             }
             MenuIntent::Confirm => {
-                if !is_host {
+                if self.role != Some(RoomRole::Player) {
                     return Ok(());
                 }
-                let Some(song) = self.selected_lobby_song() else {
-                    return Ok(());
-                };
-                let Some(source_id) = remote_locator_id(&song.source_locator) else {
-                    bail!("host selection song is not a remote song");
-                };
-                self.network
-                    .send(ClientMessage::HostSelectSong(HostSelectSongRequest {
-                        source_id: source_id.to_owned(),
-                        course_index: self.host_course_index,
-                    }))?;
-                self.status_message = "song selection sent".to_owned();
+                // Confirm course selection → auto-ready
+                if !self.ready {
+                    self.ready = true;
+                    self.network
+                        .send(ClientMessage::Ready(ReadyRequest { ready: true }))?;
+                    self.headless_log("READY");
+                    self.emit_event(OnlineEvent::Ready);
+                    self.status_message = format!(
+                        "course {} selected — ready!",
+                        self.local_course_index
+                    );
+                }
             }
-            MenuIntent::Quit | MenuIntent::Back => {}
         }
 
         Ok(())
@@ -842,21 +1045,63 @@ impl OnlineApp {
     fn handle_server_message(&mut self, message: ServerMessage) -> Result<()> {
         match message {
             ServerMessage::Hello(hello) => {
+                self.headless_log(&format!(
+                    "CONNECTED protocol={} session={}",
+                    hello.protocol_version, hello.session.session_id
+                ));
+                self.emit_event(OnlineEvent::Connected {
+                    protocol_version: hello.protocol_version,
+                    session_id: hello.session.session_id.clone(),
+                });
                 self.status_message = format!(
                     "connected (protocol={}, session={})",
                     hello.protocol_version, hello.session.session_id
                 );
             }
             ServerMessage::Error(error) => {
-                self.error_message = Some(format!("{}: {}", error.code, error.message));
+                self.headless_log(&format!("ERROR code={} message={}", error.code, error.message));
+                self.emit_event(OnlineEvent::Error {
+                    code: error.code.clone(),
+                    message: error.message.clone(),
+                });
+                let fatal = matches!(
+                    error.code.as_str(),
+                    "unsupported_protocol"
+                        | "protocol_violation"
+                        | "invalid_name"
+                        | "room_not_found"
+                        | "room_full"
+                        | "already_joined"
+                        | "unknown_session"
+                );
+                if fatal {
+                    self.error_message = Some(format!("{}: {}", error.code, error.message));
+                } else {
+                    self.status_message = format!("error: {}: {}", error.code, error.message);
+                }
             }
             ServerMessage::RoomCreated(created) => {
+                self.headless_log(&format!("ROOM_CREATED code={}", created.room_code));
+                self.emit_event(OnlineEvent::RoomCreated {
+                    room_code: created.room_code.clone(),
+                });
+                if let Some(tx) = self.headless_room_code_tx.take() {
+                    let _ = tx.send(created.room_code.clone());
+                }
                 self.room_code = Some(created.room_code.clone());
                 self.actor_id = Some(created.player_id);
                 self.role = Some(RoomRole::Player);
                 self.status_message = format!("room created: {}", created.room_code);
             }
             ServerMessage::RoomJoined(joined) => {
+                self.headless_log(&format!(
+                    "ROOM_JOINED code={} role={:?}",
+                    joined.room_code, joined.role
+                ));
+                self.emit_event(OnlineEvent::RoomJoined {
+                    room_code: joined.room_code.clone(),
+                    role: joined.role,
+                });
                 self.room_code = Some(joined.room_code.clone());
                 self.actor_id = Some(joined.actor_id);
                 self.role = Some(joined.role);
@@ -864,9 +1109,32 @@ impl OnlineApp {
                     format!("joined room {} as {:?}", joined.room_code, joined.role);
             }
             ServerMessage::RoomSnapshot(snapshot) => {
+                self.headless_log(&format!(
+                    "SNAPSHOT phase={:?} players={} song={}",
+                    snapshot.phase,
+                    snapshot.players.len(),
+                    snapshot
+                        .song
+                        .as_ref()
+                        .map(|s| s.title.as_str())
+                        .unwrap_or("(none)")
+                ));
+                self.emit_event(OnlineEvent::Snapshot {
+                    phase: snapshot.phase,
+                    player_count: snapshot.players.len(),
+                    song_title: snapshot.song.as_ref().map(|s| s.title.clone()),
+                });
                 self.ingest_snapshot(snapshot);
             }
             ServerMessage::SongSelected(selection) => {
+                self.headless_log(&format!(
+                    "SONG_SELECTED title=\"{}\" course={}",
+                    selection.title, selection.course_index
+                ));
+                self.emit_event(OnlineEvent::SongSelected {
+                    title: selection.title.clone(),
+                    course_index: selection.course_index,
+                });
                 self.status_message = format!(
                     "song selected: {} [{}]",
                     selection.title, selection.course_index
@@ -874,6 +1142,13 @@ impl OnlineApp {
                 self.sync_host_selection_from_song(&selection);
             }
             ServerMessage::MatchCountdown(countdown) => {
+                self.headless_log(&format!(
+                    "COUNTDOWN start_at_ms={}",
+                    countdown.start_at_ms
+                ));
+                self.emit_event(OnlineEvent::Countdown {
+                    start_at_ms: countdown.start_at_ms,
+                });
                 self.status_message =
                     format!("match countdown started: {} ms", countdown.start_at_ms);
                 if let Some(snapshot) = self.snapshot.as_mut() {
@@ -884,6 +1159,13 @@ impl OnlineApp {
                 self.sync_host_selection_from_song(&countdown.song);
             }
             ServerMessage::MatchStarted(started) => {
+                self.headless_log(&format!(
+                    "MATCH_STARTED start_at_ms={}",
+                    started.start_at_ms
+                ));
+                self.emit_event(OnlineEvent::MatchStarted {
+                    start_at_ms: started.start_at_ms,
+                });
                 self.status_message = "match started".to_owned();
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     snapshot.phase = RoomPhase::Playing;
@@ -961,6 +1243,14 @@ impl OnlineApp {
             self.host_course_index = course_idx;
         }
         self.normalize_host_course_selection();
+
+        // When a song is locked, auto-enter course selection for all players
+        if self.lobby_sub_state == LobbySubState::BrowsingSongs
+            && self.current_phase() == RoomPhase::Lobby
+        {
+            self.local_course_index = 0;
+            self.lobby_sub_state = LobbySubState::SelectingCourse;
+        }
     }
 
     fn is_local_host(&self) -> bool {
@@ -1172,6 +1462,8 @@ impl OnlineApp {
                 last_output: initial,
                 sent_final: false,
                 music_started: false,
+                judge_flash: None,
+                input_flash: None,
             });
         }
 
@@ -1875,7 +2167,7 @@ impl OnlineApp {
     }
 }
 
-fn collect_due_inputs(
+pub(crate) fn collect_due_inputs(
     pending_inputs: &mut Vec<TimedInput<TaikoAction>>,
     now_tick: Tick,
 ) -> Vec<TimedInput<TaikoAction>> {
@@ -1929,14 +2221,14 @@ fn median_absolute_deviation_f64(
     median_f64(deviations)
 }
 
-fn remote_locator_id(locator: &ResourceLocator) -> Option<&str> {
+pub(crate) fn remote_locator_id(locator: &ResourceLocator) -> Option<&str> {
     match locator {
         ResourceLocator::RemoteId(id) => Some(id.as_str()),
         ResourceLocator::LocalPath(_) => None,
     }
 }
 
-fn resource_http_endpoint(server: &str) -> Result<String> {
+pub(crate) fn resource_http_endpoint(server: &str) -> Result<String> {
     let mut url = Url::parse(server).with_context(|| format!("invalid --server URL: {server}"))?;
     match url.scheme() {
         "http" | "https" => {}
@@ -1984,7 +2276,7 @@ fn multiplayer_ws_url(server: &str) -> Result<Url> {
         .context("failed to build multiplayer websocket URL")
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -2046,5 +2338,602 @@ mod tests {
         assert!(browser.filtered_song_indices.is_empty());
         assert_eq!(browser.selected_song_index(), None);
         assert!(browser.filter_error.is_some());
+    }
+
+    // ── Integration test infrastructure ──────────────────────────────
+
+    use super::{OnlineApp, OnlineEvent};
+    use crate::cli::{
+        OnlineAction, OnlineCommandArgs, OnlineCreateArgs, OnlineJoinArgs, OnlineSpectateArgs,
+    };
+    use crate::headless::HeadlessCommand;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use taiko_multiplayer_protocol::RoomPhase;
+
+    struct TestHarness {
+        server_addr: std::net::SocketAddr,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl TestHarness {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime for test");
+            let songdir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("songs");
+            let server_args = taiko_resource_server::ServerArgs {
+                songdir,
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+            };
+            let (addr, _handle) = runtime
+                .block_on(taiko_resource_server::start_server_background(server_args))
+                .expect("failed to start test server");
+            Self {
+                server_addr: addr,
+                _runtime: runtime,
+            }
+        }
+
+        fn server_url(&self) -> String {
+            format!("http://{}", self.server_addr)
+        }
+    }
+
+    struct TestClient {
+        cmd_tx: mpsc::Sender<HeadlessCommand>,
+        event_rx: mpsc::Receiver<OnlineEvent>,
+        room_code_rx: Option<mpsc::Receiver<String>>,
+        thread: Option<thread::JoinHandle<anyhow::Result<()>>>,
+    }
+
+    impl TestClient {
+        fn spawn_host(harness: &TestHarness, name: &str) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (rc_tx, rc_rx) = mpsc::sync_channel(1);
+            let args = make_create_args(&harness.server_url(), name);
+            let label = name.to_owned();
+            let handle = thread::spawn(move || {
+                OnlineApp::run_headless(args, label, Some(rc_tx), Some(event_tx), cmd_rx)
+            });
+            Self {
+                cmd_tx,
+                event_rx,
+                room_code_rx: Some(rc_rx),
+                thread: Some(handle),
+            }
+        }
+
+        fn spawn_join(harness: &TestHarness, name: &str, room_code: &str) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+            let args = make_join_args(&harness.server_url(), name, room_code);
+            let label = name.to_owned();
+            let handle = thread::spawn(move || {
+                OnlineApp::run_headless(args, label, None, Some(event_tx), cmd_rx)
+            });
+            Self {
+                cmd_tx,
+                event_rx,
+                room_code_rx: None,
+                thread: Some(handle),
+            }
+        }
+
+        fn spawn_spectate(harness: &TestHarness, name: &str, room_code: &str) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+            let args = make_spectate_args(&harness.server_url(), name, room_code);
+            let label = name.to_owned();
+            let handle = thread::spawn(move || {
+                OnlineApp::run_headless(args, label, None, Some(event_tx), cmd_rx)
+            });
+            Self {
+                cmd_tx,
+                event_rx,
+                room_code_rx: None,
+                thread: Some(handle),
+            }
+        }
+
+        fn wait_room_code(&self, timeout: Duration) -> String {
+            self.room_code_rx
+                .as_ref()
+                .expect("no room_code_rx on this client")
+                .recv_timeout(timeout)
+                .expect("timed out waiting for room code")
+        }
+
+        fn wait_for<F: Fn(&OnlineEvent) -> bool>(
+            &self,
+            timeout: Duration,
+            pred: F,
+        ) -> OnlineEvent {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    panic!("timed out waiting for matching event");
+                }
+                match self.event_rx.recv_timeout(remaining) {
+                    Ok(event) if pred(&event) => return event,
+                    Ok(_) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("timed out waiting for matching event");
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("event channel disconnected while waiting for event");
+                    }
+                }
+            }
+        }
+
+        fn has_event<F: Fn(&OnlineEvent) -> bool>(&self, timeout: Duration, pred: F) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                match self.event_rx.recv_timeout(remaining) {
+                    Ok(event) if pred(&event) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        fn send_key(&self, code: KeyCode) {
+            let key =
+                KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
+            let _ = self.cmd_tx.send(HeadlessCommand::Key(key));
+        }
+
+        fn send_char(&self, c: char) {
+            self.send_key(KeyCode::Char(c));
+        }
+
+        fn send_quit(&self) {
+            let _ = self.cmd_tx.send(HeadlessCommand::Quit);
+        }
+    }
+
+    impl Drop for TestClient {
+        fn drop(&mut self) {
+            let _ = self.cmd_tx.send(HeadlessCommand::Quit);
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn make_create_args(url: &str, name: &str) -> OnlineCommandArgs {
+        OnlineCommandArgs {
+            headless: true,
+            action: OnlineAction::Create(OnlineCreateArgs {
+                server: url.to_owned(),
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    fn make_join_args(url: &str, name: &str, room: &str) -> OnlineCommandArgs {
+        OnlineCommandArgs {
+            headless: true,
+            action: OnlineAction::Join(OnlineJoinArgs {
+                server: url.to_owned(),
+                room: room.to_owned(),
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    fn make_spectate_args(url: &str, name: &str, room: &str) -> OnlineCommandArgs {
+        OnlineCommandArgs {
+            headless: true,
+            action: OnlineAction::Spectate(OnlineSpectateArgs {
+                server: url.to_owned(),
+                room: room.to_owned(),
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    const T: Duration = Duration::from_secs(5);
+
+    // ── Group 1: Connection & Room ───────────────────────────────────
+
+    #[test]
+    fn host_creates_room_and_receives_code() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        assert!(!code.is_empty(), "room code should be non-empty");
+        assert!(
+            code.chars().all(|c| c.is_ascii_alphanumeric()),
+            "room code should be alphanumeric: {code}"
+        );
+        host.wait_for(T, |e| matches!(e, OnlineEvent::Connected { .. }));
+    }
+
+    #[test]
+    fn joiner_joins_room_successfully() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+        let event = joiner.wait_for(T, |e| matches!(e, OnlineEvent::RoomJoined { .. }));
+        match event {
+            OnlineEvent::RoomJoined { room_code, role } => {
+                assert_eq!(room_code, code);
+                assert_eq!(role, taiko_multiplayer_protocol::RoomRole::Player);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn both_see_two_player_snapshot() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        // Both should eventually see a snapshot with 2 players
+        host.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, phase: RoomPhase::Lobby, .. })
+        });
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, phase: RoomPhase::Lobby, .. })
+        });
+    }
+
+    // ── Group 2: Song Selection Sync ─────────────────────────────────
+
+    #[test]
+    fn host_selects_song_joiner_syncs() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        // Wait for both to be in lobby with 2 players
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        // Host selects current song
+        host.send_key(KeyCode::Enter);
+
+        // Both should receive SongSelected with matching title
+        let host_event = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        let joiner_event =
+            joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+
+        match (&host_event, &joiner_event) {
+            (
+                OnlineEvent::SongSelected {
+                    title: t1,
+                    course_index: c1,
+                },
+                OnlineEvent::SongSelected {
+                    title: t2,
+                    course_index: c2,
+                },
+            ) => {
+                assert_eq!(t1, t2, "song titles should match");
+                assert_eq!(c1, c2, "course indices should match");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn host_changes_course_reselects() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        host.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        // First: host locks song (Enter from BrowsingSongs)
+        host.send_key(KeyCode::Enter);
+        let first = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+
+        // Now in SelectingCourse. Go back to BrowsingSongs with Esc.
+        thread::sleep(Duration::from_millis(200));
+        host.send_key(KeyCode::Esc);
+        thread::sleep(Duration::from_millis(200));
+
+        // Re-lock the same song (Enter again from BrowsingSongs)
+        host.send_key(KeyCode::Enter);
+        let second = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+
+        match (&first, &second) {
+            (
+                OnlineEvent::SongSelected { title: t1, .. },
+                OnlineEvent::SongSelected { title: t2, .. },
+            ) => {
+                assert_eq!(t1, t2, "re-selection should be the same song");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Group 3: Ready & Match Flow ──────────────────────────────────
+
+    // Helper: get both players to ready state using the two-phase flow:
+    // Host: Enter (lock song) → Enter (confirm course = auto-ready)
+    // Joiner: auto-enters course selection → Enter (confirm course = auto-ready)
+    fn ready_both(host: &TestClient, joiner: &TestClient) {
+        // Host locks song (Enter from BrowsingSongs → enters SelectingCourse)
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+
+        thread::sleep(Duration::from_millis(200));
+
+        // Host confirms course → auto-ready
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
+
+        thread::sleep(Duration::from_millis(200));
+
+        // Joiner confirms course → auto-ready
+        joiner.send_key(KeyCode::Enter);
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
+    }
+
+    #[test]
+    fn both_ready_triggers_countdown() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        ready_both(&host, &joiner);
+
+        // Both should receive Countdown
+        host.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
+    }
+
+    #[test]
+    fn countdown_leads_to_match_started() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        ready_both(&host, &joiner);
+
+        // Wait for MatchStarted (countdown is ~1ms with test-fast-countdown feature)
+        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
+    }
+
+    #[test]
+    fn single_ready_does_not_start() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        host.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        // Host locks song and confirms course (auto-ready)
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        thread::sleep(Duration::from_millis(200));
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
+
+        // Joiner does NOT confirm course — should NOT get countdown
+        let got_countdown =
+            host.has_event(Duration::from_millis(500), |e| {
+                matches!(e, OnlineEvent::Countdown { .. })
+            });
+        assert!(!got_countdown, "countdown should not start with only 1 player ready");
+    }
+
+    // ── Group 4: Gameplay ────────────────────────────────────────────
+
+    #[test]
+    fn playing_phase_accepts_input_without_crash() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        ready_both(&host, &joiner);
+
+        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
+
+        // Send some game inputs (don = 'f', kat = 'd')
+        host.send_char('f');
+        host.send_char('d');
+        joiner.send_char('f');
+        thread::sleep(Duration::from_millis(200));
+
+        // If we got here without panic, the test passes
+    }
+
+    #[test]
+    fn match_runs_stably() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        ready_both(&host, &joiner);
+
+        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
+
+        // Let the match run for a bit
+        thread::sleep(Duration::from_millis(500));
+
+        // Both threads should still be alive
+        assert!(
+            host.thread.as_ref().unwrap().is_finished() == false,
+            "host thread should still be running"
+        );
+        assert!(
+            joiner.thread.as_ref().unwrap().is_finished() == false,
+            "joiner thread should still be running"
+        );
+    }
+
+    // ── Group 5: Spectator ───────────────────────────────────────────
+
+    #[test]
+    fn spectator_joins_and_sees_snapshots() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+
+        let spec = TestClient::spawn_spectate(&harness, "Spec", &code);
+        let event = spec.wait_for(T, |e| matches!(e, OnlineEvent::RoomJoined { .. }));
+        match event {
+            OnlineEvent::RoomJoined { role, .. } => {
+                assert_eq!(role, taiko_multiplayer_protocol::RoomRole::Spectator);
+            }
+            _ => unreachable!(),
+        }
+        spec.wait_for(T, |e| matches!(e, OnlineEvent::Snapshot { .. }));
+    }
+
+    #[test]
+    fn spectator_sees_song_selection() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let spec = TestClient::spawn_spectate(&harness, "Spec", &code);
+
+        spec.wait_for(T, |e| matches!(e, OnlineEvent::Snapshot { .. }));
+        thread::sleep(Duration::from_millis(200));
+
+        host.send_key(KeyCode::Enter);
+        spec.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+    }
+
+    // ── Group 6: Error Handling ──────────────────────────────────────
+
+    #[test]
+    fn join_nonexistent_room_gets_error() {
+        let harness = TestHarness::new();
+        let client = TestClient::spawn_join(&harness, "Lost", "ZZZZZZ");
+        let event = client.wait_for(T, |e| matches!(e, OnlineEvent::Error { .. }));
+        match event {
+            OnlineEvent::Error { code, .. } => {
+                assert_eq!(code, "room_not_found");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Group 7: Latency ─────────────────────────────────────────────
+
+    #[test]
+    fn room_creation_completes_within_budget() {
+        let harness = TestHarness::new();
+        let start = Instant::now();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let _code = host.wait_room_code(T);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "room creation took {elapsed:?}, budget 10s"
+        );
+    }
+
+    #[test]
+    fn song_selection_sync_within_budget() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        let start = Instant::now();
+        host.send_key(KeyCode::Enter);
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "song selection sync took {elapsed:?}, budget 1s"
+        );
+    }
+
+    #[test]
+    fn ready_to_countdown_within_budget() {
+        let harness = TestHarness::new();
+        let host = TestClient::spawn_host(&harness, "Host");
+        let code = host.wait_room_code(T);
+        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+
+        joiner.wait_for(T, |e| {
+            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        // Host locks song + confirms course (auto-ready)
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        thread::sleep(Duration::from_millis(200));
+
+        host.send_key(KeyCode::Enter);
+        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
+        thread::sleep(Duration::from_millis(100));
+
+        let start = Instant::now();
+        // Joiner confirms course (auto-ready) → countdown should follow
+        joiner.send_key(KeyCode::Enter);
+        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "ready-to-countdown took {elapsed:?}, budget 1s"
+        );
     }
 }

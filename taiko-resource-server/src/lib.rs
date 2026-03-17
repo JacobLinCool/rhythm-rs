@@ -76,6 +76,15 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
 }
 
 pub async fn run_server_async(args: ServerArgs) -> Result<()> {
+    let (addr, handle) = start_server_background(args).await?;
+    println!("taiko-resource-server listening on http://{addr}");
+    handle.await.context("server task panicked")??;
+    Ok(())
+}
+
+pub async fn start_server_background(
+    args: ServerArgs,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
     let state = build_state(&args.songdir)?;
 
     let app = Router::new()
@@ -91,20 +100,24 @@ pub async fn run_server_async(args: ServerArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
+    let actual_addr = listener.local_addr()?;
 
     println!(
         "taiko-resource-server listening on http://{} (songs={}, warnings={})",
-        bind_addr,
+        actual_addr,
         state.library.songs.len(),
         state.library.warnings.len()
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")?;
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("HTTP server failed")?;
+        Ok(())
+    });
 
-    Ok(())
+    Ok((actual_addr, handle))
 }
 
 async fn shutdown_signal() {

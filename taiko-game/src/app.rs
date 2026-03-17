@@ -10,6 +10,8 @@ use rhythm_mode_taiko::{
     TaikoAction, TaikoFinalResult, TaikoJudge, TaikoJudgeKind, TaikoMode, LANE_KAT,
 };
 
+use taiko_multiplayer_protocol::RoomPhase;
+
 use crate::audio::AudioEngine;
 use crate::branch::BranchController;
 use crate::cli::{BranchPolicy, CliArgs};
@@ -45,6 +47,35 @@ pub enum Page {
     Game,
     Result,
     Error,
+    MultiplayerConnect,
+    OnlineLobby,
+    OnlineCourseSelect,
+    OnlineMatch,
+    OnlineResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectMode {
+    Create,
+    Join,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectField {
+    Mode,
+    Server,
+    RoomCode,
+    Name,
+    Confirm,
+}
+
+pub struct MultiplayerConnectState {
+    pub mode: ConnectMode,
+    pub server: String,
+    pub room_code: String,
+    pub name: String,
+    pub focus: ConnectField,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +211,8 @@ pub struct App {
     loaded_course_chart: Option<LoadedCourseChart>,
     resource_backend: ResourceBackend,
     audio: AudioEngine,
+    pub(crate) mp_connect: MultiplayerConnectState,
+    pub(crate) online: Option<crate::online_session::OnlineSession>,
 }
 
 impl App {
@@ -225,6 +258,15 @@ impl App {
             demo_pending: None,
             demo_playing_song: None,
             loaded_course_chart: None,
+            mp_connect: MultiplayerConnectState {
+                mode: ConnectMode::Create,
+                server: "http://127.0.0.1:4150".to_owned(),
+                room_code: String::new(),
+                name: "Player".to_owned(),
+                focus: ConnectField::Mode,
+                error: None,
+            },
+            online: None,
         };
 
         if app.songs.is_empty() {
@@ -262,8 +304,20 @@ impl App {
         let result = match self.page {
             Page::SongMenu | Page::LoadWarnings | Page::CourseMenu => self.tick_demo_preview(),
             Page::Game => self.tick_game(),
-            Page::Result | Page::Error => Ok(()),
+            Page::OnlineLobby => self.tick_online_lobby(),
+            Page::OnlineCourseSelect | Page::OnlineMatch => self.tick_online_match_phase(),
+            Page::Result | Page::Error | Page::MultiplayerConnect | Page::OnlineResult => Ok(()),
         };
+
+        // Always tick online network if session exists
+        if let Some(online) = &mut self.online {
+            if let Err(e) = online.tick_network() {
+                self.set_error_state(e);
+                return;
+            }
+        }
+        // Process pending session actions
+        self.process_online_actions();
 
         if let Err(error) = result {
             self.set_error_state(error);
@@ -294,6 +348,11 @@ impl App {
             Page::Game => self.handle_game_key(key),
             Page::Result => self.handle_result_key(key),
             Page::Error => self.handle_error_key(key),
+            Page::MultiplayerConnect => self.handle_mp_connect_key(key),
+            Page::OnlineLobby => self.handle_online_lobby_key(key),
+            Page::OnlineCourseSelect => self.handle_online_course_key(key),
+            Page::OnlineMatch => self.handle_online_match_key(key),
+            Page::OnlineResult => self.handle_online_result_key(key),
         };
 
         if let Err(error) = result {
@@ -323,6 +382,11 @@ impl App {
             Page::Game => screen::game_screen::render(self, frame, chunks[1]),
             Page::Result => screen::result_screen::render(self, frame, chunks[1]),
             Page::Error => screen::error_screen::render(self, frame, chunks[1]),
+            Page::MultiplayerConnect => screen::mp_connect::render(self, frame, chunks[1]),
+            Page::OnlineLobby => screen::online_lobby::render(self, frame, chunks[1]),
+            Page::OnlineCourseSelect => screen::online_course::render(self, frame, chunks[1]),
+            Page::OnlineMatch => screen::online_match::render(self, frame, chunks[1]),
+            Page::OnlineResult => screen::online_result::render(self, frame, chunks[1]),
         }
     }
 
@@ -389,6 +453,17 @@ impl App {
         if is_load_warnings_hotkey(key) {
             self.page = Page::LoadWarnings;
             self.load_warnings_scroll = 0;
+            return Ok(());
+        }
+
+        // 'm' opens multiplayer connect screen
+        if matches!(key.code, KeyCode::Char('m'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.mp_connect.error = None;
+            self.mp_connect.focus = ConnectField::Mode;
+            self.page = Page::MultiplayerConnect;
             return Ok(());
         }
 
@@ -652,6 +727,698 @@ impl App {
             MenuIntent::Up | MenuIntent::Down | MenuIntent::Left | MenuIntent::Right => {}
         }
 
+        Ok(())
+    }
+
+    fn handle_mp_connect_key(&mut self, key: KeyEvent) -> Result<()> {
+        let mp = &mut self.mp_connect;
+
+        match key.code {
+            KeyCode::Esc => {
+                self.page = Page::SongMenu;
+                self.schedule_demo();
+                return Ok(());
+            }
+            KeyCode::Up => {
+                mp.focus = match mp.focus {
+                    ConnectField::Mode => ConnectField::Mode,
+                    ConnectField::Server => ConnectField::Mode,
+                    ConnectField::RoomCode => ConnectField::Server,
+                    ConnectField::Name => {
+                        if mp.mode == ConnectMode::Join {
+                            ConnectField::RoomCode
+                        } else {
+                            ConnectField::Server
+                        }
+                    }
+                    ConnectField::Confirm => ConnectField::Name,
+                };
+                return Ok(());
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                mp.focus = match mp.focus {
+                    ConnectField::Mode => ConnectField::Server,
+                    ConnectField::Server => {
+                        if mp.mode == ConnectMode::Join {
+                            ConnectField::RoomCode
+                        } else {
+                            ConnectField::Name
+                        }
+                    }
+                    ConnectField::RoomCode => ConnectField::Name,
+                    ConnectField::Name => ConnectField::Confirm,
+                    ConnectField::Confirm => ConnectField::Confirm,
+                };
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        match mp.focus {
+            ConnectField::Mode => match key.code {
+                KeyCode::Left | KeyCode::Right => {
+                    mp.mode = match mp.mode {
+                        ConnectMode::Create => ConnectMode::Join,
+                        ConnectMode::Join => ConnectMode::Create,
+                    };
+                }
+                KeyCode::Enter => {
+                    mp.focus = ConnectField::Server;
+                }
+                _ => {}
+            },
+            ConnectField::Server => match key.code {
+                KeyCode::Char(c) => mp.server.push(c),
+                KeyCode::Backspace => { mp.server.pop(); }
+                KeyCode::Enter => {
+                    mp.focus = if mp.mode == ConnectMode::Join {
+                        ConnectField::RoomCode
+                    } else {
+                        ConnectField::Name
+                    };
+                }
+                _ => {}
+            },
+            ConnectField::RoomCode => match key.code {
+                KeyCode::Char(c) => mp.room_code.push(c.to_ascii_uppercase()),
+                KeyCode::Backspace => { mp.room_code.pop(); }
+                KeyCode::Enter => {
+                    mp.focus = ConnectField::Name;
+                }
+                _ => {}
+            },
+            ConnectField::Name => match key.code {
+                KeyCode::Char(c) => mp.name.push(c),
+                KeyCode::Backspace => { mp.name.pop(); }
+                KeyCode::Enter => {
+                    mp.focus = ConnectField::Confirm;
+                }
+                _ => {}
+            },
+            ConnectField::Confirm => {
+                if matches!(key.code, KeyCode::Enter) {
+                    if mp.server.is_empty() || mp.name.is_empty() {
+                        mp.error = Some("Server and Name are required".to_owned());
+                        return Ok(());
+                    }
+                    if mp.mode == ConnectMode::Join && mp.room_code.is_empty() {
+                        mp.error = Some("Room Code is required for Join".to_owned());
+                        return Ok(());
+                    }
+
+                    let action = match mp.mode {
+                        ConnectMode::Create => {
+                            crate::cli::OnlineAction::Create(crate::cli::OnlineCreateArgs {
+                                server: mp.server.clone(),
+                                name: mp.name.clone(),
+                            })
+                        }
+                        ConnectMode::Join => {
+                            crate::cli::OnlineAction::Join(crate::cli::OnlineJoinArgs {
+                                server: mp.server.clone(),
+                                room: mp.room_code.clone(),
+                                name: mp.name.clone(),
+                            })
+                        }
+                    };
+
+                    match self.connect_online(&action) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.mp_connect.error = Some(format!("{e}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Online connection ─────────────────────────────────────────────
+
+    fn connect_online(&mut self, action: &crate::cli::OnlineAction) -> Result<()> {
+        let (server, name) = match action {
+            crate::cli::OnlineAction::Create(a) => (&a.server, &a.name),
+            crate::cli::OnlineAction::Join(a) => (&a.server, &a.name),
+            crate::cli::OnlineAction::Spectate(a) => (&a.server, &a.name),
+        };
+
+        // Connect WebSocket
+        let network = crate::online::NetworkClient::connect(server, name, action)?;
+
+        // Load remote song library
+        let endpoint = crate::online::resource_http_endpoint(server)?;
+        let remote_backend = ResourceBackend::remote(&endpoint, true)?;
+        let library = remote_backend.load_song_library()?;
+
+        // Replace app songs with remote library
+        self.songs = library.songs;
+        self.filtered_song_indices = (0..self.songs.len()).collect();
+        self.song_query.clear();
+        self.song_filter_error = None;
+        self.song_index = 0;
+        self.resource_backend = remote_backend;
+
+        // Stop any playing demo
+        self.audio.stop_song()?;
+        self.demo_pending = None;
+        self.demo_playing_song = None;
+
+        // Create online session
+        self.online = Some(crate::online_session::OnlineSession::new(network));
+        self.page = Page::OnlineLobby;
+
+        Ok(())
+    }
+
+    fn disconnect_online(&mut self) {
+        self.online = None;
+        self.page = Page::SongMenu;
+        // Reload local songs
+        let _ = self.audio.stop_song();
+        self.demo_pending = None;
+        self.demo_playing_song = None;
+        // Note: local songs reload would require re-running the loader.
+        // For now, the songs list stays as remote. User can restart the app
+        // to get local songs back, or we reload here if needed.
+    }
+
+    fn process_online_actions(&mut self) {
+        let actions = match &mut self.online {
+            Some(online) if !online.pending_actions.is_empty() => {
+                std::mem::take(&mut online.pending_actions)
+            }
+            _ => return,
+        };
+
+        for action in actions {
+            match action {
+                crate::online_session::SessionAction::SongSelected {
+                    title: _,
+                    source_id,
+                    course_index,
+                } => {
+                    // Sync song selection: find the song in our list
+                    if let Some(idx) = self.songs.iter().position(|s| {
+                        crate::online::remote_locator_id(&s.source_locator)
+                            .is_some_and(|id| id == source_id)
+                    }) {
+                        // Update filter to show this song
+                        if !self.filtered_song_indices.contains(&idx) {
+                            self.song_query.clear();
+                            self.filtered_song_indices = (0..self.songs.len()).collect();
+                        }
+                        if let Some(pos) =
+                            self.filtered_song_indices.iter().position(|&i| i == idx)
+                        {
+                            self.song_index = pos;
+                        }
+                    }
+                    if let Some(online) = &mut self.online {
+                        online.host_course_index = course_index;
+                        online.local_course_index = 0;
+                        online.lobby_sub_state =
+                            crate::online::LobbySubState::SelectingCourse;
+                    }
+                    // Auto-transition to course select page
+                    if self.page == Page::OnlineLobby {
+                        self.page = Page::OnlineCourseSelect;
+                    }
+                }
+                crate::online_session::SessionAction::PhaseChanged(phase) => match phase {
+                    RoomPhase::Countdown | RoomPhase::Playing => {
+                        if matches!(
+                            self.page,
+                            Page::OnlineLobby | Page::OnlineCourseSelect
+                        ) {
+                            self.page = Page::OnlineMatch;
+                        }
+                    }
+                    RoomPhase::Finished => {
+                        if self.page == Page::OnlineMatch {
+                            self.page = Page::OnlineResult;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    // ── Online page handlers ─────────────────────────────────────────
+
+    fn tick_online_lobby(&mut self) -> Result<()> {
+        self.tick_demo_preview()?;
+        // Check if online session got a phase change
+        if let Some(online) = &self.online {
+            if online.is_disconnected() {
+                let msg = online
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "disconnected".to_owned());
+                self.online = None;
+                self.error_message = Some(msg);
+                self.page = Page::Error;
+            }
+        }
+        Ok(())
+    }
+
+    fn tick_online_match_phase(&mut self) -> Result<()> {
+        // Check phase transitions from server
+        if let Some(online) = &self.online {
+            let phase = online.current_phase();
+            match (self.page, phase) {
+                (Page::OnlineCourseSelect, RoomPhase::Countdown | RoomPhase::Playing) => {
+                    self.page = Page::OnlineMatch;
+                }
+                (Page::OnlineMatch, RoomPhase::Finished) => {
+                    self.page = Page::OnlineResult;
+                }
+                _ => {}
+            }
+            if online.is_disconnected() {
+                let msg = online
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "disconnected".to_owned());
+                self.online = None;
+                self.error_message = Some(msg);
+                self.page = Page::Error;
+                return Ok(());
+            }
+        }
+
+        // Prepare the match (load chart/audio) if not yet done
+        self.ensure_online_match_prepared()?;
+        // Tick the local player engine
+        self.tick_online_player_runtime()?;
+
+        Ok(())
+    }
+
+    fn ensure_online_match_prepared(&mut self) -> Result<()> {
+        let Some(online) = &self.online else {
+            return Ok(());
+        };
+        let Some(snapshot) = online.snapshot.as_ref() else {
+            return Ok(());
+        };
+        let Some(song_sel) = snapshot.song.as_ref() else {
+            return Ok(());
+        };
+
+        // Already prepared for this song?
+        if online
+            .prepared_match
+            .as_ref()
+            .is_some_and(|p| p.selection == *song_sel)
+        {
+            return Ok(());
+        }
+
+        // Find the song in our local library
+        let song_sel = song_sel.clone();
+        let (song_idx, course_idx) = self
+            .songs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, song)| {
+                let source_id = crate::online::remote_locator_id(&song.source_locator)?;
+                if source_id != song_sel.source_id {
+                    return None;
+                }
+                if song
+                    .courses
+                    .iter()
+                    .any(|c| c.index == song_sel.course_index)
+                {
+                    Some((idx, song_sel.course_index))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "selected song not found: source_id={}, course={}",
+                    song_sel.source_id,
+                    song_sel.course_index
+                )
+            })?;
+
+        let song_entry = &self.songs[song_idx];
+        let chart = self
+            .resource_backend
+            .load_course_chart(
+                song_entry,
+                course_idx,
+                &rhythm_importer_tja::TjaImporter::default(),
+            )
+            .context("failed to load online match chart")?;
+        let audio_source = self
+            .resource_backend
+            .load_song_audio(song_entry)
+            .context("failed to load online match audio")?;
+
+        let course = song_entry
+            .courses
+            .get(course_idx)
+            .ok_or_else(|| anyhow!("course index out of range"))?;
+
+        if let Some(online) = &mut self.online {
+            online.prepared_match = Some(crate::online::PreparedMatch {
+                selection: song_sel,
+                branch_decisions: course.branch_decisions.clone(),
+                chart,
+                audio_source,
+            });
+            online.local_player = None;
+        }
+
+        Ok(())
+    }
+
+    fn tick_online_player_runtime(&mut self) -> Result<()> {
+        let Some(online) = &mut self.online else {
+            return Ok(());
+        };
+
+        let phase = online.current_phase();
+        if !matches!(
+            phase,
+            RoomPhase::Countdown | RoomPhase::Playing | RoomPhase::Finished
+        ) {
+            online.local_player = None;
+            return Ok(());
+        }
+
+        let Some(prepared) = online.prepared_match.as_ref() else {
+            return Ok(());
+        };
+
+        // Initialize the local player runtime if needed
+        if online.local_player.is_none() {
+            let mut engine =
+                ControlledEngine::<rhythm_mode_taiko::TaikoMode>::new_controlled(&prepared.chart)?;
+            let initial = engine
+                .step_to_with_controls(0, &[], &[])
+                .context("failed to bootstrap online engine")?;
+            online.local_player = Some(crate::online::LocalPlayerRuntime {
+                engine,
+                branch_controller: BranchController::new(
+                    crate::cli::BranchPolicy::Auto,
+                    0,
+                    prepared.branch_decisions.clone(),
+                ),
+                pending_inputs: Vec::new(),
+                input_seq: 0,
+                state_seq: 0,
+                final_seq: 0,
+                last_tick: 0,
+                last_output: initial,
+                sent_final: false,
+                music_started: false,
+                judge_flash: None,
+                input_flash: None,
+            });
+        }
+
+        let now_tick = online.estimated_server_tick().max(0);
+
+        // Start music when playing
+        if matches!(phase, RoomPhase::Playing | RoomPhase::Finished) {
+            let runtime = online.local_player.as_ref().unwrap();
+            if !runtime.music_started {
+                let start_seconds = (now_tick as f64 / 1_000_000.0).max(0.0);
+                let audio_source = prepared.audio_source.clone();
+                self.audio.stop_song()?;
+                self.audio.play_song(audio_source, start_seconds, false)?;
+                let runtime = online.local_player.as_mut().unwrap();
+                runtime.music_started = true;
+            }
+        }
+
+        let runtime = online.local_player.as_mut().unwrap();
+        let frame_tick = now_tick.max(runtime.last_tick);
+        let controls = runtime
+            .branch_controller
+            .controls_for_tick(frame_tick, runtime.engine.score())
+            .map_err(|error| anyhow!(error))?;
+        let frame_inputs =
+            crate::online::collect_due_inputs(&mut runtime.pending_inputs, frame_tick);
+
+        if let Some(input) = frame_inputs.last().copied() {
+            runtime.input_flash = Some(InputFlashState {
+                action: input.action,
+                until_tick: frame_tick.saturating_add(HIT_FLASH_TICKS),
+            });
+        }
+
+        let output = runtime
+            .engine
+            .step_to_with_controls(frame_tick, &controls, &frame_inputs)
+            .context("online player engine step failed")?;
+
+        if let Some(judge) = latest_flashable_judge(&output.judges) {
+            runtime.judge_flash = Some(JudgeFlashState {
+                judge,
+                until_tick: frame_tick.saturating_add(HIT_FLASH_TICKS),
+            });
+        }
+
+        let replay_hash = output.replay_hash;
+        let recent_judges = output.judges.clone();
+        let state_score = output.score.clone();
+        let state_frame_view = output.frame_view.clone();
+        let frame_finished = output.finished;
+        runtime.last_tick = frame_tick;
+        runtime.last_output = output;
+        runtime.state_seq = runtime.state_seq.saturating_add(1);
+
+        if runtime
+            .input_flash
+            .is_some_and(|flash| runtime.last_output.now > flash.until_tick)
+        {
+            runtime.input_flash = None;
+        }
+        if runtime
+            .judge_flash
+            .is_some_and(|flash| runtime.last_output.now > flash.until_tick)
+        {
+            runtime.judge_flash = None;
+        }
+
+        online.network.send(
+            taiko_multiplayer_protocol::ClientMessage::PlayerStateUpdate(
+                taiko_multiplayer_protocol::PlayerStateUpdate {
+                    seq: runtime.state_seq,
+                    now_tick: frame_tick,
+                    score: state_score,
+                    frame_view: state_frame_view,
+                    recent_judges,
+                    replay_hash,
+                },
+            ),
+        )?;
+
+        if frame_finished && !runtime.sent_final {
+            runtime.final_seq = runtime.final_seq.saturating_add(1);
+            let final_result = runtime.engine.finalize();
+            online.network.send(
+                taiko_multiplayer_protocol::ClientMessage::FinalResult(
+                    taiko_multiplayer_protocol::FinalResultReport {
+                        seq: runtime.final_seq,
+                        finish_tick: frame_tick,
+                        replay_hash,
+                        result: final_result,
+                    },
+                ),
+            )?;
+            runtime.sent_final = true;
+        }
+
+        Ok(())
+    }
+
+    fn handle_online_lobby_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Search key handling (same as song menu)
+        if self.handle_song_menu_search_key(key) {
+            return Ok(());
+        }
+
+        let Some(intent) = map_menu_intent(key) else {
+            return Ok(());
+        };
+
+        match intent {
+            MenuIntent::Quit | MenuIntent::Back => {
+                self.disconnect_online();
+            }
+            MenuIntent::Up | MenuIntent::Left => {
+                let _ = self.move_song_selection(-1);
+            }
+            MenuIntent::Down | MenuIntent::Right => {
+                let _ = self.move_song_selection(1);
+            }
+            MenuIntent::Confirm => {
+                let is_host = self
+                    .online
+                    .as_ref()
+                    .is_some_and(|o| o.is_local_host());
+                if is_host {
+                    if let Some(song) = self.selected_song() {
+                        if let Some(source_id) =
+                            crate::online::remote_locator_id(&song.source_locator)
+                        {
+                            let source_id = source_id.to_owned();
+                            if let Some(online) = &self.online {
+                                let _ = online.network.send(
+                                    taiko_multiplayer_protocol::ClientMessage::HostSelectSong(
+                                        taiko_multiplayer_protocol::HostSelectSongRequest {
+                                            source_id,
+                                            course_index: 0,
+                                        },
+                                    ),
+                                );
+                            }
+                            if let Some(online) = &mut self.online {
+                                online.local_course_index = 0;
+                                online.lobby_sub_state =
+                                    crate::online::LobbySubState::SelectingCourse;
+                            }
+                            self.page = Page::OnlineCourseSelect;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_online_course_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(intent) = map_menu_intent(key) else {
+            return Ok(());
+        };
+
+        let course_len = self
+            .selected_song()
+            .map(|s| s.courses.len())
+            .unwrap_or(0);
+
+        match intent {
+            MenuIntent::Back => {
+                // Cancel ready if was ready, go back to lobby
+                if let Some(online) = &mut self.online {
+                    if online.ready {
+                        online.ready = false;
+                        let _ = online.network.send(
+                            taiko_multiplayer_protocol::ClientMessage::Ready(
+                                taiko_multiplayer_protocol::ReadyRequest { ready: false },
+                            ),
+                        );
+                    }
+                    online.lobby_sub_state = crate::online::LobbySubState::BrowsingSongs;
+                }
+                self.page = Page::OnlineLobby;
+            }
+            MenuIntent::Quit => {
+                self.disconnect_online();
+            }
+            MenuIntent::Up | MenuIntent::Left => {
+                if let Some(online) = &mut self.online {
+                    if course_len > 0 {
+                        if online.local_course_index == 0 {
+                            online.local_course_index = course_len - 1;
+                        } else {
+                            online.local_course_index -= 1;
+                        }
+                    }
+                }
+            }
+            MenuIntent::Down | MenuIntent::Right => {
+                if let Some(online) = &mut self.online {
+                    if course_len > 0 {
+                        online.local_course_index =
+                            (online.local_course_index + 1) % course_len;
+                    }
+                }
+            }
+            MenuIntent::Confirm => {
+                // Confirm course → auto-ready
+                if let Some(online) = &mut self.online {
+                    if online.role == Some(taiko_multiplayer_protocol::RoomRole::Player)
+                        && !online.ready
+                    {
+                        online.ready = true;
+                        let _ = online.network.send(
+                            taiko_multiplayer_protocol::ClientMessage::Ready(
+                                taiko_multiplayer_protocol::ReadyRequest { ready: true },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_online_match_key(&mut self, key: KeyEvent) -> Result<()> {
+        if matches!(key.code, KeyCode::Esc) {
+            self.disconnect_online();
+            return Ok(());
+        }
+
+        // Forward game inputs (don/kat)
+        let Some(online) = &mut self.online else {
+            return Ok(());
+        };
+        let phase = online.current_phase();
+        if !matches!(phase, RoomPhase::Countdown | RoomPhase::Playing) {
+            return Ok(());
+        }
+        if let Some(action) = map_game_hit(key) {
+            let tick = online.estimated_server_tick().max(0);
+            if let Some(runtime) = online.local_player.as_mut() {
+                runtime
+                    .pending_inputs
+                    .push(TimedInput { tick, action });
+                runtime.pending_inputs.sort_by_key(|i| i.tick);
+                runtime.input_seq = runtime.input_seq.saturating_add(1);
+
+                online.network.send(
+                    taiko_multiplayer_protocol::ClientMessage::InputEvent(
+                        taiko_multiplayer_protocol::InputEvent {
+                            seq: runtime.input_seq,
+                            tick,
+                            action,
+                        },
+                    ),
+                )?;
+            }
+
+            match action {
+                TaikoAction::Don => self.audio.play_don()?,
+                TaikoAction::Kat => self.audio.play_kat()?,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_online_result_key(&mut self, _key: KeyEvent) -> Result<()> {
+        // Any key goes back to lobby
+        self.page = Page::OnlineLobby;
+        if let Some(online) = &mut self.online {
+            online.ready = false;
+            online.lobby_sub_state = crate::online::LobbySubState::BrowsingSongs;
+            online.prepared_match = None;
+            online.local_player = None;
+            online.live_states.clear();
+            online.final_results.clear();
+        }
         Ok(())
     }
 

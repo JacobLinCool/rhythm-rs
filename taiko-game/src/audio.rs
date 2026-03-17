@@ -9,10 +9,10 @@ use kira::tween::Tween;
 use crate::resource::SongAudioSource;
 
 pub struct AudioEngine {
-    manager: AudioManager<DefaultBackend>,
+    manager: Option<AudioManager<DefaultBackend>>,
     song: Option<StaticSoundHandle>,
-    don_se: StaticSoundData,
-    kat_se: StaticSoundData,
+    don_se: Option<StaticSoundData>,
+    kat_se: Option<StaticSoundData>,
     song_volume: f64,
     se_volume: f64,
 }
@@ -22,7 +22,6 @@ impl AudioEngine {
         let manager = AudioManager::new(AudioManagerSettings::default())
             .context("failed to initialize audio backend")?;
 
-        let se_gain = f64::from(se_volume) / 100.0;
         let don_se =
             StaticSoundData::from_cursor(Cursor::new(include_bytes!("../assets/don.wav").to_vec()))
                 .context("failed to load built-in don SE")?;
@@ -32,13 +31,24 @@ impl AudioEngine {
                 .context("failed to load built-in kat SE")?;
 
         Ok(Self {
-            manager,
+            manager: Some(manager),
             song: None,
-            don_se,
-            kat_se,
+            don_se: Some(don_se),
+            kat_se: Some(kat_se),
             song_volume: f64::from(song_volume) / 100.0,
-            se_volume: se_gain,
+            se_volume: f64::from(se_volume) / 100.0,
         })
+    }
+
+    pub fn new_noop() -> Self {
+        Self {
+            manager: None,
+            song: None,
+            don_se: None,
+            kat_se: None,
+            song_volume: 0.0,
+            se_volume: 0.0,
+        }
     }
 
     pub fn play_song(
@@ -47,6 +57,10 @@ impl AudioEngine {
         start_seconds: f64,
         looping: bool,
     ) -> Result<()> {
+        if self.manager.is_none() {
+            return Ok(());
+        }
+
         self.stop_song()?;
 
         let base = match source {
@@ -66,7 +80,8 @@ impl AudioEngine {
             data = data.loop_region(..);
         }
 
-        self.song = Some(self.manager.play(data).context("failed to play song")?);
+        let manager = self.manager.as_mut().unwrap();
+        self.song = Some(manager.play(data).context("failed to play song")?);
         Ok(())
     }
 
@@ -115,17 +130,27 @@ impl AudioEngine {
     }
 
     pub fn play_don(&mut self) -> Result<()> {
-        let _ = self
-            .manager
-            .play(self.don_se.clone().volume(self.se_volume))
+        let Some(manager) = &mut self.manager else {
+            return Ok(());
+        };
+        let Some(don_se) = &self.don_se else {
+            return Ok(());
+        };
+        let _ = manager
+            .play(don_se.clone().volume(self.se_volume))
             .context("failed to play don SE")?;
         Ok(())
     }
 
     pub fn play_kat(&mut self) -> Result<()> {
-        let _ = self
-            .manager
-            .play(self.kat_se.clone().volume(self.se_volume))
+        let Some(manager) = &mut self.manager else {
+            return Ok(());
+        };
+        let Some(kat_se) = &self.kat_se else {
+            return Ok(());
+        };
+        let _ = manager
+            .play(kat_se.clone().volume(self.se_volume))
             .context("failed to play kat SE")?;
         Ok(())
     }

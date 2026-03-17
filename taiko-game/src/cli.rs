@@ -126,6 +126,13 @@ pub struct CacheClearArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct OnlineCommandArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run without TUI or audio; log events to stdout and read commands from stdin"
+    )]
+    pub headless: bool,
+
     #[command(subcommand)]
     pub action: OnlineAction,
 }

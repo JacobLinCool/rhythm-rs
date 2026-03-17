@@ -28,5 +28,8 @@ taiko-resource-protocol = { path = "../taiko-resource-protocol", version = "0.1.
 tokio = { version = "1.47.1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 walkdir = "2.5.0"
 
+[features]
+test-fast-countdown = []
+
 [dev-dependencies]
 rhythm-mode-taiko = { path = "../rhythm-mode-taiko", version = "0.1.0" }

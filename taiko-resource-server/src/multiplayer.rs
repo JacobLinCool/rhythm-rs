@@ -15,9 +15,9 @@ use tokio::sync::Mutex;
 
 const ROOM_MAX_PLAYERS: usize = 4;
 const ROOM_MAX_SPECTATORS: usize = 64;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fast-countdown"))]
 const MATCH_COUNTDOWN_MS: u64 = 1;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-fast-countdown")))]
 const MATCH_COUNTDOWN_MS: u64 = 3_000;
 
 #[derive(Clone)]
