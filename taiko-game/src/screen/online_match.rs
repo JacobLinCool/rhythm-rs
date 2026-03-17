@@ -38,12 +38,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-fn render_player_tile(
-    app: &App,
-    frame: &mut Frame<'_>,
-    area: Rect,
-    player: &RoomPlayerSnapshot,
-) {
+fn render_player_tile(app: &App, frame: &mut Frame<'_>, area: Rect, player: &RoomPlayerSnapshot) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(app.theme.border)
@@ -96,10 +91,18 @@ fn render_player_tile(
         let now_tick = state.now_tick;
         let flash = online.remote_flash_for(&player.player_id, now_tick);
         let judge_flash = flash.and_then(|f| {
-            if f.judge_until > now_tick { f.judge } else { None }
+            if f.judge_until > now_tick {
+                f.judge
+            } else {
+                None
+            }
         });
         let input_flash = flash.and_then(|f| {
-            if f.input_until > now_tick { f.input_action } else { None }
+            if f.input_until > now_tick {
+                f.input_action
+            } else {
+                None
+            }
         });
         (
             state.frame_view.clone(),
@@ -131,13 +134,7 @@ fn render_player_tile(
     ])]);
     frame.render_widget(header, split[0]);
 
-    render_lane_view(
-        &app.theme,
-        frame,
-        split[1],
-        &frame_view,
-        lane_opts,
-    );
+    render_lane_view(&app.theme, frame, split[1], &frame_view, lane_opts);
 }
 
 fn render_waiting(app: &App, frame: &mut Frame<'_>, area: Rect) {

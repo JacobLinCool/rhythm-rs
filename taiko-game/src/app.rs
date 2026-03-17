@@ -789,7 +789,9 @@ impl App {
             },
             ConnectField::Server => match key.code {
                 KeyCode::Char(c) => mp.server.push(c),
-                KeyCode::Backspace => { mp.server.pop(); }
+                KeyCode::Backspace => {
+                    mp.server.pop();
+                }
                 KeyCode::Enter => {
                     mp.focus = if mp.mode == ConnectMode::Join {
                         ConnectField::RoomCode
@@ -801,7 +803,9 @@ impl App {
             },
             ConnectField::RoomCode => match key.code {
                 KeyCode::Char(c) => mp.room_code.push(c.to_ascii_uppercase()),
-                KeyCode::Backspace => { mp.room_code.pop(); }
+                KeyCode::Backspace => {
+                    mp.room_code.pop();
+                }
                 KeyCode::Enter => {
                     mp.focus = ConnectField::Name;
                 }
@@ -809,7 +813,9 @@ impl App {
             },
             ConnectField::Name => match key.code {
                 KeyCode::Char(c) => mp.name.push(c),
-                KeyCode::Backspace => { mp.name.pop(); }
+                KeyCode::Backspace => {
+                    mp.name.pop();
+                }
                 KeyCode::Enter => {
                     mp.focus = ConnectField::Confirm;
                 }
@@ -929,8 +935,7 @@ impl App {
                             self.song_query.clear();
                             self.filtered_song_indices = (0..self.songs.len()).collect();
                         }
-                        if let Some(pos) =
-                            self.filtered_song_indices.iter().position(|&i| i == idx)
+                        if let Some(pos) = self.filtered_song_indices.iter().position(|&i| i == idx)
                         {
                             self.song_index = pos;
                         }
@@ -938,8 +943,7 @@ impl App {
                     if let Some(online) = &mut self.online {
                         online.host_course_index = course_index;
                         online.local_course_index = 0;
-                        online.lobby_sub_state =
-                            crate::online::LobbySubState::SelectingCourse;
+                        online.lobby_sub_state = crate::online::LobbySubState::SelectingCourse;
                     }
                     // Auto-transition to course select page
                     if self.page == Page::OnlineLobby {
@@ -948,10 +952,7 @@ impl App {
                 }
                 crate::online_session::SessionAction::PhaseChanged(phase) => match phase {
                     RoomPhase::Countdown | RoomPhase::Playing => {
-                        if matches!(
-                            self.page,
-                            Page::OnlineLobby | Page::OnlineCourseSelect
-                        ) {
+                        if matches!(self.page, Page::OnlineLobby | Page::OnlineCourseSelect) {
                             self.page = Page::OnlineMatch;
                         }
                     }
@@ -1073,7 +1074,7 @@ impl App {
             .load_course_chart(
                 song_entry,
                 course_idx,
-                &rhythm_importer_tja::TjaImporter::default(),
+                &rhythm_importer_tja::TjaImporter,
             )
             .context("failed to load online match chart")?;
         let audio_source = self
@@ -1225,16 +1226,16 @@ impl App {
         if frame_finished && !runtime.sent_final {
             runtime.final_seq = runtime.final_seq.saturating_add(1);
             let final_result = runtime.engine.finalize();
-            online.network.send(
-                taiko_multiplayer_protocol::ClientMessage::FinalResult(
+            online
+                .network
+                .send(taiko_multiplayer_protocol::ClientMessage::FinalResult(
                     taiko_multiplayer_protocol::FinalResultReport {
                         seq: runtime.final_seq,
                         finish_tick: frame_tick,
                         replay_hash,
                         result: final_result,
                     },
-                ),
-            )?;
+                ))?;
             runtime.sent_final = true;
         }
 
@@ -1262,10 +1263,7 @@ impl App {
                 let _ = self.move_song_selection(1);
             }
             MenuIntent::Confirm => {
-                let is_host = self
-                    .online
-                    .as_ref()
-                    .is_some_and(|o| o.is_local_host());
+                let is_host = self.online.as_ref().is_some_and(|o| o.is_local_host());
                 if is_host {
                     if let Some(song) = self.selected_song() {
                         if let Some(source_id) =
@@ -1302,10 +1300,7 @@ impl App {
             return Ok(());
         };
 
-        let course_len = self
-            .selected_song()
-            .map(|s| s.courses.len())
-            .unwrap_or(0);
+        let course_len = self.selected_song().map(|s| s.courses.len()).unwrap_or(0);
 
         match intent {
             MenuIntent::Back => {
@@ -1313,11 +1308,12 @@ impl App {
                 if let Some(online) = &mut self.online {
                     if online.ready {
                         online.ready = false;
-                        let _ = online.network.send(
-                            taiko_multiplayer_protocol::ClientMessage::Ready(
-                                taiko_multiplayer_protocol::ReadyRequest { ready: false },
-                            ),
-                        );
+                        let _ =
+                            online
+                                .network
+                                .send(taiko_multiplayer_protocol::ClientMessage::Ready(
+                                    taiko_multiplayer_protocol::ReadyRequest { ready: false },
+                                ));
                     }
                     online.lobby_sub_state = crate::online::LobbySubState::BrowsingSongs;
                 }
@@ -1340,8 +1336,7 @@ impl App {
             MenuIntent::Down | MenuIntent::Right => {
                 if let Some(online) = &mut self.online {
                     if course_len > 0 {
-                        online.local_course_index =
-                            (online.local_course_index + 1) % course_len;
+                        online.local_course_index = (online.local_course_index + 1) % course_len;
                     }
                 }
             }
@@ -1352,11 +1347,12 @@ impl App {
                         && !online.ready
                     {
                         online.ready = true;
-                        let _ = online.network.send(
-                            taiko_multiplayer_protocol::ClientMessage::Ready(
-                                taiko_multiplayer_protocol::ReadyRequest { ready: true },
-                            ),
-                        );
+                        let _ =
+                            online
+                                .network
+                                .send(taiko_multiplayer_protocol::ClientMessage::Ready(
+                                    taiko_multiplayer_protocol::ReadyRequest { ready: true },
+                                ));
                     }
                 }
             }
@@ -1382,21 +1378,19 @@ impl App {
         if let Some(action) = map_game_hit(key) {
             let tick = online.estimated_server_tick().max(0);
             if let Some(runtime) = online.local_player.as_mut() {
-                runtime
-                    .pending_inputs
-                    .push(TimedInput { tick, action });
+                runtime.pending_inputs.push(TimedInput { tick, action });
                 runtime.pending_inputs.sort_by_key(|i| i.tick);
                 runtime.input_seq = runtime.input_seq.saturating_add(1);
 
-                online.network.send(
-                    taiko_multiplayer_protocol::ClientMessage::InputEvent(
+                online
+                    .network
+                    .send(taiko_multiplayer_protocol::ClientMessage::InputEvent(
                         taiko_multiplayer_protocol::InputEvent {
                             seq: runtime.input_seq,
                             tick,
                             action,
                         },
-                    ),
-                )?;
+                    ))?;
             }
 
             match action {

@@ -75,7 +75,11 @@ fn command_to_event(cmd: HeadlessCommand) -> Option<UiEvent> {
 }
 
 fn ctrl_c() -> KeyEvent {
-    KeyEvent::new_with_kind(KeyCode::Char('c'), KeyModifiers::CONTROL, KeyEventKind::Press)
+    KeyEvent::new_with_kind(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Press,
+    )
 }
 
 pub fn synthetic_key(code: KeyCode) -> KeyEvent {

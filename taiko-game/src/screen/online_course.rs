@@ -57,7 +57,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     lines.push(Line::from(Span::styled("Players:", app.theme.metadata)));
     if let Some(snapshot) = &online.snapshot {
         for player in &snapshot.players {
-            let status = if player.ready { "READY" } else { "selecting..." };
+            let status = if player.ready {
+                "READY"
+            } else {
+                "selecting..."
+            };
             let style = if player.ready {
                 app.theme.judge_great
             } else {

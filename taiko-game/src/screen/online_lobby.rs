@@ -96,7 +96,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             };
             let host_marker = if player.is_host { " (host)" } else { "" };
             lines.push(Line::from(Span::styled(
-                format!("  {} {}{}{}", player.player_id, player.name, host_marker, status),
+                format!(
+                    "  {} {}{}{}",
+                    player.player_id, player.name, host_marker, status
+                ),
                 app.theme.text_primary,
             )));
         }
@@ -120,7 +123,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(
                 song.courses
                     .iter()
-                    .map(|c| format!("{} ({})", c.name, c.level.map_or("?".to_owned(), |l| l.to_string())))
+                    .map(|c| {
+                        format!(
+                            "{} ({})",
+                            c.name,
+                            c.level.map_or("?".to_owned(), |l| l.to_string())
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
                 app.theme.text_secondary,

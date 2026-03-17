@@ -40,7 +40,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(""));
-    lines.push(field_line("  Mode:      ", mode_label, focus == ConnectField::Mode, theme));
+    lines.push(field_line(
+        "  Mode:      ",
+        mode_label,
+        focus == ConnectField::Mode,
+        theme,
+    ));
     lines.push(field_line(
         "  Server:    ",
         &server_display,
@@ -74,10 +79,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     if let Some(error) = &mp.error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {error}"),
-            theme.error,
-        )));
+        lines.push(Line::from(Span::styled(format!("  {error}"), theme.error)));
     }
 
     let block = Block::default()
@@ -96,7 +98,11 @@ fn field_line<'a>(
     focused: bool,
     theme: &crate::theme::Theme,
 ) -> Line<'a> {
-    let style = if focused { theme.selection } else { theme.text_primary };
+    let style = if focused {
+        theme.selection
+    } else {
+        theme.text_primary
+    };
     Line::from(vec![
         Span::styled(label, theme.metadata),
         Span::styled(value.to_owned(), style),

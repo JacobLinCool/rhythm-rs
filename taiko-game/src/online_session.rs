@@ -224,8 +224,7 @@ impl OnlineSession {
                 });
             }
             ServerMessage::MatchCountdown(countdown) => {
-                self.status_message =
-                    format!("match countdown: {} ms", countdown.start_at_ms);
+                self.status_message = format!("match countdown: {} ms", countdown.start_at_ms);
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     snapshot.phase = RoomPhase::Countdown;
                     snapshot.start_at_ms = Some(countdown.start_at_ms);
@@ -282,8 +281,11 @@ impl OnlineSession {
                     (pong.client_send_ms, pong.server_send_ms)
                 {
                     let client_receive_ms = self.local_now_ms();
-                    self.clock_sync
-                        .observe_sample(client_send_ms, client_receive_ms, server_send_ms);
+                    self.clock_sync.observe_sample(
+                        client_send_ms,
+                        client_receive_ms,
+                        server_send_ms,
+                    );
                 }
             }
         }
@@ -324,9 +326,9 @@ impl OnlineSession {
 
     /// Get the current flash state for a remote player, expiring stale entries.
     pub(crate) fn remote_flash_for(&self, player_id: &str, now_tick: Tick) -> Option<&RemoteFlash> {
-        self.remote_flashes.get(player_id).filter(|f| {
-            f.judge_until > now_tick || f.input_until > now_tick
-        })
+        self.remote_flashes
+            .get(player_id)
+            .filter(|f| f.judge_until > now_tick || f.input_until > now_tick)
     }
 }
 

@@ -23,7 +23,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{}: ", player.name), app.theme.metadata),
                     Span::styled(
-                        format!("score={} combo={}", result.result.score, result.result.max_combo),
+                        format!(
+                            "score={} combo={}",
+                            result.result.score, result.result.max_combo
+                        ),
                         app.theme.text_primary,
                     ),
                 ]));

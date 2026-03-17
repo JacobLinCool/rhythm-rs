@@ -303,7 +303,12 @@ pub(crate) struct ClockSyncState {
 }
 
 impl ClockSyncState {
-    pub(crate) fn observe_sample(&mut self, client_send_ms: u64, client_receive_ms: u64, server_send_ms: u64) {
+    pub(crate) fn observe_sample(
+        &mut self,
+        client_send_ms: u64,
+        client_receive_ms: u64,
+        server_send_ms: u64,
+    ) {
         if client_receive_ms < client_send_ms {
             self.rejected_samples = self.rejected_samples.saturating_add(1);
             return;
@@ -597,17 +602,41 @@ impl LobbySongBrowser {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OnlineEvent {
-    Init { song_count: usize },
-    Connected { protocol_version: u32, session_id: String },
-    Error { code: String, message: String },
-    RoomCreated { room_code: String },
-    RoomJoined { room_code: String, role: RoomRole },
-    Snapshot { phase: RoomPhase, player_count: usize, song_title: Option<String> },
-    SongSelected { title: String, course_index: usize },
+    Init {
+        song_count: usize,
+    },
+    Connected {
+        protocol_version: u32,
+        session_id: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    RoomCreated {
+        room_code: String,
+    },
+    RoomJoined {
+        room_code: String,
+        role: RoomRole,
+    },
+    Snapshot {
+        phase: RoomPhase,
+        player_count: usize,
+        song_title: Option<String>,
+    },
+    SongSelected {
+        title: String,
+        course_index: usize,
+    },
     Ready,
     Unready,
-    Countdown { start_at_ms: u64 },
-    MatchStarted { start_at_ms: u64 },
+    Countdown {
+        start_at_ms: u64,
+    },
+    MatchStarted {
+        start_at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,7 +819,9 @@ impl OnlineApp {
         while !app.should_quit {
             match events.next_event()? {
                 UiEvent::Tick => app.handle_tick()?,
-                UiEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                UiEvent::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     app.handle_key(key)?;
                 }
                 _ => {}
@@ -1031,10 +1062,8 @@ impl OnlineApp {
                         .send(ClientMessage::Ready(ReadyRequest { ready: true }))?;
                     self.headless_log("READY");
                     self.emit_event(OnlineEvent::Ready);
-                    self.status_message = format!(
-                        "course {} selected — ready!",
-                        self.local_course_index
-                    );
+                    self.status_message =
+                        format!("course {} selected — ready!", self.local_course_index);
                 }
             }
         }
@@ -1059,7 +1088,10 @@ impl OnlineApp {
                 );
             }
             ServerMessage::Error(error) => {
-                self.headless_log(&format!("ERROR code={} message={}", error.code, error.message));
+                self.headless_log(&format!(
+                    "ERROR code={} message={}",
+                    error.code, error.message
+                ));
                 self.emit_event(OnlineEvent::Error {
                     code: error.code.clone(),
                     message: error.message.clone(),
@@ -1142,10 +1174,7 @@ impl OnlineApp {
                 self.sync_host_selection_from_song(&selection);
             }
             ServerMessage::MatchCountdown(countdown) => {
-                self.headless_log(&format!(
-                    "COUNTDOWN start_at_ms={}",
-                    countdown.start_at_ms
-                ));
+                self.headless_log(&format!("COUNTDOWN start_at_ms={}", countdown.start_at_ms));
                 self.emit_event(OnlineEvent::Countdown {
                     start_at_ms: countdown.start_at_ms,
                 });
@@ -2364,8 +2393,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime for test");
-            let songdir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("songs");
+            let songdir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("songs");
             let server_args = taiko_resource_server::ServerArgs {
                 songdir,
                 host: "127.0.0.1".to_owned(),
@@ -2450,11 +2478,7 @@ mod tests {
                 .expect("timed out waiting for room code")
         }
 
-        fn wait_for<F: Fn(&OnlineEvent) -> bool>(
-            &self,
-            timeout: Duration,
-            pred: F,
-        ) -> OnlineEvent {
+        fn wait_for<F: Fn(&OnlineEvent) -> bool>(&self, timeout: Duration, pred: F) -> OnlineEvent {
             let deadline = Instant::now() + timeout;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2490,8 +2514,7 @@ mod tests {
         }
 
         fn send_key(&self, code: KeyCode) {
-            let key =
-                KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
+            let key = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
             let _ = self.cmd_tx.send(HeadlessCommand::Key(key));
         }
 
@@ -2588,10 +2611,24 @@ mod tests {
 
         // Both should eventually see a snapshot with 2 players
         host.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, phase: RoomPhase::Lobby, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    phase: RoomPhase::Lobby,
+                    ..
+                }
+            )
         });
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, phase: RoomPhase::Lobby, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    phase: RoomPhase::Lobby,
+                    ..
+                }
+            )
         });
     }
 
@@ -2606,7 +2643,13 @@ mod tests {
 
         // Wait for both to be in lobby with 2 players
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2615,8 +2658,7 @@ mod tests {
 
         // Both should receive SongSelected with matching title
         let host_event = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        let joiner_event =
-            joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
+        let joiner_event = joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
 
         match (&host_event, &joiner_event) {
             (
@@ -2644,7 +2686,13 @@ mod tests {
         let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         host.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2704,7 +2752,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2723,7 +2777,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2742,7 +2802,13 @@ mod tests {
         let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         host.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2754,11 +2820,13 @@ mod tests {
         host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
 
         // Joiner does NOT confirm course — should NOT get countdown
-        let got_countdown =
-            host.has_event(Duration::from_millis(500), |e| {
-                matches!(e, OnlineEvent::Countdown { .. })
-            });
-        assert!(!got_countdown, "countdown should not start with only 1 player ready");
+        let got_countdown = host.has_event(Duration::from_millis(500), |e| {
+            matches!(e, OnlineEvent::Countdown { .. })
+        });
+        assert!(
+            !got_countdown,
+            "countdown should not start with only 1 player ready"
+        );
     }
 
     // ── Group 4: Gameplay ────────────────────────────────────────────
@@ -2771,7 +2839,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2797,7 +2871,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2890,7 +2970,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -2912,7 +2998,13 @@ mod tests {
         let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
 
         joiner.wait_for(T, |e| {
-            matches!(e, OnlineEvent::Snapshot { player_count: 2, .. })
+            matches!(
+                e,
+                OnlineEvent::Snapshot {
+                    player_count: 2,
+                    ..
+                }
+            )
         });
         thread::sleep(Duration::from_millis(200));
 
