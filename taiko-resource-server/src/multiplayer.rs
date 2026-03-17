@@ -15,6 +15,11 @@ use tokio::sync::Mutex;
 
 const ROOM_MAX_PLAYERS: usize = 4;
 const ROOM_MAX_SPECTATORS: usize = 64;
+const ROOM_CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const ROOM_CODE_LEN: usize = 4;
+const ROOM_CODE_BITS: u32 = (ROOM_CODE_LEN * 5) as u32;
+const ROOM_CODE_SPACE: usize = 1usize << ROOM_CODE_BITS;
+const ROOM_CODE_MASK: u32 = (1u32 << ROOM_CODE_BITS) - 1;
 #[cfg(any(test, feature = "test-fast-countdown"))]
 const MATCH_COUNTDOWN_MS: u64 = 1;
 #[cfg(not(any(test, feature = "test-fast-countdown")))]
@@ -158,7 +163,6 @@ impl MultiplayerRegistry {
 #[derive(Default)]
 struct RegistryInner {
     next_session_id: u64,
-    next_room_nonce: u64,
     sessions: HashMap<u64, SessionState>,
     rooms: HashMap<String, RoomState>,
 }
@@ -297,7 +301,7 @@ impl RegistryInner {
         }
 
         let name = self.session_name(session_id)?.to_owned();
-        let room_code = self.generate_room_code();
+        let room_code = self.generate_room_code()?;
         let player_id = "p1".to_owned();
 
         let mut room = RoomState {
@@ -921,22 +925,30 @@ impl RegistryInner {
         Ok(())
     }
 
-    fn generate_room_code(&mut self) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        loop {
-            self.next_room_nonce = self.next_room_nonce.saturating_add(1);
-            let mut value = self.next_room_nonce;
-            let mut chars = [ALPHABET[0]; 6];
-            for slot in &mut chars {
-                let idx = (value % ALPHABET.len() as u64) as usize;
-                *slot = ALPHABET[idx];
-                value /= ALPHABET.len() as u64;
-            }
-            let room_code = String::from_utf8_lossy(&chars).to_string();
-            if !self.rooms.contains_key(&room_code) {
-                return room_code;
+    fn generate_room_code(&self) -> Result<String, ServerError> {
+        if self.rooms.len() >= ROOM_CODE_SPACE {
+            return Err(ServerError {
+                code: "room_code_exhausted".to_owned(),
+                message: "all room codes are currently allocated".to_owned(),
+            });
+        }
+
+        let start = getrandom::u32().map_err(|error| ServerError {
+            code: "random_unavailable".to_owned(),
+            message: format!("failed to generate room code: {error}"),
+        })? & ROOM_CODE_MASK;
+
+        for offset in 0..ROOM_CODE_SPACE as u32 {
+            let candidate = encode_room_code(start.wrapping_add(offset) & ROOM_CODE_MASK);
+            if !self.rooms.contains_key(&candidate) {
+                return Ok(candidate);
             }
         }
+
+        Err(ServerError {
+            code: "room_code_exhausted".to_owned(),
+            message: "all room codes are currently allocated".to_owned(),
+        })
     }
 
     fn advance_all_rooms(&mut self, now_ms: u64) {
@@ -975,6 +987,16 @@ impl RegistryInner {
             }
         }
     }
+}
+
+fn encode_room_code(mut value: u32) -> String {
+    let mut chars = [ROOM_CODE_ALPHABET[0]; ROOM_CODE_LEN];
+    for slot in &mut chars {
+        let idx = (value & 0b1_1111) as usize;
+        *slot = ROOM_CODE_ALPHABET[idx];
+        value >>= 5;
+    }
+    String::from_utf8(chars.to_vec()).expect("room code alphabet must be valid ASCII")
 }
 
 #[derive(Clone)]
@@ -1343,6 +1365,39 @@ mod tests {
                 ServerMessage::RoomSnapshot(snapshot) if snapshot.phase == RoomPhase::Playing
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn created_room_code_is_four_chars_from_room_alphabet() {
+        let registry = MultiplayerRegistry::new(&sample_library());
+        let (tx, mut rx) = unbounded_channel();
+        let session_id = registry.register_session(tx).await;
+
+        registry
+            .handle_client_message(
+                session_id,
+                ClientMessage::Hello(ClientHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    name: "host".to_owned(),
+                }),
+            )
+            .await;
+        registry
+            .handle_client_message(session_id, ClientMessage::CreateRoom)
+            .await;
+
+        let room_code = drain_messages(&mut rx)
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::RoomCreated(created) => Some(created.room_code),
+                _ => None,
+            })
+            .expect("room code");
+
+        assert_eq!(room_code.len(), ROOM_CODE_LEN);
+        assert!(room_code
+            .bytes()
+            .all(|byte| ROOM_CODE_ALPHABET.contains(&byte)));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ anyhow = "1.0.98"
 axum = { version = "0.8.6", features = ["ws"] }
 clap = { version = "4.5.32", features = ["derive"] }
 futures-util = "0.3.31"
+getrandom = "0.3.4"
 hex = "0.4.3"
 rayon = "1.11.0"
 rhythm-importer-tja = { path = "../rhythm-importer-tja", version = "0.1.0" }

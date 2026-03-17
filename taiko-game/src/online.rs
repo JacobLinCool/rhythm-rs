@@ -2623,6 +2623,7 @@ LEVEL:1
         let host = TestClient::spawn_host(&harness, "Host");
         let code = host.wait_room_code(T);
         assert!(!code.is_empty(), "room code should be non-empty");
+        assert_eq!(code.len(), 4, "room code should be 4 characters: {code}");
         assert!(
             code.chars().all(|c| c.is_ascii_alphanumeric()),
             "room code should be alphanumeric: {code}"
