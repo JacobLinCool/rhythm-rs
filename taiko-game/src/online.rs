@@ -2367,25 +2367,83 @@ mod tests {
     };
     use crate::headless::HeadlessCommand;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     use taiko_multiplayer_protocol::RoomPhase;
 
+    static TEST_SONGDIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    const TEST_SONG_TJA: &str = r#"TITLE:Fixture Song
+WAVE:fixture.wav
+BPM:120
+COURSE:Oni
+LEVEL:1
+#START
+1000,
+0000,
+0000,
+0000,
+#END
+"#;
+
+    struct TestSongDir {
+        root: PathBuf,
+    }
+
+    impl TestSongDir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "taiko-online-test-{}-{}",
+                std::process::id(),
+                TEST_SONGDIR_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+
+            if root.exists() {
+                fs::remove_dir_all(&root).expect("failed to clear stale test song directory");
+            }
+
+            fs::create_dir_all(&root).expect("failed to create test song directory");
+            fs::write(root.join("fixture.tja"), TEST_SONG_TJA)
+                .expect("failed to write test chart fixture");
+            fs::write(
+                root.join("fixture.wav"),
+                include_bytes!("../assets/don.wav"),
+            )
+            .expect("failed to write test audio fixture");
+
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TestSongDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     struct TestHarness {
         server_addr: std::net::SocketAddr,
         _runtime: tokio::runtime::Runtime,
+        _songdir: TestSongDir,
     }
 
     impl TestHarness {
         fn new() -> Self {
+            let songdir = TestSongDir::new();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime for test");
-            let songdir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("songs");
             let server_args = taiko_resource_server::ServerArgs {
-                songdir,
+                songdir: songdir.path().to_path_buf(),
                 host: "127.0.0.1".to_owned(),
                 port: 0,
             };
@@ -2395,6 +2453,7 @@ mod tests {
             Self {
                 server_addr: addr,
                 _runtime: runtime,
+                _songdir: songdir,
             }
         }
 
