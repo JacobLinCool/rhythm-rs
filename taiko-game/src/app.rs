@@ -1071,11 +1071,7 @@ impl App {
         let song_entry = &self.songs[song_idx];
         let chart = self
             .resource_backend
-            .load_course_chart(
-                song_entry,
-                course_idx,
-                &rhythm_importer_tja::TjaImporter,
-            )
+            .load_course_chart(song_entry, course_idx, &rhythm_importer_tja::TjaImporter)
             .context("failed to load online match chart")?;
         let audio_source = self
             .resource_backend
