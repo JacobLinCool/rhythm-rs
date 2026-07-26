@@ -36,40 +36,33 @@ const GAUGE_BAR_MAX_WIDTH: usize = 60;
 const GAUGE_FIXED_COLUMNS: usize = 24;
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 24;
-pub(crate) const MIN_LOCAL_GAME_HEIGHT: u16 = 27;
-pub(crate) const MIN_LOCAL_GAME_POINTER_HEIGHT: u16 = 30;
+pub(crate) const MIN_ONLINE_MATCH_HEIGHT: u16 = 25;
+pub(crate) const MIN_LOCAL_GAME_HEIGHT: u16 = 31;
+const LOCAL_GAME_CONTROLLER_SURFACE_HEIGHT: u16 = 3;
 
 pub(crate) const fn minimum_terminal_size(page: Page) -> (u16, u16) {
     let height = match page {
         Page::LocalGame => MIN_LOCAL_GAME_HEIGHT,
+        Page::OnlineMatch => MIN_ONLINE_MATCH_HEIGHT,
         _ => MIN_TERMINAL_HEIGHT,
     };
     (MIN_TERMINAL_WIDTH, height)
 }
 
-pub(crate) const fn terminal_is_too_small(page: Page, area: Rect) -> bool {
-    let (required_width, required_height) = minimum_terminal_size(page);
-    area.width < required_width || area.height < required_height
-}
-
 pub(crate) fn minimum_terminal_size_for_app(app: &App) -> (u16, u16) {
-    if app.page == Page::LocalGame
-        && (app.terminal_pointer_slot().is_some() || app.mac_trackpad_slot().is_some())
-    {
-        (MIN_TERMINAL_WIDTH, MIN_LOCAL_GAME_POINTER_HEIGHT)
-    } else {
-        minimum_terminal_size(app.page)
+    let (width, mut height) = minimum_terminal_size(app.page);
+    if app.page == Page::LocalGame {
+        height = height.saturating_add(u16::from(!app.keyboard_repeat_is_distinguishable));
+        if app.terminal_pointer_slot().is_some() || app.mac_trackpad_slot().is_some() {
+            height = height.saturating_add(LOCAL_GAME_CONTROLLER_SURFACE_HEIGHT);
+        }
     }
+    (width, height)
 }
 
 pub(crate) fn terminal_is_too_small_for_app(app: &App, area: Rect) -> bool {
-    if app.page == Page::LocalGame
-        && (app.terminal_pointer_slot().is_some() || app.mac_trackpad_slot().is_some())
-    {
-        area.width < MIN_TERMINAL_WIDTH || area.height < MIN_LOCAL_GAME_POINTER_HEIGHT
-    } else {
-        terminal_is_too_small(app.page, area)
-    }
+    let (required_width, required_height) = minimum_terminal_size_for_app(app);
+    area.width < required_width || area.height < required_height
 }
 
 pub(crate) fn render_terminal_guard(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -514,9 +507,7 @@ fn threshold_index(bar_width: usize, threshold: f32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::layout::Rect;
-
-    use super::{gauge_bar_width, terminal_is_too_small};
+    use super::{gauge_bar_width, minimum_terminal_size};
     use crate::app::Page;
 
     #[test]
@@ -528,22 +519,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_guard_uses_page_specific_playable_minimums() {
-        assert!(!terminal_is_too_small(
-            Page::SongMenu,
-            Rect::new(0, 0, 80, 24)
-        ));
-        assert!(terminal_is_too_small(
-            Page::SongMenu,
-            Rect::new(0, 0, 79, 24)
-        ));
-        assert!(terminal_is_too_small(
-            Page::LocalGame,
-            Rect::new(0, 0, 80, 24)
-        ));
-        assert!(!terminal_is_too_small(
-            Page::LocalGame,
-            Rect::new(0, 0, 80, 27)
-        ));
+    fn page_specific_minimums_reserve_complete_lane_canvases() {
+        assert_eq!(minimum_terminal_size(Page::SongMenu), (80, 24));
+        assert_eq!(minimum_terminal_size(Page::LocalGame), (80, 31));
+        assert_eq!(minimum_terminal_size(Page::OnlineMatch), (80, 25));
     }
 }

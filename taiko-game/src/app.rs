@@ -6654,7 +6654,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         wait_for_page(&mut app, Page::LocalGame)?;
 
-        let rendered = render_text_at(&mut app, 120, 30);
+        let rendered = render_text_at(&mut app, 120, 35);
         assert!(rendered.contains("P1L-KAT"));
         assert!(rendered.contains("P2L-KAT"));
         assert_eq!(
@@ -6685,7 +6685,7 @@ mod tests {
         );
 
         app.preferences.ui_language = UiLanguage::Japanese;
-        let minimum_japanese = render_text_at(&mut app, 80, 30);
+        let minimum_japanese = render_text_at(&mut app, 80, 35);
         assert!(
             rendered_text_contains(&minimum_japanese, "P1L-カッ"),
             "{minimum_japanese}"
@@ -7166,8 +7166,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Char('j')));
         wait_for_page(&mut app, Page::LocalGame)?;
-        let undersized_pointer_view = render_text_at(&mut app, 80, 27);
-        assert!(undersized_pointer_view.contains("Required: at least 80 × 30"));
+        let undersized_pointer_view = render_text_at(&mut app, 80, 34);
+        assert!(undersized_pointer_view.contains("Required: at least 80 × 35"));
         let _ = render_text(&mut app);
         let surface = app.pointer_surface.context("P2 pointer surface")?;
         assert_eq!(surface.slot, ControllerSlot::Two);
@@ -7386,7 +7386,7 @@ mod tests {
             assert_eq!(app.page, Page::OfflinePreparation);
             wait_for_page(&mut app, Page::LocalGame)?;
 
-            let local_game_text = render_text_at(&mut app, 80, 27);
+            let local_game_text = render_text_at(&mut app, 80, 32);
             assert!(
                 local_game_text
                     .replace(' ', "")
@@ -7607,10 +7607,10 @@ mod tests {
         wait_for_page(&mut app, Page::LocalGame)?;
         assert!(app.local_game.is_some());
 
-        let undersized = render_text_at(&mut app, 80, 24);
+        let undersized = render_text_at(&mut app, 80, 31);
         assert!(undersized.contains("Terminal too small"));
-        assert!(undersized.contains("Required: at least 80 × 27"));
-        let minimum_size = render_text_at(&mut app, 80, 27);
+        assert!(undersized.contains("Required: at least 80 × 32"));
+        let minimum_size = render_text_at(&mut app, 80, 32);
         assert!(!minimum_size.contains("Terminal too small"));
         assert!(minimum_size.matches("SCORE").count() >= 2);
         assert!(minimum_size.matches("SOUL").count() >= 2);

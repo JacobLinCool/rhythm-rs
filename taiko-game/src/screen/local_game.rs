@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::game_screen::{judge_feedback, render_lane_view, LaneRenderOptions};
+use super::game_screen::{judge_feedback, render_lane_view, LaneRenderOptions, LANE_BLOCK_HEIGHT};
 use super::{render_controller_drum_surface, render_gauge_bar_line};
 use crate::app::App;
 use crate::controller::ControllerSlot;
@@ -10,6 +10,9 @@ use crate::drum_surface::DrumSurfaceLayout;
 use crate::local_multiplayer::LocalPlayerId;
 use crate::localization::UiText;
 use crate::tui::Frame;
+
+const PLAYER_HUD_HEIGHT: u16 = 5;
+const LOCAL_PLAY_AREA_MIN_HEIGHT: u16 = 2 * (PLAYER_HUD_HEIGHT + LANE_BLOCK_HEIGHT);
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfaceLayout> {
     let Some(game) = app.local_game.as_ref() else {
@@ -39,14 +42,20 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(11), Constraint::Length(footer_height)])
+        .constraints([
+            Constraint::Min(LOCAL_PLAY_AREA_MIN_HEIGHT),
+            Constraint::Length(footer_height),
+        ])
         .split(area);
     let player_areas = split_player_areas(rows[0]);
 
     for (player_id, player_area) in LocalPlayerId::ALL.into_iter().zip(player_areas) {
         let player_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(6)])
+            .constraints([
+                Constraint::Length(PLAYER_HUD_HEIGHT),
+                Constraint::Min(LANE_BLOCK_HEIGHT),
+            ])
             .split(player_area);
         let player = &game.players[player_id.index()];
         let score = &player.last_output.score;
@@ -222,7 +231,10 @@ fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
 mod tests {
     use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-    use super::{distinct_controller_slots, split_player_areas};
+    use super::{
+        distinct_controller_slots, split_player_areas, LANE_BLOCK_HEIGHT,
+        LOCAL_PLAY_AREA_MIN_HEIGHT, PLAYER_HUD_HEIGHT,
+    };
     use crate::controller::ControllerSlot;
 
     #[test]
@@ -257,25 +269,30 @@ mod tests {
     }
 
     #[test]
-    fn minimum_local_game_height_preserves_both_complete_five_row_lanes() {
-        // A 30-row terminal leaves 29 rows after the global top bar.
-        let content = Rect::new(0, 1, 80, 29);
+    fn minimum_local_game_height_preserves_both_complete_seven_row_lane_canvases() {
+        // A 35-row terminal leaves 34 rows after the global top bar. The
+        // worst-case footer contains both a controller surface and the
+        // keyboard-repeat warning.
+        let content = Rect::new(0, 1, 80, 34);
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(11), Constraint::Length(5)])
+            .constraints([
+                Constraint::Min(LOCAL_PLAY_AREA_MIN_HEIGHT),
+                Constraint::Length(6),
+            ])
             .split(content);
         let players = split_player_areas(rows[0]);
 
         for player in players {
             let player_rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(5), Constraint::Min(6)])
+                .constraints([
+                    Constraint::Length(PLAYER_HUD_HEIGHT),
+                    Constraint::Min(LANE_BLOCK_HEIGHT),
+                ])
                 .split(player);
-            assert_eq!(player_rows[0].height, 5);
-            assert!(
-                player_rows[1].height >= 7,
-                "lane requires 2 border rows plus all 5 rendered highway rows"
-            );
+            assert_eq!(player_rows[0].height, PLAYER_HUD_HEIGHT);
+            assert_eq!(player_rows[1].height, LANE_BLOCK_HEIGHT);
         }
     }
 }

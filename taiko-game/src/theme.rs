@@ -93,8 +93,8 @@ impl Theme {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 lane_track: Style::default().bg(Color::DarkGray),
-                lane_gogo_edge: Style::default().bg(Color::DarkGray),
-                lane_bar_line: Style::default().bg(Color::DarkGray),
+                lane_gogo_edge: Style::default().bg(Color::Rgb(148, 72, 48)),
+                lane_bar_line: Style::default().bg(Color::Rgb(86, 98, 120)),
                 lane_note_don: Style::default()
                     .fg(Color::White)
                     .bg(Color::Red)
@@ -377,10 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn colored_gogo_edge_matches_the_normal_track_background() {
+    fn colored_gogo_edge_is_a_fixed_muted_orange_distinct_from_the_track() {
         let theme = Theme::taiko_vivid(ColorMode::Enabled);
 
-        assert_eq!(theme.lane_gogo_edge.bg, theme.lane_track.bg);
+        assert_eq!(theme.lane_gogo_edge.bg, Some(Color::Rgb(148, 72, 48)));
+        assert_ne!(theme.lane_gogo_edge.bg, theme.lane_track.bg);
+        assert_ne!(theme.lane_bar_line.bg, theme.lane_track.bg);
     }
 
     #[test]

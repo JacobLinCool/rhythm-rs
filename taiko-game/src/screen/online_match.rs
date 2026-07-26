@@ -8,11 +8,12 @@ use crate::controller::ControllerSlot;
 use crate::drum_surface::DrumSurfaceLayout;
 use crate::localization::{Localizer, UiText};
 use crate::preferences::DrumBindings;
-use crate::screen::game_screen::{render_lane_view, LaneRenderOptions};
+use crate::screen::game_screen::{render_lane_view, LaneRenderOptions, LANE_BLOCK_HEIGHT};
 use crate::screen::render_controller_drum_surface;
 use crate::tui::Frame;
 
 const START_CUE_DURATION_US: u64 = 750_000;
+const LOCAL_PLAYER_MIN_HEIGHT: u16 = LANE_BLOCK_HEIGHT + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CountdownCue {
@@ -60,7 +61,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
     };
     let sections = Layout::vertical([
         Constraint::Length(header_height),
-        Constraint::Min(1),
+        Constraint::Min(LOCAL_PLAYER_MIN_HEIGHT),
         Constraint::Length(footer_height),
     ])
     .split(area);
@@ -229,7 +230,8 @@ fn render_local_player(app: &App, frame: &mut Frame<'_>, area: Rect, player: &Pl
         );
         return;
     };
-    let split = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+    let split =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(LANE_BLOCK_HEIGHT)]).split(inner);
     let score = &runtime.last_output.score;
     frame.render_widget(
         Paragraph::new(Line::from(vec![

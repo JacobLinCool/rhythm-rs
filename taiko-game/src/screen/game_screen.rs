@@ -19,7 +19,9 @@ const LOOKAHEAD_TICKS: i64 = 2_000_000;
 const LOOKBACK_TICKS: i64 = 300_000;
 const HIT_X_DIVISOR: usize = 6;
 const HIT_X_LEFT_SHIFT: usize = 1;
-const GOGO_EDGE_BLINK_HALF_PERIOD_TICKS: i64 = 350_000;
+const LANE_CORE_ROWS: u16 = 5;
+const LANE_RENDERED_ROWS: u16 = LANE_CORE_ROWS + 2;
+pub(crate) const LANE_BLOCK_HEIGHT: u16 = LANE_RENDERED_ROWS + 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LaneRenderOptions {
@@ -68,7 +70,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
-            Constraint::Min(7),
+            Constraint::Min(LANE_BLOCK_HEIGHT),
             Constraint::Length(footer_height),
         ])
         .split(area);
@@ -269,18 +271,20 @@ pub fn render_lane_view(
 ) {
     let width = usize::from(area.width.saturating_sub(2).max(1));
     let hit_x = hit_x_for_width(width);
-    // Shared row: balloon labels and top-side bar lines.
-    // Draw bar lines first, then labels so labels stay visually on top.
-    let edge_style = if gogo_edge_visible(view.gogo_active, view.now) {
+    let edge_style = if view.gogo_active {
         theme.lane_gogo_edge
     } else {
         theme.text_primary
     };
-    let mut label = vec![Span::styled(" ", edge_style); width];
+    // The central five rows are the stable highway. Go-Go adds one fixed
+    // accent row above and below without recoloring or moving that highway.
+    let gogo_top = vec![Span::styled(" ", edge_style); width];
+    let mut label = vec![Span::styled(" ", theme.lane_track); width];
     let mut top = vec![Span::styled(" ", theme.lane_track); width];
     let mut middle = vec![Span::styled(" ", theme.lane_track); width];
     let mut bottom = vec![Span::styled(" ", theme.lane_track); width];
-    let mut bar_bottom = vec![Span::styled(" ", edge_style); width];
+    let mut bar_bottom = vec![Span::styled(" ", theme.lane_track); width];
+    let gogo_bottom = vec![Span::styled(" ", edge_style); width];
 
     let base_style = judge_base_style(theme, options.judge_flash);
     paint_hit_zone_base(&mut top, &mut middle, &mut bottom, hit_x, width, base_style);
@@ -305,13 +309,13 @@ pub fn render_lane_view(
         paint_centered_label(
             &mut label,
             options.paused_label,
-            edge_style.patch(theme.warning),
+            theme.lane_track.patch(theme.warning),
         );
     } else if view.gogo_active {
         paint_centered_label(
             &mut label,
             options.gogo_label,
-            edge_style.patch(theme.warning),
+            theme.lane_track.patch(theme.warning),
         );
     }
 
@@ -327,30 +331,29 @@ pub fn render_lane_view(
     );
 
     let lane_lines = vec![
+        Line::from(gogo_top),
         Line::from(label),
         Line::from(top),
         Line::from(middle),
         Line::from(bottom),
         Line::from(bar_bottom),
+        Line::from(gogo_bottom),
     ];
     let block = themed_block_plain_theme(theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height < LANE_RENDERED_ROWS {
+        return;
+    }
     let lane_area = Rect {
         x: inner.x,
-        y: inner.y.saturating_add(inner.height.saturating_sub(5) / 2),
+        y: inner
+            .y
+            .saturating_add(inner.height.saturating_sub(LANE_RENDERED_ROWS) / 2),
         width: inner.width,
-        height: inner.height.min(5),
+        height: LANE_RENDERED_ROWS,
     };
     frame.render_widget(Paragraph::new(lane_lines), lane_area);
-}
-
-fn gogo_edge_visible(gogo_active: bool, now_tick: i64) -> bool {
-    gogo_active
-        && now_tick
-            .div_euclid(GOGO_EDGE_BLINK_HALF_PERIOD_TICKS)
-            .rem_euclid(2)
-            == 0
 }
 
 fn paint_bar_lines(
@@ -686,9 +689,9 @@ mod tests {
     use rhythm_mode_taiko::TaikoMode;
 
     use super::{
-        gogo_edge_visible, hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
+        hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
         paint_hit_markers_overlay, paint_hit_zone_base, paint_note_blob, projected_span_x,
-        render_lane_view, to_x, LaneRenderOptions, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS,
+        render_lane_view, to_x, LaneRenderOptions, LANE_CORE_ROWS, LANE_RENDERED_ROWS,
     };
     use crate::theme::{ColorMode, Theme};
 
@@ -931,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn bar_lines_render_as_background_blocks_on_outer_rows() {
+    fn bar_lines_render_as_background_blocks_on_first_and_fifth_core_rows() {
         let width = 40usize;
         let hit_x = hit_x_for_width(width);
         let bar_line_style = Style::default().bg(Color::DarkGray);
@@ -1043,83 +1046,69 @@ mod tests {
     }
 
     #[test]
-    fn gogo_edge_blink_uses_a_350_millisecond_half_period() {
-        let half_period = GOGO_EDGE_BLINK_HALF_PERIOD_TICKS;
-
-        assert!(gogo_edge_visible(true, 0));
-        assert!(gogo_edge_visible(true, half_period - 1));
-        assert!(!gogo_edge_visible(true, half_period));
-        assert!(!gogo_edge_visible(true, half_period * 2 - 1));
-        assert!(gogo_edge_visible(true, half_period * 2));
-        assert!(!gogo_edge_visible(false, 0));
-        assert!(!gogo_edge_visible(false, half_period * 2));
-    }
-
-    #[test]
-    fn gogo_only_pulses_the_two_outer_rows() {
+    fn five_row_highway_is_stable_and_gogo_adds_two_steady_outer_rows() {
         const SAMPLE_X: u16 = 2;
         const UPPER_EDGE_Y: u16 = 1;
-        const TRACK_ROWS: [u16; 3] = [2, 3, 4];
-        const LOWER_EDGE_Y: u16 = 5;
+        const TRACK_ROWS: [u16; 5] = [2, 3, 4, 5, 6];
+        const LOWER_EDGE_Y: u16 = 7;
 
         let theme = Theme::taiko_vivid(ColorMode::Enabled);
-        let bright = render_empty_lane(&theme, 0, true);
-        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
         let inactive = render_empty_lane(&theme, 0, false);
+        let active_at_start = render_empty_lane(&theme, 0, true);
+        let active_much_later = render_empty_lane(&theme, 987_654_321, true);
 
-        for buffer in [&bright, &dark, &inactive] {
+        assert_eq!(LANE_CORE_ROWS, 5);
+        assert_eq!(LANE_RENDERED_ROWS, 7);
+        for buffer in [&inactive, &active_at_start, &active_much_later] {
             for y in TRACK_ROWS {
                 assert_eq!(
                     cell(buffer, SAMPLE_X, y).style().bg,
                     theme.lane_track.bg,
-                    "main track row {y} must never adopt a Go-Go style"
+                    "all five main-track rows must keep the stable track background"
                 );
             }
         }
 
         for y in [UPPER_EDGE_Y, LOWER_EDGE_Y] {
             assert_eq!(
-                cell(&bright, SAMPLE_X, y).style().bg,
-                theme.lane_gogo_edge.bg,
-                "outer row {y} must expand using the normal track color"
-            );
-            assert_eq!(
-                cell(&dark, SAMPLE_X, y).style().bg,
-                Some(Color::Reset),
-                "outer row {y} must return to the normal empty background"
-            );
-            assert_eq!(
                 cell(&inactive, SAMPLE_X, y).style().bg,
                 Some(Color::Reset),
                 "outer row {y} must stay empty outside Go-Go"
             );
+            for active in [&active_at_start, &active_much_later] {
+                assert_eq!(
+                    cell(active, SAMPLE_X, y).style().bg,
+                    theme.lane_gogo_edge.bg,
+                    "outer row {y} must stay a fixed Go-Go accent"
+                );
+            }
         }
+
+        assert_eq!(
+            active_at_start.content(),
+            active_much_later.content(),
+            "Go-Go edge rendering must not blink or depend on song time"
+        );
     }
 
     #[test]
-    fn gogo_label_stays_readable_during_both_edge_phases() {
+    fn gogo_label_stays_on_the_first_core_track_row() {
         let theme = Theme::taiko_vivid(ColorMode::Enabled);
-        let bright = render_empty_lane(&theme, 0, true);
-        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
+        let buffer = render_empty_lane(&theme, 0, true);
+        let text = buffer
+            .content()
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("GO-GO!"));
 
-        for (buffer, expected_background) in
-            [(&bright, theme.lane_track.bg), (&dark, Some(Color::Reset))]
-        {
-            let text = buffer
-                .content()
-                .iter()
-                .map(Cell::symbol)
-                .collect::<String>();
-            assert!(text.contains("GO-GO!"));
-
-            let label_cell = (1..buffer.area.width.saturating_sub(1))
-                .map(|x| cell(buffer, x, 1))
-                .find(|cell| cell.symbol() == "G")
-                .expect("rendered GO-GO label");
-            assert_eq!(label_cell.style().fg, theme.warning.fg);
-            assert_eq!(label_cell.style().bg, expected_background);
-            assert!(label_cell.style().add_modifier.contains(Modifier::BOLD));
-        }
+        let label_cell = (1..buffer.area.width.saturating_sub(1))
+            .map(|x| cell(&buffer, x, 2))
+            .find(|cell| cell.symbol() == "G")
+            .expect("rendered GO-GO label");
+        assert_eq!(label_cell.style().fg, theme.warning.fg);
+        assert_eq!(label_cell.style().bg, theme.lane_track.bg);
+        assert!(label_cell.style().add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1127,21 +1116,21 @@ mod tests {
         const SAMPLE_X: u16 = 2;
 
         let theme = Theme::taiko_vivid(ColorMode::Disabled);
-        let bright = render_empty_lane(&theme, 0, true);
-        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
+        let active = render_empty_lane(&theme, 0, true);
+        let inactive = render_empty_lane(&theme, 0, false);
 
-        for y in [1, 5] {
-            assert!(cell(&bright, SAMPLE_X, y)
+        for y in [1, 7] {
+            assert!(cell(&active, SAMPLE_X, y)
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED));
-            assert!(!cell(&dark, SAMPLE_X, y)
+            assert!(!cell(&inactive, SAMPLE_X, y)
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED));
         }
-        for y in [2, 3, 4] {
-            assert!(!cell(&bright, SAMPLE_X, y)
+        for y in [2, 3, 4, 5, 6] {
+            assert!(!cell(&active, SAMPLE_X, y)
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED));
@@ -1158,7 +1147,7 @@ mod tests {
             gauge: 0.0,
             gogo_active,
         };
-        let backend = TestBackend::new(48, 7);
+        let backend = TestBackend::new(48, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
