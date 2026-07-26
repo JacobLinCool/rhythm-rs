@@ -22,6 +22,7 @@ impl ControllerSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControllerSource {
     Keyboard,
+    MacTrackpadContact,
     TerminalPointer,
     Lan { connection_id: u64 },
 }

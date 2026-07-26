@@ -363,6 +363,25 @@ impl OnlineDomain {
         Self::with_network(config, network)
     }
 
+    #[cfg(test)]
+    pub(crate) fn assume_playing_player_for_test(
+        &mut self,
+        player_id: PlayerId,
+        match_id: MatchId,
+    ) {
+        self.membership = Some(MembershipGranted {
+            room_code: taiko_multiplayer_protocol::RoomCode::parse("TEST")
+                .expect("static test room code"),
+            actor_id: ActorId::Player(player_id),
+            resume_token: taiko_multiplayer_protocol::ResumeToken::parse("a".repeat(64))
+                .expect("static test resume token"),
+            invitation_token: taiko_multiplayer_protocol::InvitationToken::parse("b".repeat(64))
+                .expect("static test invitation token"),
+        });
+        self.active_match_id = Some(match_id);
+        self.phase = OnlinePhase::Playing;
+    }
+
     pub(crate) fn tick_network(&mut self) -> Result<()> {
         let now_us = self.local_now_us();
         self.tick_at(now_us)

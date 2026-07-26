@@ -11,9 +11,10 @@ use crate::controller::ControllerSlot;
 use crate::controller_qr::encode_controller_url;
 use crate::lan_controller::ControllerSlotStatus;
 use crate::localization::{pad_or_truncate_to_width, UiText};
+use crate::macos_trackpad::MacTrackpadAvailability;
 use crate::tui::Frame;
 
-use super::render_terminal_drum_surface;
+use super::render_controller_drum_surface;
 
 const TEST_FLASH_DURATION: Duration = Duration::from_millis(120);
 
@@ -28,7 +29,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
 
     let panes = if area.width < 110 {
-        Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).split(area)
+        Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).split(area)
     } else {
         Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).split(area)
     };
@@ -49,7 +50,13 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     );
 
     let pointer_slot = app.controller_setup.pointer_slot;
-    let right_sections = if pointer_slot.is_some() && panes[1].height >= 9 {
+    let mac_trackpad_slot = app.controller_setup.mac_trackpad_slot;
+    let surface_slot = match app.controller_setup.selected_item() {
+        ControllerSetupItem::MacTrackpad => mac_trackpad_slot.or(pointer_slot),
+        ControllerSetupItem::TerminalPointer => pointer_slot.or(mac_trackpad_slot),
+        _ => mac_trackpad_slot.or(pointer_slot),
+    };
+    let right_sections = if surface_slot.is_some() && panes[1].height >= 9 {
         Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(panes[1])
     } else {
         Layout::vertical([Constraint::Min(0), Constraint::Length(0)]).split(panes[1])
@@ -122,11 +129,19 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             app.theme.text_primary,
         )),
         Line::from(Span::styled(
+            app.text(UiText::ControllerLocalSlotHelp),
+            app.theme.text_primary,
+        )),
+        Line::from(Span::styled(
             app.text(UiText::ControllerPairingHelp),
             app.theme.text_primary,
         )),
         Line::from(Span::styled(
-            app.text(UiText::ControllerTrackpadHelp),
+            app.text(UiText::ControllerMacTrackpadHelp),
+            app.theme.metadata,
+        )),
+        Line::from(Span::styled(
+            app.text(UiText::ControllerPointerHelp),
             app.theme.metadata,
         )),
         Line::from(Span::styled(
@@ -146,14 +161,16 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         detail_area,
     );
 
-    if let Some(slot) = pointer_slot {
+    if let Some(slot) = surface_slot {
         let active_action = app.controller_setup.last_test_action[slot.index()]
             .filter(|(_, observed_at)| observed_at.elapsed() <= TEST_FLASH_DURATION)
             .map(|(action, _)| action);
         if let Some(surface) =
-            render_terminal_drum_surface(app, frame, right_sections[1], slot, active_action)
+            render_controller_drum_surface(app, frame, right_sections[1], slot, active_action)
         {
-            app.set_pointer_surface(surface);
+            if pointer_slot == Some(slot) {
+                app.set_pointer_surface(surface);
+            }
         }
     }
 }
@@ -255,14 +272,26 @@ fn item_line(
                 app.theme.metadata
             },
         ),
+        ControllerSetupItem::MacTrackpad => {
+            let (value, value_style) = match &app.controller_setup.mac_trackpad_availability {
+                MacTrackpadAvailability::Available => (
+                    controller_assignment(app, app.controller_setup.mac_trackpad_slot).to_owned(),
+                    if app.controller_setup.mac_trackpad_slot.is_some() {
+                        app.theme.success
+                    } else {
+                        app.theme.metadata
+                    },
+                ),
+                MacTrackpadAvailability::Unavailable(_) => (
+                    app.text(UiText::ControllerUnavailable).to_owned(),
+                    app.theme.error,
+                ),
+            };
+            (app.text(UiText::ControllerMacTrackpad), value, value_style)
+        }
         ControllerSetupItem::TerminalPointer => (
             app.text(UiText::ControllerTerminalPointer),
-            match app.controller_setup.pointer_slot {
-                Some(ControllerSlot::One) => app.text(UiText::ControllerPointerPlayerOne),
-                Some(ControllerSlot::Two) => app.text(UiText::ControllerPointerPlayerTwo),
-                None => app.text(UiText::ControllerPointerOff),
-            }
-            .to_owned(),
+            controller_assignment(app, app.controller_setup.pointer_slot).to_owned(),
             if app.controller_setup.pointer_slot.is_some() {
                 app.theme.success
             } else {
@@ -289,6 +318,14 @@ fn item_line(
         Span::styled(pad_or_truncate_to_width(label, 27), app.theme.label),
         Span::styled(value, value_style),
     ])
+}
+
+fn controller_assignment(app: &App, slot: Option<ControllerSlot>) -> &'static str {
+    match slot {
+        Some(ControllerSlot::One) => app.text(UiText::ControllerLocalPlayerOne),
+        Some(ControllerSlot::Two) => app.text(UiText::ControllerLocalPlayerTwo),
+        None => app.text(UiText::ControllerPointerOff),
+    }
 }
 
 fn controller_row(
@@ -390,6 +427,7 @@ fn selected_controller_slot(item: ControllerSetupItem) -> Option<ControllerSlot>
         ControllerSetupItem::PlayerTwo => Some(ControllerSlot::Two),
         ControllerSetupItem::BindAddress
         | ControllerSetupItem::LanServer
+        | ControllerSetupItem::MacTrackpad
         | ControllerSetupItem::TerminalPointer
         | ControllerSetupItem::Back => None,
     }

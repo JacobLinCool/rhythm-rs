@@ -18,6 +18,7 @@ mod library_loading;
 mod loader;
 mod local_multiplayer;
 mod localization;
+mod macos_trackpad;
 mod offline_preparation;
 mod online;
 mod online_bootstrap;
@@ -55,6 +56,7 @@ use signal_hook::{
 use tui::{Tui, UiEvent};
 
 use crate::cli::{CacheAction, CacheClearArgs, CacheCommandArgs, Cli, CliSubcommand};
+use crate::macos_trackpad::{MacTrackpad, MacTrackpadHit};
 use crate::resource::{
     cache_root_dir, clear_all_remote_cache, clear_remote_cache_for_endpoint, inspect_remote_cache,
 };
@@ -80,6 +82,8 @@ pub(crate) fn run_app(mut app: App) -> Result<()> {
 fn run_app_tui(app: &mut App) -> Result<()> {
     let shutdown_signal = ShutdownSignal::install()?;
     let mut tui = Tui::new(app.args.tps, 120)?;
+    let mut mac_trackpad = MacTrackpad::open();
+    app.set_mac_trackpad_availability(mac_trackpad.availability());
     tui.enter()?;
     app.set_keyboard_repeat_capability(tui.keyboard_repeat_is_distinguishable());
 
@@ -89,33 +93,71 @@ fn run_app_tui(app: &mut App) -> Result<()> {
                 break;
             }
 
+            mac_trackpad.set_target(app.mac_trackpad_capture_target())?;
             tui.set_mouse_capture(app.terminal_pointer_capture_requested())?;
-            match tui.next_event()? {
-                UiEvent::Tick => app.handle_tick(),
-                UiEvent::Frame => {
-                    let start = Instant::now();
-                    tui.draw(|frame| app.render(frame))?;
-                    app.commit_rendered_pointer_surface();
-                    app.record_frame_time(start.elapsed());
-                }
-                UiEvent::Key { event, observed_at } => {
-                    if is_physical_key_press(event.kind) {
-                        app.handle_key_at(event, observed_at);
-                    }
-                }
-                UiEvent::Pointer { event, observed_at } => {
-                    app.handle_pointer_at(event, observed_at);
-                }
-                UiEvent::Resize(width, height) => {
-                    app.invalidate_pointer_surface();
-                    tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
-                }
+            let event = tui.next_event()?;
+            let trackpad = mac_trackpad.drain()?;
+            app.record_mac_trackpad_drops(trackpad.dropped);
+            if let Some(event_time) = ui_event_observed_at(event) {
+                let split = trackpad
+                    .hits
+                    .partition_point(|hit| hit.observed_at <= event_time);
+                dispatch_mac_trackpad_hits(app, &trackpad.hits[..split]);
+                handle_ui_event(app, &mut tui, event)?;
+                mac_trackpad.set_target(app.mac_trackpad_capture_target())?;
+                dispatch_mac_trackpad_hits(app, &trackpad.hits[split..]);
+            } else {
+                dispatch_mac_trackpad_hits(app, &trackpad.hits);
+                handle_ui_event(app, &mut tui, event)?;
+                mac_trackpad.set_target(app.mac_trackpad_capture_target())?;
             }
         }
         Ok(())
     })();
 
-    merge_results(run_result, tui.exit(), "terminal shutdown")
+    let trackpad_shutdown = mac_trackpad.shutdown();
+    let input_result = merge_results(run_result, trackpad_shutdown, "Mac trackpad input shutdown");
+    merge_results(input_result, tui.exit(), "terminal shutdown")
+}
+
+fn ui_event_observed_at(event: UiEvent) -> Option<Instant> {
+    match event {
+        UiEvent::Key { observed_at, .. } | UiEvent::Pointer { observed_at, .. } => {
+            Some(observed_at)
+        }
+        UiEvent::Tick | UiEvent::Frame | UiEvent::Resize(_, _) => None,
+    }
+}
+
+fn dispatch_mac_trackpad_hits(app: &mut App, hits: &[MacTrackpadHit]) {
+    for hit in hits.iter().copied() {
+        app.handle_mac_trackpad_hit(hit);
+    }
+}
+
+fn handle_ui_event(app: &mut App, tui: &mut Tui, event: UiEvent) -> Result<()> {
+    match event {
+        UiEvent::Tick => app.handle_tick(),
+        UiEvent::Frame => {
+            let start = Instant::now();
+            tui.draw(|frame| app.render(frame))?;
+            app.commit_rendered_pointer_surface();
+            app.record_frame_time(start.elapsed());
+        }
+        UiEvent::Key { event, observed_at } => {
+            if is_physical_key_press(event.kind) {
+                app.handle_key_at(event, observed_at);
+            }
+        }
+        UiEvent::Pointer { event, observed_at } => {
+            app.handle_pointer_at(event, observed_at);
+        }
+        UiEvent::Resize(width, height) => {
+            app.invalidate_pointer_surface();
+            tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

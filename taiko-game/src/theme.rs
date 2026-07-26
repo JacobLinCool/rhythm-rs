@@ -33,7 +33,7 @@ pub struct Theme {
     pub judge_miss: Style,
     pub judge_roll: Style,
     pub lane_track: Style,
-    pub lane_track_gogo: Style,
+    pub lane_gogo_edge: Style,
     pub lane_bar_line: Style,
     pub lane_note_don: Style,
     pub lane_note_kat: Style,
@@ -93,7 +93,7 @@ impl Theme {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 lane_track: Style::default().bg(Color::DarkGray),
-                lane_track_gogo: Style::default().bg(Color::Rgb(76, 38, 0)),
+                lane_gogo_edge: Style::default().bg(Color::DarkGray),
                 lane_bar_line: Style::default().bg(Color::DarkGray),
                 lane_note_don: Style::default()
                     .fg(Color::White)
@@ -184,7 +184,7 @@ impl Theme {
                 lane_track: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM),
-                lane_track_gogo: Style::default()
+                lane_gogo_edge: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM | Modifier::REVERSED),
                 lane_bar_line: Style::default()
@@ -258,14 +258,6 @@ impl Theme {
 
     pub fn hit_zone_base_style(&self) -> Style {
         self.hit_zone_base
-    }
-
-    pub fn lane_track_style(&self, gogo_active: bool) -> Style {
-        if gogo_active {
-            self.lane_track_gogo
-        } else {
-            self.lane_track
-        }
     }
 
     pub fn gauge_style(&self, gauge: f32, pass_threshold: f32) -> Style {
@@ -371,6 +363,24 @@ mod tests {
 
         assert!(theme.title.add_modifier.contains(Modifier::BOLD));
         assert!(theme.error.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            theme
+                .lane_gogo_edge
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the Go-Go edge must remain visible without color"
+        );
+        assert!(
+            !theme.lane_track.add_modifier.contains(Modifier::REVERSED),
+            "the main lane must not adopt the Go-Go edge treatment"
+        );
+    }
+
+    #[test]
+    fn colored_gogo_edge_matches_the_normal_track_background() {
+        let theme = Theme::taiko_vivid(ColorMode::Enabled);
+
+        assert_eq!(theme.lane_gogo_edge.bg, theme.lane_track.bg);
     }
 
     #[test]

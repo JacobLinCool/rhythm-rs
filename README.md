@@ -37,14 +37,22 @@ cargo run -p taiko-game -- cache clear --all
 ## Controller Setup
 
 Start the game normally, then press `C` from the play-mode menu. Keyboard,
-terminal pointer, and phone controllers all feed the same
-four distinct inputs for the selected player:
+native Mac trackpad contact, terminal mouse click, and phone controllers all
+feed the same four distinct inputs for the selected player:
 `LEFT KAT | LEFT DON | RIGHT DON | RIGHT KAT`.
 
-- **MacBook trackpad or mouse:** set **Terminal pointer** to P1 or P2, then
-  left-click the four drum pads shown in Controller Setup or during play. The
-  terminal receives pointer-cell clicks rather than raw touch coordinates, so
-  this is intended as a convenient casual controller.
+- **MacBook trackpad contact (macOS only):** set **Mac trackpad contact** to P1
+  or P2 by pressing `Enter` on that row. The physical trackpad is divided
+  horizontally into four equal zones, from left to right:
+  `LEFT KAT | LEFT DON | RIGHT DON | RIGHT KAT`. Merely place a finger on a
+  zone to strike; no click or pressure is read. Holding or sliding that finger
+  does not repeat a strike. Lift it and touch again to re-arm it. After
+  changing the assignment between P1 and P2, lift every finger once before
+  playing so the new player starts from a neutral surface.
+- **Terminal mouse click:** set **Terminal mouse click** to P1 or P2, then use
+  the mouse's left button (or physically click a trackpad) on one of the four
+  rendered drum pads. This is a separate terminal pointer source and does not
+  turn ordinary trackpad contact into input.
 - **Phone on the same LAN:** enter one exact local/LAN bind address and start
   **Phone controller server**. Select the P1 or P2 phone row and press `Enter`
   to show its one-time QR code, or press `C` to copy the link. Open it on a
@@ -55,6 +63,17 @@ four distinct inputs for the selected player:
 - The Controller Setup page accepts live test hits without changing score.
   Press `R` on a P1/P2 phone row to revoke its session and create a new
   one-time pairing link.
+
+Assignments are local controller slots: single-player and online play use
+**LOCAL P1**; **LOCAL P2** is used only by local two-player mode. Pressing
+`Enter` on either local-controller row cycles `OFF → LOCAL P1 → LOCAL P2`.
+
+Native Mac trackpad contact uses macOS's private
+`MultitouchSupport.framework`. The game probes that capability at startup. If
+the framework or a compatible device cannot be opened, Controller Setup shows
+the source as unsupported and does not silently fall back to mouse clicks.
+Because this is a private Apple interface, a future macOS release may require
+the integration to be updated.
 
 The phone server is unencrypted and deliberately has no relay, TLS, NAT
 traversal, or Internet mode. Enable it only on a LAN whose other users you

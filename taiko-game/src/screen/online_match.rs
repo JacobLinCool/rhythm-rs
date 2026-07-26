@@ -9,7 +9,7 @@ use crate::drum_surface::DrumSurfaceLayout;
 use crate::localization::{Localizer, UiText};
 use crate::preferences::DrumBindings;
 use crate::screen::game_screen::{render_lane_view, LaneRenderOptions};
-use crate::screen::render_terminal_drum_surface;
+use crate::screen::render_controller_drum_surface;
 use crate::tui::Frame;
 
 const START_CUE_DURATION_US: u64 = 750_000;
@@ -44,13 +44,16 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         .as_ref()
         .and_then(|snapshot| countdown_cue(&snapshot.stage, online.estimated_server_now_us()));
     let header_height = if cue.is_some() { 6 } else { 3 };
-    let pointer_enabled = app.terminal_pointer_slot() == Some(ControllerSlot::One)
+    let controller_surface_enabled = (app.terminal_pointer_slot() == Some(ControllerSlot::One)
+        || app.mac_trackpad_slot() == Some(ControllerSlot::One))
         && online.phase() == crate::online_session::OnlinePhase::Playing
         && online.local_player_id().is_some()
         && app.leave_confirmation.is_none();
+    let pointer_enabled =
+        controller_surface_enabled && app.terminal_pointer_slot() == Some(ControllerSlot::One);
     let show_keyboard_warning =
         local_player_uses_keyboard_warning(app, online.local_player_id().is_some());
-    let footer_height = if pointer_enabled {
+    let footer_height = if controller_surface_enabled {
         4 + u16::from(show_keyboard_warning)
     } else {
         2
@@ -93,7 +96,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
     } else {
         render_spectator_scoreboard(app, frame, sections[1], &snapshot.players);
     }
-    if pointer_enabled {
+    if controller_surface_enabled {
         let footer = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(1 + u16::from(show_keyboard_warning)),
@@ -105,7 +108,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
             .local_player
             .as_ref()
             .and_then(|runtime| runtime.input_flash.map(|flash| flash.action));
-        let surface = render_terminal_drum_surface(
+        let surface = render_controller_drum_surface(
             app,
             frame,
             columns[0],
@@ -113,7 +116,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
             active_action,
         );
         render_match_controls(app, frame, footer[1], local_player.is_some());
-        surface
+        pointer_enabled.then_some(surface).flatten()
     } else {
         render_match_controls(app, frame, sections[2], local_player.is_some());
         None

@@ -7,7 +7,7 @@ use rhythm_mode_taiko::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{render_gauge_bar_line, render_terminal_drum_surface};
+use super::{render_controller_drum_surface, render_gauge_bar_line};
 use crate::app::App;
 use crate::controller::ControllerSlot;
 use crate::drum_surface::DrumSurfaceLayout;
@@ -19,6 +19,7 @@ const LOOKAHEAD_TICKS: i64 = 2_000_000;
 const LOOKBACK_TICKS: i64 = 300_000;
 const HIT_X_DIVISOR: usize = 6;
 const HIT_X_LEFT_SHIFT: usize = 1;
+const GOGO_EDGE_BLINK_HALF_PERIOD_TICKS: i64 = 350_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LaneRenderOptions {
@@ -48,14 +49,17 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         return None;
     };
 
-    let pointer_slot = (app.terminal_pointer_slot() == Some(ControllerSlot::One)
+    let controller_surface_slot = ((app.terminal_pointer_slot() == Some(ControllerSlot::One)
+        || app.mac_trackpad_slot() == Some(ControllerSlot::One))
         && !game.paused
         && !app.auto_play
         && app.leave_confirmation.is_none())
     .then_some(ControllerSlot::One);
+    let pointer_slot =
+        controller_surface_slot.filter(|slot| app.terminal_pointer_slot() == Some(*slot));
     let show_keyboard_warning = !app.keyboard_repeat_is_distinguishable && !app.auto_play;
     let controls_height = 1 + u16::from(show_keyboard_warning);
-    let footer_height = if pointer_slot.is_some() {
+    let footer_height = if controller_surface_slot.is_some() {
         3 + controls_height
     } else {
         controls_height
@@ -122,7 +126,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
 
     render_lane(app, frame, layout[1]);
 
-    let footer = if pointer_slot.is_some() {
+    let footer = if controller_surface_slot.is_some() {
         Layout::vertical([Constraint::Length(3), Constraint::Length(controls_height)])
             .split(layout[2])
     } else {
@@ -164,14 +168,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
     }
     frame.render_widget(Paragraph::new(help_lines), footer[1]);
 
-    pointer_slot.and_then(|slot| {
-        render_terminal_drum_surface(
+    controller_surface_slot.and_then(|slot| {
+        let surface = render_controller_drum_surface(
             app,
             frame,
             footer[0],
             slot,
             game.input_flash.map(|flash| flash.action),
-        )
+        );
+        (pointer_slot == Some(slot)).then_some(surface).flatten()
     })
 }
 
@@ -266,12 +271,16 @@ pub fn render_lane_view(
     let hit_x = hit_x_for_width(width);
     // Shared row: balloon labels and top-side bar lines.
     // Draw bar lines first, then labels so labels stay visually on top.
-    let mut label = vec![Span::styled(" ", theme.text_primary); width];
-    let track_style = theme.lane_track_style(view.gogo_active);
-    let mut top = vec![Span::styled(" ", track_style); width];
-    let mut middle = vec![Span::styled(" ", track_style); width];
-    let mut bottom = vec![Span::styled(" ", track_style); width];
-    let mut bar_bottom = vec![Span::styled(" ", theme.text_primary); width];
+    let edge_style = if gogo_edge_visible(view.gogo_active, view.now) {
+        theme.lane_gogo_edge
+    } else {
+        theme.text_primary
+    };
+    let mut label = vec![Span::styled(" ", edge_style); width];
+    let mut top = vec![Span::styled(" ", theme.lane_track); width];
+    let mut middle = vec![Span::styled(" ", theme.lane_track); width];
+    let mut bottom = vec![Span::styled(" ", theme.lane_track); width];
+    let mut bar_bottom = vec![Span::styled(" ", edge_style); width];
 
     let base_style = judge_base_style(theme, options.judge_flash);
     paint_hit_zone_base(&mut top, &mut middle, &mut bottom, hit_x, width, base_style);
@@ -293,9 +302,17 @@ pub fn render_lane_view(
     };
     paint_notes(theme, &mut rows, width, hit_x, view, options.scroll_speed);
     if options.paused {
-        paint_centered_label(&mut label, options.paused_label, theme.warning);
+        paint_centered_label(
+            &mut label,
+            options.paused_label,
+            edge_style.patch(theme.warning),
+        );
     } else if view.gogo_active {
-        paint_centered_label(&mut label, options.gogo_label, theme.warning);
+        paint_centered_label(
+            &mut label,
+            options.gogo_label,
+            edge_style.patch(theme.warning),
+        );
     }
 
     let marker_style = input_marker_style(theme, options.input_flash);
@@ -326,6 +343,14 @@ pub fn render_lane_view(
         height: inner.height.min(5),
     };
     frame.render_widget(Paragraph::new(lane_lines), lane_area);
+}
+
+fn gogo_edge_visible(gogo_active: bool, now_tick: i64) -> bool {
+    gogo_active
+        && now_tick
+            .div_euclid(GOGO_EDGE_BLINK_HALF_PERIOD_TICKS)
+            .rem_euclid(2)
+            == 0
 }
 
 fn paint_bar_lines(
@@ -402,7 +427,8 @@ fn paint_notes(
                 }
 
                 if matches!(note.kind, TaikoDisplayKind::Balloon) {
-                    rows.label[l] = Span::styled(format!("{}", note.remaining_hits), theme.balloon);
+                    let label_style = rows.label[l].style.patch(theme.balloon);
+                    rows.label[l] = Span::styled(format!("{}", note.remaining_hits), label_style);
                 }
             }
         }
@@ -649,8 +675,8 @@ fn hit_x_for_width(width: usize) -> usize {
 mod tests {
     use ratatui::{
         backend::TestBackend,
-        buffer::Cell,
-        style::{Color, Style},
+        buffer::{Buffer, Cell},
+        style::{Color, Modifier, Style},
         text::Line,
         widgets::Paragraph,
         Terminal,
@@ -660,11 +686,11 @@ mod tests {
     use rhythm_mode_taiko::TaikoMode;
 
     use super::{
-        hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
+        gogo_edge_visible, hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
         paint_hit_markers_overlay, paint_hit_zone_base, paint_note_blob, projected_span_x,
-        render_lane_view, to_x, LaneRenderOptions,
+        render_lane_view, to_x, LaneRenderOptions, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS,
     };
-    use crate::theme::Theme;
+    use crate::theme::{ColorMode, Theme};
 
     #[test]
     fn layering_keeps_marker_on_top_of_note_and_base() {
@@ -1017,23 +1043,127 @@ mod tests {
     }
 
     #[test]
-    fn gogo_zone_uses_distinct_track_background_and_visible_label() {
-        let theme = Theme::taiko_vivid(crate::theme::ColorMode::Enabled);
+    fn gogo_edge_blink_uses_a_350_millisecond_half_period() {
+        let half_period = GOGO_EDGE_BLINK_HALF_PERIOD_TICKS;
+
+        assert!(gogo_edge_visible(true, 0));
+        assert!(gogo_edge_visible(true, half_period - 1));
+        assert!(!gogo_edge_visible(true, half_period));
+        assert!(!gogo_edge_visible(true, half_period * 2 - 1));
+        assert!(gogo_edge_visible(true, half_period * 2));
+        assert!(!gogo_edge_visible(false, 0));
+        assert!(!gogo_edge_visible(false, half_period * 2));
+    }
+
+    #[test]
+    fn gogo_only_pulses_the_two_outer_rows() {
+        const SAMPLE_X: u16 = 2;
+        const UPPER_EDGE_Y: u16 = 1;
+        const TRACK_ROWS: [u16; 3] = [2, 3, 4];
+        const LOWER_EDGE_Y: u16 = 5;
+
+        let theme = Theme::taiko_vivid(ColorMode::Enabled);
+        let bright = render_empty_lane(&theme, 0, true);
+        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
+        let inactive = render_empty_lane(&theme, 0, false);
+
+        for buffer in [&bright, &dark, &inactive] {
+            for y in TRACK_ROWS {
+                assert_eq!(
+                    cell(buffer, SAMPLE_X, y).style().bg,
+                    theme.lane_track.bg,
+                    "main track row {y} must never adopt a Go-Go style"
+                );
+            }
+        }
+
+        for y in [UPPER_EDGE_Y, LOWER_EDGE_Y] {
+            assert_eq!(
+                cell(&bright, SAMPLE_X, y).style().bg,
+                theme.lane_gogo_edge.bg,
+                "outer row {y} must expand using the normal track color"
+            );
+            assert_eq!(
+                cell(&dark, SAMPLE_X, y).style().bg,
+                Some(Color::Reset),
+                "outer row {y} must return to the normal empty background"
+            );
+            assert_eq!(
+                cell(&inactive, SAMPLE_X, y).style().bg,
+                Some(Color::Reset),
+                "outer row {y} must stay empty outside Go-Go"
+            );
+        }
+    }
+
+    #[test]
+    fn gogo_label_stays_readable_during_both_edge_phases() {
+        let theme = Theme::taiko_vivid(ColorMode::Enabled);
+        let bright = render_empty_lane(&theme, 0, true);
+        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
+
+        for (buffer, expected_background) in
+            [(&bright, theme.lane_track.bg), (&dark, Some(Color::Reset))]
+        {
+            let text = buffer
+                .content()
+                .iter()
+                .map(Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains("GO-GO!"));
+
+            let label_cell = (1..buffer.area.width.saturating_sub(1))
+                .map(|x| cell(buffer, x, 1))
+                .find(|cell| cell.symbol() == "G")
+                .expect("rendered GO-GO label");
+            assert_eq!(label_cell.style().fg, theme.warning.fg);
+            assert_eq!(label_cell.style().bg, expected_background);
+            assert!(label_cell.style().add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn no_color_gogo_edge_remains_distinct_from_the_main_track() {
+        const SAMPLE_X: u16 = 2;
+
+        let theme = Theme::taiko_vivid(ColorMode::Disabled);
+        let bright = render_empty_lane(&theme, 0, true);
+        let dark = render_empty_lane(&theme, GOGO_EDGE_BLINK_HALF_PERIOD_TICKS, true);
+
+        for y in [1, 5] {
+            assert!(cell(&bright, SAMPLE_X, y)
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED));
+            assert!(!cell(&dark, SAMPLE_X, y)
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED));
+        }
+        for y in [2, 3, 4] {
+            assert!(!cell(&bright, SAMPLE_X, y)
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED));
+        }
+    }
+
+    fn render_empty_lane(theme: &Theme, now: i64, gogo_active: bool) -> Buffer {
         let view = rhythm_mode_taiko::TaikoFrameView {
-            now: 0,
+            now,
             notes: Vec::new(),
             bar_lines: Vec::new(),
             score: 0,
             combo: 0,
             gauge: 0.0,
-            gogo_active: true,
+            gogo_active,
         };
         let backend = TestBackend::new(48, 7);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
                 render_lane_view(
-                    &theme,
+                    theme,
                     frame,
                     frame.area(),
                     &view,
@@ -1048,18 +1178,7 @@ mod tests {
                 );
             })
             .expect("draw");
-
-        let buffer = terminal.backend().buffer();
-        let text = buffer
-            .content()
-            .iter()
-            .map(Cell::symbol)
-            .collect::<String>();
-        assert!(text.contains("GO-GO!"));
-        assert!(buffer
-            .content()
-            .iter()
-            .any(|cell| cell.style().bg == theme.lane_track_gogo.bg));
+        terminal.backend().buffer().clone()
     }
 
     fn cell(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> &Cell {

@@ -53,7 +53,9 @@ pub(crate) const fn terminal_is_too_small(page: Page, area: Rect) -> bool {
 }
 
 pub(crate) fn minimum_terminal_size_for_app(app: &App) -> (u16, u16) {
-    if app.page == Page::LocalGame && app.terminal_pointer_slot().is_some() {
+    if app.page == Page::LocalGame
+        && (app.terminal_pointer_slot().is_some() || app.mac_trackpad_slot().is_some())
+    {
         (MIN_TERMINAL_WIDTH, MIN_LOCAL_GAME_POINTER_HEIGHT)
     } else {
         minimum_terminal_size(app.page)
@@ -61,7 +63,9 @@ pub(crate) fn minimum_terminal_size_for_app(app: &App) -> (u16, u16) {
 }
 
 pub(crate) fn terminal_is_too_small_for_app(app: &App, area: Rect) -> bool {
-    if app.page == Page::LocalGame && app.terminal_pointer_slot().is_some() {
+    if app.page == Page::LocalGame
+        && (app.terminal_pointer_slot().is_some() || app.mac_trackpad_slot().is_some())
+    {
         area.width < MIN_TERMINAL_WIDTH || area.height < MIN_LOCAL_GAME_POINTER_HEIGHT
     } else {
         terminal_is_too_small(app.page, area)
@@ -363,7 +367,7 @@ pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-pub(crate) fn render_terminal_drum_surface(
+pub(crate) fn render_controller_drum_surface(
     app: &App,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -371,40 +375,21 @@ pub(crate) fn render_terminal_drum_surface(
     active_action: Option<rhythm_mode_taiko::TaikoAction>,
 ) -> Option<DrumSurfaceLayout> {
     let layout = DrumSurfaceLayout::new(area, slot)?;
-    let (player, bindings) = match slot {
-        ControllerSlot::One => ("P1", app.preferences.player_one),
-        ControllerSlot::Two => ("P2", app.preferences.player_two),
+    let player = match slot {
+        ControllerSlot::One => "P1",
+        ControllerSlot::Two => "P2",
     };
-    let label = |key: char, name: &'static str, style| {
+    let label = |side: char, name: &'static str, style| {
         Line::from(vec![
-            Span::styled(
-                format!("{player} {}=", key.to_ascii_uppercase()),
-                app.theme.title,
-            ),
+            Span::styled(format!("{player}{side}-"), app.theme.title),
             Span::styled(name.to_uppercase(), style),
         ])
     };
     let labels = DrumSurfaceLabels::new(
-        label(
-            bindings.left_kat,
-            app.text(UiText::BindingLeftKat),
-            app.theme.lane_note_kat,
-        ),
-        label(
-            bindings.left_don,
-            app.text(UiText::BindingLeftDon),
-            app.theme.lane_note_don,
-        ),
-        label(
-            bindings.right_don,
-            app.text(UiText::BindingRightDon),
-            app.theme.lane_note_don,
-        ),
-        label(
-            bindings.right_kat,
-            app.text(UiText::BindingRightKat),
-            app.theme.lane_note_kat,
-        ),
+        label('L', app.text(UiText::Kat), app.theme.lane_note_kat),
+        label('L', app.text(UiText::Don), app.theme.lane_note_don),
+        label('R', app.text(UiText::Don), app.theme.lane_note_don),
+        label('R', app.text(UiText::Kat), app.theme.lane_note_kat),
     );
     layout.render(
         frame,

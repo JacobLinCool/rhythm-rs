@@ -46,6 +46,7 @@ use crate::local_multiplayer::{
     LocalMultiplayerSession, LocalPlayerId, LocalPlayerSpec,
 };
 use crate::localization::{pop_grapheme, Localizer, UiMessage, UiText};
+use crate::macos_trackpad::{MacTrackpadAvailability, MacTrackpadHit};
 use crate::offline_preparation::{
     event_is_current as offline_preparation_event_is_current, OfflinePreparationCompletion,
     OfflinePreparationIdentity, OfflinePreparationMode, OfflinePreparationRequest,
@@ -266,6 +267,7 @@ pub(crate) struct SettingsState {
 pub(crate) enum ControllerSetupItem {
     BindAddress,
     LanServer,
+    MacTrackpad,
     TerminalPointer,
     PlayerOne,
     PlayerTwo,
@@ -273,9 +275,10 @@ pub(crate) enum ControllerSetupItem {
 }
 
 impl ControllerSetupItem {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::BindAddress,
         Self::LanServer,
+        Self::MacTrackpad,
         Self::TerminalPointer,
         Self::PlayerOne,
         Self::PlayerTwo,
@@ -287,6 +290,8 @@ impl ControllerSetupItem {
 pub(crate) struct ControllerSetupState {
     pub(crate) bind_ip: String,
     pub(crate) selected: usize,
+    pub(crate) mac_trackpad_slot: Option<ControllerSlot>,
+    pub(crate) mac_trackpad_availability: MacTrackpadAvailability,
     pub(crate) pointer_slot: Option<ControllerSlot>,
     pub(crate) invite_revealed: [bool; 2],
     pub(crate) last_test_action: [Option<(TaikoAction, Instant)>; 2],
@@ -299,6 +304,10 @@ impl ControllerSetupState {
         Self {
             bind_ip,
             selected: 0,
+            mac_trackpad_slot: None,
+            mac_trackpad_availability: MacTrackpadAvailability::Unavailable(
+                "native trackpad capability has not been probed".to_owned(),
+            ),
             pointer_slot: None,
             invite_revealed: [false; 2],
             last_test_action: [None; 2],
@@ -1138,6 +1147,24 @@ impl App {
         self.controller_setup.pointer_slot
     }
 
+    pub(crate) fn mac_trackpad_slot(&self) -> Option<ControllerSlot> {
+        self.controller_setup.mac_trackpad_slot
+    }
+
+    pub(crate) fn set_mac_trackpad_availability(&mut self, availability: MacTrackpadAvailability) {
+        if !matches!(availability, MacTrackpadAvailability::Available) {
+            self.controller_setup.mac_trackpad_slot = None;
+            self.clear_pending_mac_trackpad_hits();
+        }
+        self.controller_setup.mac_trackpad_availability = availability;
+    }
+
+    pub(crate) fn mac_trackpad_capture_target(&self) -> Option<ControllerSlot> {
+        self.controller_setup
+            .mac_trackpad_slot
+            .filter(|slot| self.controller_active_slots().contains(*slot))
+    }
+
     pub(crate) fn set_keyboard_repeat_capability(&mut self, distinguishable: bool) {
         self.keyboard_repeat_is_distinguishable = distinguishable;
     }
@@ -1170,6 +1197,27 @@ impl App {
         if let Err(error) = self.enqueue_controller_strike(strike) {
             self.set_error_state(error);
         }
+    }
+
+    pub(crate) fn handle_mac_trackpad_hit(&mut self, hit: MacTrackpadHit) {
+        if self.controller_setup.mac_trackpad_slot != Some(hit.slot)
+            || !self.controller_active_slots().contains(hit.slot)
+        {
+            return;
+        }
+        let strike = ControllerStrike::local(
+            hit.slot,
+            ControllerSource::MacTrackpadContact,
+            hit.action,
+            hit.observed_at,
+        );
+        if let Err(error) = self.enqueue_controller_strike(strike) {
+            self.set_error_state(error);
+        }
+    }
+
+    pub(crate) fn record_mac_trackpad_drops(&mut self, dropped: u64) {
+        self.controller_input_drops = self.controller_input_drops.saturating_add(dropped);
     }
 
     fn controller_active_slots(&self) -> ActiveControllerSlots {
@@ -1749,15 +1797,25 @@ impl App {
                 self.play_kat_se()?;
             }
             MenuIntent::Left | MenuIntent::Right
-                if selected == ControllerSetupItem::TerminalPointer =>
+                if matches!(
+                    selected,
+                    ControllerSetupItem::MacTrackpad | ControllerSetupItem::TerminalPointer
+                ) =>
             {
-                self.cycle_terminal_pointer(matches!(intent, MenuIntent::Right));
+                if selected == ControllerSetupItem::MacTrackpad {
+                    self.cycle_mac_trackpad(matches!(intent, MenuIntent::Right));
+                } else {
+                    self.cycle_terminal_pointer(matches!(intent, MenuIntent::Right));
+                }
                 self.play_kat_se()?;
             }
             MenuIntent::Confirm => {
                 match selected {
                     ControllerSetupItem::BindAddress => {}
                     ControllerSetupItem::LanServer => self.toggle_lan_controller_server(),
+                    ControllerSetupItem::MacTrackpad => {
+                        self.cycle_mac_trackpad(true);
+                    }
                     ControllerSetupItem::TerminalPointer => {
                         self.cycle_terminal_pointer(true);
                     }
@@ -1786,14 +1844,35 @@ impl App {
         Ok(())
     }
 
-    fn cycle_terminal_pointer(&mut self, forward: bool) {
-        self.controller_setup.pointer_slot = match (self.controller_setup.pointer_slot, forward) {
-            (None, true) | (Some(ControllerSlot::Two), false) => Some(ControllerSlot::One),
-            (Some(ControllerSlot::One), true) | (None, false) => Some(ControllerSlot::Two),
-            (Some(ControllerSlot::Two), true) | (Some(ControllerSlot::One), false) => None,
+    fn cycle_mac_trackpad(&mut self, forward: bool) {
+        let MacTrackpadAvailability::Available = &self.controller_setup.mac_trackpad_availability
+        else {
+            self.controller_setup.notice = Some((
+                format!(
+                    "{}: {}",
+                    self.text(UiText::ControllerMacTrackpadUnavailable),
+                    self.text(UiText::ControllerMacTrackpadUnavailableDetail)
+                ),
+                true,
+            ));
+            return;
         };
+        self.clear_pending_mac_trackpad_hits();
+        self.controller_setup.mac_trackpad_slot =
+            cycled_controller_slot(self.controller_setup.mac_trackpad_slot, forward);
+        self.controller_setup.notice = None;
+    }
+
+    fn cycle_terminal_pointer(&mut self, forward: bool) {
+        self.controller_setup.pointer_slot =
+            cycled_controller_slot(self.controller_setup.pointer_slot, forward);
         self.invalidate_pointer_surface();
         self.controller_setup.notice = None;
+    }
+
+    fn clear_pending_mac_trackpad_hits(&mut self) {
+        self.pending_controller_strikes
+            .retain(|queued| queued.strike.source != ControllerSource::MacTrackpadContact);
     }
 
     fn toggle_lan_controller_server(&mut self) {
@@ -5235,12 +5314,24 @@ fn wrapped_selection(current: usize, len: usize, delta: isize) -> usize {
         .map_or_else(|| len - 1, |next| next % len)
 }
 
+fn cycled_controller_slot(
+    current: Option<ControllerSlot>,
+    forward: bool,
+) -> Option<ControllerSlot> {
+    match (current, forward) {
+        (None, true) | (Some(ControllerSlot::Two), false) => Some(ControllerSlot::One),
+        (Some(ControllerSlot::One), true) | (None, false) => Some(ControllerSlot::Two),
+        (Some(ControllerSlot::Two), true) | (Some(ControllerSlot::One), false) => None,
+    }
+}
+
 fn controller_item_slot(item: ControllerSetupItem) -> Option<ControllerSlot> {
     match item {
         ControllerSetupItem::PlayerOne => Some(ControllerSlot::One),
         ControllerSetupItem::PlayerTwo => Some(ControllerSlot::Two),
         ControllerSetupItem::BindAddress
         | ControllerSetupItem::LanServer
+        | ControllerSetupItem::MacTrackpad
         | ControllerSetupItem::TerminalPointer
         | ControllerSetupItem::Back => None,
     }
@@ -6263,8 +6354,9 @@ mod tests {
         let rendered = render_text(&mut app);
         assert!(rendered.contains("Controller Setup"));
         assert!(rendered.contains("Trusted LAN only"));
-        assert!(rendered.contains("Terminal pointer"));
+        assert!(rendered.contains("Terminal mouse click"));
 
+        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(
@@ -6279,6 +6371,360 @@ mod tests {
         assert_eq!(app.controller_setup.pointer_slot, None);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.page, Page::ModeSelect);
+    }
+
+    #[test]
+    fn controller_setup_assigns_contact_only_mac_trackpad_input() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.controller_setup.selected_item(),
+            ControllerSetupItem::MacTrackpad
+        );
+        assert!(render_text(&mut app).contains("Mac trackpad contact"));
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.controller_setup.mac_trackpad_slot,
+            Some(ControllerSlot::One)
+        );
+        let observed_at = Instant::now();
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::One,
+            action: TaikoAction::RIGHT_DON,
+            observed_at,
+        });
+        app.drain_controller_inputs()?;
+        assert_eq!(
+            app.controller_setup.last_test_action[ControllerSlot::One.index()]
+                .map(|(action, _)| action),
+            Some(TaikoAction::RIGHT_DON)
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.controller_setup.mac_trackpad_slot,
+            Some(ControllerSlot::Two)
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.controller_setup.mac_trackpad_slot, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_native_trackpad_fails_closed_in_controller_setup() {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Unavailable(
+            "test capability failure".to_owned(),
+        ));
+        app.page = Page::Controllers;
+        app.controller_setup.selected = 2;
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.controller_setup.mac_trackpad_slot, None);
+        assert!(app
+            .controller_setup
+            .notice
+            .as_ref()
+            .is_some_and(|(message, is_error)| {
+                *is_error
+                    && message.contains("Native Mac trackpad contact is unavailable")
+                    && !message.contains("test capability failure")
+            }));
+    }
+
+    #[test]
+    fn mac_trackpad_capture_target_follows_single_player_state_boundaries() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::One);
+
+        assert_eq!(app.page, Page::ModeSelect);
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.mac_trackpad_capture_target(), Some(ControllerSlot::One));
+        let controller_view = render_text(&mut app);
+        assert!(controller_view.contains("P1L-KAT"));
+        assert!(app.pointer_surface.is_none());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+        assert_eq!(app.mac_trackpad_capture_target(), Some(ControllerSlot::One));
+
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.game.as_ref().is_some_and(|game| game.paused));
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.mac_trackpad_capture_target(), Some(ControllerSlot::One));
+
+        app.auto_play = true;
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        app.auto_play = false;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.leave_confirmation, Some(LeaveTarget::SinglePlayer));
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+
+        app.leave_confirmation = None;
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::Two);
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn mac_trackpad_routes_single_player_hits_and_rejects_pause_and_wrong_slot() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::One);
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+
+        let now = Instant::now();
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::One,
+            action: TaikoAction::LEFT_DON,
+            observed_at: now,
+        });
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::Two,
+            action: TaikoAction::RIGHT_KAT,
+            observed_at: now,
+        });
+        app.handle_key_at(key(KeyCode::Char('p')), now + Duration::from_millis(1));
+
+        let game = app.game.as_ref().context("paused single-player game")?;
+        assert!(game.paused);
+        assert_eq!(
+            game.pending_inputs
+                .iter()
+                .map(|input| input.action)
+                .collect::<Vec<_>>(),
+            vec![TaikoAction::LEFT_DON]
+        );
+
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::One,
+            action: TaikoAction::RIGHT_DON,
+            observed_at: now + Duration::from_millis(2),
+        });
+        app.drain_controller_inputs()?;
+        assert_eq!(
+            app.game
+                .as_ref()
+                .context("still-paused game")?
+                .pending_inputs
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mac_trackpad_online_uses_local_slot_one_even_when_server_assigns_player_two() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        let config = crate::online::OnlineClientConfig::create("http://127.0.0.1:4150", "alice")?;
+        let (network, mut peer) = crate::online::NetworkClient::test_pair();
+        let mut online = crate::online_session::OnlineDomain::with_test_network(config, network);
+        online.assume_playing_player_for_test(
+            taiko_multiplayer_protocol::PlayerId(2),
+            taiko_multiplayer_protocol::MatchId(7),
+        );
+        online.local_player = Some(test_online_player_runtime()?);
+        app.online = Some(online);
+        app.page = Page::OnlineMatch;
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::Two);
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::Two,
+            action: TaikoAction::LEFT_DON,
+            observed_at: Instant::now(),
+        });
+        app.drain_controller_inputs()?;
+        assert_eq!(
+            app.online
+                .as_ref()
+                .context("online domain")?
+                .pending_input_count(),
+            0
+        );
+        assert!(peer.try_recv_message().is_none());
+
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::One);
+        assert_eq!(app.mac_trackpad_capture_target(), Some(ControllerSlot::One));
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::One,
+            action: TaikoAction::RIGHT_KAT,
+            observed_at: Instant::now(),
+        });
+        app.drain_controller_inputs()?;
+
+        let online = app.online.as_ref().context("online domain")?;
+        assert_eq!(
+            online.local_player_id(),
+            Some(taiko_multiplayer_protocol::PlayerId(2))
+        );
+        assert_eq!(online.pending_input_count(), 1);
+        assert_eq!(
+            online
+                .local_player
+                .as_ref()
+                .context("local online runtime")?
+                .pending_inputs
+                .iter()
+                .map(|input| input.action)
+                .collect::<Vec<_>>(),
+            vec![TaikoAction::RIGHT_KAT]
+        );
+        match peer.try_recv_message().context("wire input batch")? {
+            taiko_multiplayer_protocol::ClientMessage::Input(batch) => {
+                assert_eq!(batch.events.len(), 1);
+                assert_eq!(
+                    batch.events[0].action,
+                    taiko_multiplayer_protocol::DrumAction::RIGHT_KAT
+                );
+            }
+            other => bail!("unexpected online controller message: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_two_player_shows_and_routes_distinct_pointer_and_trackpad_players() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+        app.controller_setup.pointer_slot = Some(ControllerSlot::One);
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::Two);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Char('j')));
+        wait_for_page(&mut app, Page::LocalGame)?;
+
+        let rendered = render_text_at(&mut app, 120, 30);
+        assert!(rendered.contains("P1L-KAT"));
+        assert!(rendered.contains("P2L-KAT"));
+        assert_eq!(
+            app.pointer_surface
+                .context("P1 terminal pointer surface")?
+                .slot,
+            ControllerSlot::One
+        );
+        assert_eq!(app.mac_trackpad_capture_target(), Some(ControllerSlot::Two));
+
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::Two,
+            action: TaikoAction::RIGHT_DON,
+            observed_at: Instant::now(),
+        });
+        app.drain_controller_inputs()?;
+        let game = app.local_game.as_ref().context("local two-player game")?;
+        assert!(game.players[LocalPlayerId::One.index()]
+            .pending_inputs
+            .is_empty());
+        assert_eq!(
+            game.players[LocalPlayerId::Two.index()]
+                .pending_inputs
+                .iter()
+                .map(|input| input.action)
+                .collect::<Vec<_>>(),
+            vec![TaikoAction::RIGHT_DON]
+        );
+
+        app.preferences.ui_language = UiLanguage::Japanese;
+        let minimum_japanese = render_text_at(&mut app, 80, 30);
+        assert!(
+            rendered_text_contains(&minimum_japanese, "P1L-カッ"),
+            "{minimum_japanese}"
+        );
+        assert!(
+            rendered_text_contains(&minimum_japanese, "P2R-カッ"),
+            "{minimum_japanese}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn losing_mac_trackpad_availability_clears_assignment_and_queued_hits() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.page = Page::Controllers;
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Available);
+        app.controller_setup.mac_trackpad_slot = Some(ControllerSlot::One);
+        app.handle_mac_trackpad_hit(MacTrackpadHit {
+            slot: ControllerSlot::One,
+            action: TaikoAction::LEFT_KAT,
+            observed_at: Instant::now(),
+        });
+        assert_eq!(app.pending_controller_strikes.len(), 1);
+
+        app.set_mac_trackpad_availability(MacTrackpadAvailability::Unavailable(
+            "device disappeared".to_owned(),
+        ));
+        assert_eq!(app.controller_setup.mac_trackpad_slot, None);
+        assert_eq!(app.mac_trackpad_capture_target(), None);
+        assert!(app.pending_controller_strikes.is_empty());
+        app.drain_controller_inputs()?;
+        assert!(app.controller_setup.last_test_action[ControllerSlot::One.index()].is_none());
+        Ok(())
     }
 
     #[test]
@@ -6375,6 +6821,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(
             app.controller_setup.selected_item(),
             ControllerSetupItem::PlayerOne
@@ -6419,6 +6866,7 @@ mod tests {
         assert!(!token_is_visible(&rotated_hidden, &replacement_token));
         assert!(!token_is_visible(&rotated_hidden, &first_p1_token));
 
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Enter));

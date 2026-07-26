@@ -3,8 +3,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::game_screen::{judge_feedback, render_lane_view, LaneRenderOptions};
-use super::{render_gauge_bar_line, render_terminal_drum_surface};
+use super::{render_controller_drum_surface, render_gauge_bar_line};
 use crate::app::App;
+use crate::controller::ControllerSlot;
 use crate::drum_surface::DrumSurfaceLayout;
 use crate::local_multiplayer::LocalPlayerId;
 use crate::localization::UiText;
@@ -23,11 +24,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         return None;
     };
 
-    let pointer_slot = (!game.paused && app.leave_confirmation.is_none())
-        .then(|| app.terminal_pointer_slot())
-        .flatten();
+    let pointer_slot = app.terminal_pointer_slot();
+    let controller_surface_slots = if !game.paused && app.leave_confirmation.is_none() {
+        distinct_controller_slots(pointer_slot, app.mac_trackpad_slot())
+    } else {
+        [None, None]
+    };
+    let controller_surface_count = controller_surface_slots.iter().flatten().count();
     let controls_height = 2 + u16::from(!app.keyboard_repeat_is_distinguishable);
-    let footer_height = if pointer_slot.is_some() {
+    let footer_height = if controller_surface_count > 0 {
         3 + controls_height
     } else {
         controls_height
@@ -90,7 +95,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         );
     }
 
-    if let Some(slot) = pointer_slot {
+    if controller_surface_count > 0 {
         let footer = Layout::vertical([Constraint::Length(3), Constraint::Length(controls_height)])
             .split(rows[1]);
         let mut help_lines = vec![
@@ -115,10 +120,30 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
         ];
         append_keyboard_warning(app, &mut help_lines);
         frame.render_widget(Paragraph::new(help_lines), footer[1]);
-        let active_action = game.players[slot.index()]
-            .input_flash
-            .map(|(action, _)| action);
-        return render_terminal_drum_surface(app, frame, footer[0], slot, active_action);
+        let surface_areas = if controller_surface_count == 2 {
+            let areas =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(footer[0]);
+            [areas[0], areas[1]]
+        } else {
+            [footer[0], Rect::default()]
+        };
+        let mut pointer_surface = None;
+        for (slot, surface_area) in controller_surface_slots
+            .into_iter()
+            .flatten()
+            .zip(surface_areas)
+        {
+            let active_action = game.players[slot.index()]
+                .input_flash
+                .map(|(action, _)| action);
+            let surface =
+                render_controller_drum_surface(app, frame, surface_area, slot, active_action);
+            if pointer_slot == Some(slot) {
+                pointer_surface = surface;
+            }
+        }
+        return pointer_surface;
     }
 
     let mut help_lines = vec![
@@ -169,6 +194,14 @@ fn binding_summary(app: &App, bindings: crate::preferences::DrumBindings) -> Str
     )
 }
 
+fn distinct_controller_slots(
+    first: Option<ControllerSlot>,
+    second: Option<ControllerSlot>,
+) -> [Option<ControllerSlot>; 2] {
+    [ControllerSlot::One, ControllerSlot::Two]
+        .map(|slot| (first == Some(slot) || second == Some(slot)).then_some(slot))
+}
+
 fn split_player_areas(area: Rect) -> [Rect; 2] {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -189,7 +222,8 @@ fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
 mod tests {
     use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-    use super::split_player_areas;
+    use super::{distinct_controller_slots, split_player_areas};
+    use crate::controller::ControllerSlot;
 
     #[test]
     fn local_players_stack_vertically_and_keep_the_full_highway_width() {
@@ -203,6 +237,23 @@ mod tests {
         assert_eq!(p1.y, area.y);
         assert_eq!(p2.y, p1.y + p1.height);
         assert_eq!(p1.height + p2.height, area.height);
+    }
+
+    #[test]
+    fn controller_surfaces_deduplicate_and_stay_in_player_order() {
+        assert_eq!(distinct_controller_slots(None, None), [None, None]);
+        assert_eq!(
+            distinct_controller_slots(Some(ControllerSlot::Two), None),
+            [None, Some(ControllerSlot::Two)]
+        );
+        assert_eq!(
+            distinct_controller_slots(Some(ControllerSlot::Two), Some(ControllerSlot::Two)),
+            [None, Some(ControllerSlot::Two)]
+        );
+        assert_eq!(
+            distinct_controller_slots(Some(ControllerSlot::Two), Some(ControllerSlot::One)),
+            [Some(ControllerSlot::One), Some(ControllerSlot::Two)]
+        );
     }
 
     #[test]

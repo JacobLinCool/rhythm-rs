@@ -224,9 +224,9 @@ define_ui_text! {
         ja: "コントローラー設定"
     },
     ControllerSetupDescription => {
-        en: "Keyboard, terminal pointer, and phone controllers share the same four-pad input path.",
-        zh_hant: "鍵盤、終端機觸控板與手機控制器共用同一條四鼓面輸入路徑。",
-        ja: "キーボード、端末ポインター、スマホは同じ4打面の入力経路を使います。"
+        en: "Keyboard, Mac trackpad contact, terminal click, and phone controllers share one four-pad input path.",
+        zh_hant: "鍵盤、Mac 觸控板接觸、終端機點擊與手機控制器共用同一條四鼓面輸入路徑。",
+        ja: "キーボード、Macトラックパッド接触、端末クリック、スマホは同じ4打面の入力経路を使います。"
     },
     TrustedLanOnly => {
         en: "Trusted LAN only",
@@ -248,10 +248,15 @@ define_ui_text! {
         zh_hant: "手機控制器伺服器",
         ja: "スマホコントローラーサーバー"
     },
+    ControllerMacTrackpad => {
+        en: "Mac trackpad contact",
+        zh_hant: "Mac 觸控板接觸",
+        ja: "Macトラックパッド接触"
+    },
     ControllerTerminalPointer => {
-        en: "Terminal pointer",
-        zh_hant: "終端機觸控板／滑鼠",
-        ja: "端末ポインター"
+        en: "Terminal mouse click",
+        zh_hant: "終端機滑鼠點擊",
+        ja: "端末マウスクリック"
     },
     ControllerPlayerOne => {
         en: "P1 phone",
@@ -278,20 +283,35 @@ define_ui_text! {
         zh_hant: "已停止",
         ja: "停止中"
     },
-    ControllerPointerPlayerOne => {
-        en: "P1",
-        zh_hant: "P1",
-        ja: "P1"
+    ControllerLocalPlayerOne => {
+        en: "LOCAL P1",
+        zh_hant: "本機 P1",
+        ja: "ローカル P1"
     },
-    ControllerPointerPlayerTwo => {
-        en: "P2",
-        zh_hant: "P2",
-        ja: "P2"
+    ControllerLocalPlayerTwo => {
+        en: "LOCAL P2",
+        zh_hant: "本機 P2",
+        ja: "ローカル P2"
     },
     ControllerPointerOff => {
         en: "OFF",
         zh_hant: "關",
         ja: "オフ"
+    },
+    ControllerUnavailable => {
+        en: "UNAVAILABLE",
+        zh_hant: "無法使用",
+        ja: "利用不可"
+    },
+    ControllerMacTrackpadUnavailable => {
+        en: "Native Mac trackpad contact is unavailable",
+        zh_hant: "無法使用 Mac 觸控板原生接觸輸入",
+        ja: "Macトラックパッドのネイティブ接触入力を利用できません"
+    },
+    ControllerMacTrackpadUnavailableDetail => {
+        en: "This Mac or macOS version did not provide a compatible raw-contact device.",
+        zh_hant: "這台 Mac 或目前的 macOS 版本未提供相容的原始接觸裝置。",
+        ja: "このMacまたはmacOSでは互換性のある接触デバイスを利用できません。"
     },
     ControllerPaired => {
         en: "PAIRED",
@@ -359,34 +379,44 @@ define_ui_text! {
         ja: "受付／拒否した入力"
     },
     ControllerNavigationHelp => {
-        en: "Enter starts/stops the server, changes pointer assignment, or reveals a selected link.",
-        zh_hant: "Enter 可啟停伺服器、切換觸控板指派，或顯示選取的配對連結。",
-        ja: "Enterでサーバーの起動・停止、ポインター割当、選択リンクの表示を行います。"
+        en: "Enter starts/stops the server, changes a local controller's P1/P2 assignment, or reveals a selected link.",
+        zh_hant: "Enter 可啟停伺服器、切換本機控制器的 P1／P2 指派，或顯示選取的配對連結。",
+        ja: "Enterでサーバーの起動・停止、ローカル入力のP1/P2割当、選択リンクの表示を行います。"
+    },
+    ControllerLocalSlotHelp => {
+        en: "Single-player and online play use LOCAL P1. LOCAL P2 is used only by local two-player mode.",
+        zh_hant: "單人與連線遊玩使用「本機 P1」；只有單機雙人模式會使用「本機 P2」。",
+        ja: "1人プレイとオンラインは「ローカルP1」を使います。「ローカルP2」はローカル2人プレイ専用です。"
     },
     ControllerPairingHelp => {
         en: "On a P1/P2 row: C copies the one-time link; R revokes the controller and rotates the link.",
         zh_hant: "在 P1／P2 欄位：C 複製一次性連結；R 撤銷控制器並更換連結。",
         ja: "P1/P2項目では、Cで一度限りのリンクをコピーし、Rで接続を無効化してリンクを更新します。"
     },
-    ControllerTrackpadHelp => {
-        en: "Trackpad mode means moving the terminal pointer and left-clicking one of four on-screen pads.",
-        zh_hant: "觸控板模式是移動終端機游標，並左鍵點擊畫面上的四個鼓面。",
-        ja: "トラックパッドでは端末のポインターを動かし、画面上の4打面を左クリックします。"
+    ControllerMacTrackpadHelp => {
+        en: "Mac contact mode needs no click or pressure: touch one of four left-to-right trackpad zones. Holding or sliding does not repeat.",
+        zh_hant: "Mac 接觸模式不需點擊或加壓：直接碰觸觸控板由左至右的四個分區；持續接觸或滑動不會重複敲擊。",
+        ja: "Mac接触モードはクリックも加圧も不要です。トラックパッドを左から4分割した領域に触れます。長押しや移動では連打しません。"
+    },
+    ControllerPointerHelp => {
+        en: "Terminal mouse mode requires left-clicking one of the four on-screen pads.",
+        zh_hant: "終端機滑鼠模式需要左鍵點擊畫面上的四個鼓面之一。",
+        ja: "端末マウスモードでは画面上の4打面を左クリックします。"
     },
     ControllerKeyboardRepeatLimited => {
-        en: "This terminal cannot distinguish held-key repeat. Use the trackpad or phone controller for repeat-safe play.",
-        zh_hant: "此終端機無法分辨按住按鍵的重複事件；若要避免誤觸，請改用觸控板或手機控制器。",
-        ja: "この端末ではキー長押しのリピートを判別できません。誤入力を避けるにはポインターかスマホを使ってください。"
+        en: "This terminal cannot distinguish held-key repeat. Use Mac trackpad contact or a phone controller for repeat-safe play.",
+        zh_hant: "此終端機無法分辨按住按鍵的重複事件；若要避免誤觸，請改用 Mac 觸控板接觸或手機控制器。",
+        ja: "この端末ではキー長押しのリピートを判別できません。Macトラックパッド接触かスマホを使ってください。"
     },
     ControllerKeyboardRepeatGameplay => {
-        en: "KEY HOLD-REPEAT IS UNSAFE HERE — USE TRACKPAD OR PHONE",
-        zh_hant: "此終端機無法安全辨識按住重複 — 請用觸控板或手機",
-        ja: "キー長押しの判別不可 — ポインターかスマホを使用"
+        en: "KEY HOLD-REPEAT IS UNSAFE HERE — USE MAC TRACKPAD CONTACT OR PHONE",
+        zh_hant: "此終端機無法安全辨識按住重複 — 請用 MAC 觸控板接觸或手機",
+        ja: "キー長押しの判別不可 — MACトラックパッド接触かスマホを使用"
     },
     ControllerTestHelp => {
-        en: "Controller test is live here: tap any phone pad or enable the terminal pointer, then click a pad below.",
-        zh_hant: "此頁可即時測試：敲手機鼓面，或啟用終端機觸控板後點擊下方鼓面。",
-        ja: "この画面で動作確認できます。スマホを叩くか、端末ポインターを有効にして下の打面をクリックしてください。"
+        en: "Live test: touch a Mac trackpad zone, tap a phone pad, or enable terminal mouse click and click a pad below.",
+        zh_hant: "即時測試：碰觸 Mac 觸控板分區、敲手機鼓面，或啟用終端機滑鼠點擊後按下方鼓面。",
+        ja: "動作確認：Macトラックパッド領域に触れるか、スマホを叩くか、端末マウスを有効にして下の打面をクリックします。"
     },
     ControllerPhoneHelp => {
         en: "Open one P1/P2 link on a phone on the same LAN. Multi-touch uses Pointer Events.",
