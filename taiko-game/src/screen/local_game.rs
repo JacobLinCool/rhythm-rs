@@ -3,13 +3,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::game_screen::{judge_feedback, render_lane_view, LaneRenderOptions};
-use super::render_gauge_bar_line;
+use super::{render_gauge_bar_line, render_terminal_drum_surface};
 use crate::app::App;
+use crate::drum_surface::DrumSurfaceLayout;
 use crate::local_multiplayer::LocalPlayerId;
 use crate::localization::UiText;
 use crate::tui::Frame;
 
-pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfaceLayout> {
     let Some(game) = app.local_game.as_ref() else {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -19,12 +20,21 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .block(themed_block(app, app.text(UiText::LocalTwoPlayer))),
             area,
         );
-        return;
+        return None;
     };
 
+    let pointer_slot = (!game.paused && app.leave_confirmation.is_none())
+        .then(|| app.terminal_pointer_slot())
+        .flatten();
+    let controls_height = 2 + u16::from(!app.keyboard_repeat_is_distinguishable);
+    let footer_height = if pointer_slot.is_some() {
+        3 + controls_height
+    } else {
+        controls_height
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(11), Constraint::Length(2)])
+        .constraints([Constraint::Min(11), Constraint::Length(footer_height)])
         .split(area);
     let player_areas = split_player_areas(rows[0]);
 
@@ -80,7 +90,38 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         );
     }
 
-    let help = Paragraph::new(vec![
+    if let Some(slot) = pointer_slot {
+        let footer = Layout::vertical([Constraint::Length(3), Constraint::Length(controls_height)])
+            .split(rows[1]);
+        let mut help_lines = vec![
+            Line::from(vec![
+                Span::styled("P1  ", app.theme.title),
+                Span::styled(
+                    binding_summary(app, app.preferences.player_one),
+                    app.theme.metadata,
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("P2  ", app.theme.title),
+                Span::styled(
+                    binding_summary(app, app.preferences.player_two),
+                    app.theme.metadata,
+                ),
+                Span::styled(
+                    format!("    {}", app.text(UiText::GameControlsHelp)),
+                    app.theme.text_secondary,
+                ),
+            ]),
+        ];
+        append_keyboard_warning(app, &mut help_lines);
+        frame.render_widget(Paragraph::new(help_lines), footer[1]);
+        let active_action = game.players[slot.index()]
+            .input_flash
+            .map(|(action, _)| action);
+        return render_terminal_drum_surface(app, frame, footer[0], slot, active_action);
+    }
+
+    let mut help_lines = vec![
         Line::from(vec![
             Span::styled("P1  ", app.theme.title),
             Span::styled(
@@ -99,8 +140,19 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 app.theme.text_secondary,
             ),
         ]),
-    ]);
-    frame.render_widget(help, rows[1]);
+    ];
+    append_keyboard_warning(app, &mut help_lines);
+    frame.render_widget(Paragraph::new(help_lines), rows[1]);
+    None
+}
+
+fn append_keyboard_warning(app: &App, lines: &mut Vec<Line<'static>>) {
+    if !app.keyboard_repeat_is_distinguishable {
+        lines.push(Line::from(Span::styled(
+            app.text(UiText::ControllerKeyboardRepeatGameplay),
+            app.theme.warning,
+        )));
+    }
 }
 
 fn binding_summary(app: &App, bindings: crate::preferences::DrumBindings) -> String {
@@ -155,11 +207,11 @@ mod tests {
 
     #[test]
     fn minimum_local_game_height_preserves_both_complete_five_row_lanes() {
-        // A 27-row terminal leaves 26 rows after the global top bar.
-        let content = Rect::new(0, 1, 80, 26);
+        // A 30-row terminal leaves 29 rows after the global top bar.
+        let content = Rect::new(0, 1, 80, 29);
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(11), Constraint::Length(2)])
+            .constraints([Constraint::Min(11), Constraint::Length(5)])
             .split(content);
         let players = split_player_areas(rows[0]);
 

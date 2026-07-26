@@ -5,10 +5,14 @@ mod audio_sync;
 mod bench;
 mod cli;
 mod clipboard;
+mod controller;
+mod controller_qr;
 mod demo_preview;
+mod drum_surface;
 mod embedded_server_start;
 mod input;
 mod invite;
+mod lan_controller;
 mod latest_background;
 mod library_loading;
 mod loader;
@@ -30,11 +34,24 @@ mod theme;
 mod tui;
 
 use std::time::Instant;
+#[cfg(unix)]
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    vec::Vec,
+};
 
 use anyhow::Result;
 use app::App;
 use clap::Parser;
 use crossterm::event::KeyEventKind;
+#[cfg(unix)]
+use signal_hook::{
+    consts::signal::{SIGHUP, SIGINT, SIGTERM},
+    flag, low_level, SigId,
+};
 use tui::{Tui, UiEvent};
 
 use crate::cli::{CacheAction, CacheClearArgs, CacheCommandArgs, Cli, CliSubcommand};
@@ -61,20 +78,24 @@ pub(crate) fn run_app(mut app: App) -> Result<()> {
 }
 
 fn run_app_tui(app: &mut App) -> Result<()> {
+    let shutdown_signal = ShutdownSignal::install()?;
     let mut tui = Tui::new(app.args.tps, 120)?;
     tui.enter()?;
+    app.set_keyboard_repeat_capability(tui.keyboard_repeat_is_distinguishable());
 
     let run_result = (|| {
         loop {
-            if app.should_quit() {
+            if app.should_quit() || shutdown_signal.is_requested() {
                 break;
             }
 
+            tui.set_mouse_capture(app.terminal_pointer_capture_requested())?;
             match tui.next_event()? {
                 UiEvent::Tick => app.handle_tick(),
                 UiEvent::Frame => {
                     let start = Instant::now();
                     tui.draw(|frame| app.render(frame))?;
+                    app.commit_rendered_pointer_surface();
                     app.record_frame_time(start.elapsed());
                 }
                 UiEvent::Key { event, observed_at } => {
@@ -82,7 +103,11 @@ fn run_app_tui(app: &mut App) -> Result<()> {
                         app.handle_key_at(event, observed_at);
                     }
                 }
+                UiEvent::Pointer { event, observed_at } => {
+                    app.handle_pointer_at(event, observed_at);
+                }
                 UiEvent::Resize(width, height) => {
+                    app.invalidate_pointer_surface();
                     tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
                 }
             }
@@ -91,6 +116,54 @@ fn run_app_tui(app: &mut App) -> Result<()> {
     })();
 
     merge_results(run_result, tui.exit(), "terminal shutdown")
+}
+
+#[cfg(unix)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+    registrations: Vec<SigId>,
+}
+
+#[cfg(unix)]
+impl ShutdownSignal {
+    fn install() -> Result<Self> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let registrations = [SIGHUP, SIGINT, SIGTERM]
+            .into_iter()
+            .map(|signal| flag::register(signal, Arc::clone(&requested)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self {
+            requested,
+            registrations,
+        })
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            low_level::unregister(registration);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignal;
+
+#[cfg(not(unix))]
+impl ShutdownSignal {
+    fn install() -> Result<Self> {
+        Ok(Self)
+    }
+
+    const fn is_requested(&self) -> bool {
+        false
+    }
 }
 
 fn is_physical_key_press(kind: KeyEventKind) -> bool {
@@ -172,7 +245,7 @@ fn run_cache_clear(args: CacheClearArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_physical_key_press;
+    use super::{is_physical_key_press, ShutdownSignal};
     use crossterm::event::KeyEventKind;
 
     #[test]
@@ -180,5 +253,19 @@ mod tests {
         assert!(is_physical_key_press(KeyEventKind::Press));
         assert!(!is_physical_key_press(KeyEventKind::Repeat));
         assert!(!is_physical_key_press(KeyEventKind::Release));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_flag_is_observed_without_running_code_in_the_handler() {
+        let shutdown = ShutdownSignal {
+            requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registrations: Vec::new(),
+        };
+        assert!(!shutdown.is_requested());
+        shutdown
+            .requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(shutdown.is_requested());
     }
 }

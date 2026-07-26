@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="color-scheme" content="dark">
+  <title data-i18n="title">Taiko Controller</title>
+  <link rel="stylesheet" href="/controller/controller.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow" data-i18n="eyebrow">TAIKO CONTROLLER</p>
+        <h1 id="player" data-i18n="pairing">Pairing…</h1>
+      </div>
+      <p id="status" role="status" aria-live="polite" data-i18n="connecting">Connecting to the game</p>
+    </header>
+    <section class="pads" aria-label="Taiko drum controls" data-i18n-aria-label="drumControls">
+      <button type="button" class="pad kat" data-action="left_kat" aria-label="Left Kat" data-i18n-aria-label="leftKat" aria-pressed="false">
+        <span data-i18n="left">LEFT</span><strong data-i18n="kat">KAT</strong><small data-i18n="rim">RIM</small>
+      </button>
+      <button type="button" class="pad don" data-action="left_don" aria-label="Left Don" data-i18n-aria-label="leftDon" aria-pressed="false">
+        <span data-i18n="left">LEFT</span><strong data-i18n="don">DON</strong><small data-i18n="center">CENTER</small>
+      </button>
+      <button type="button" class="pad don" data-action="right_don" aria-label="Right Don" data-i18n-aria-label="rightDon" aria-pressed="false">
+        <span data-i18n="right">RIGHT</span><strong data-i18n="don">DON</strong><small data-i18n="center">CENTER</small>
+      </button>
+      <button type="button" class="pad kat" data-action="right_kat" aria-label="Right Kat" data-i18n-aria-label="rightKat" aria-pressed="false">
+        <span data-i18n="right">RIGHT</span><strong data-i18n="kat">KAT</strong><small data-i18n="rim">RIM</small>
+      </button>
+    </section>
+    <footer data-i18n="trustedLan">Keep this page open on the same trusted LAN as the game.</footer>
+  </main>
+  <script src="/controller/controller.js" defer></script>
+</body>
+</html>

@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+pub(crate) const MIN_TPS: u32 = 60;
+pub(crate) const MAX_TPS: u32 = 1_000;
+
 #[derive(Debug, Clone, Args)]
 pub struct CliArgs {
     #[arg(
@@ -31,7 +34,8 @@ pub struct CliArgs {
         long,
         value_name = "N",
         default_value_t = 240,
-        help = "Logic ticks per second"
+        value_parser = clap::value_parser!(u32).range(MIN_TPS as i64..=MAX_TPS as i64),
+        help = "Logic ticks per second (60-1000)"
     )]
     pub tps: u32,
 
@@ -143,5 +147,34 @@ mod tests {
         assert_eq!(parsed.args.calibration_offset_ms, -125);
         assert!(Cli::try_parse_from(["taiko", "--calibration-offset-ms", "501"]).is_err());
         assert!(Cli::try_parse_from(["taiko", "--track-offset", "0.125"]).is_err());
+    }
+
+    #[test]
+    fn scheduler_rate_has_strict_practical_bounds() {
+        assert_eq!(
+            Cli::try_parse_from(["taiko", "--tps", "60"])
+                .expect("minimum TPS")
+                .args
+                .tps,
+            MIN_TPS
+        );
+        assert_eq!(
+            Cli::try_parse_from(["taiko", "--tps", "1000"])
+                .expect("maximum TPS")
+                .args
+                .tps,
+            MAX_TPS
+        );
+        assert!(Cli::try_parse_from(["taiko", "--tps", "59"]).is_err());
+        assert!(Cli::try_parse_from(["taiko", "--tps", "1001"]).is_err());
+    }
+
+    #[test]
+    fn slowest_supported_tick_is_well_inside_the_lan_input_freshness_window() {
+        let slowest_tick = std::time::Duration::from_secs_f64(1.0 / f64::from(MIN_TPS));
+        assert!(
+            slowest_tick < crate::lan_controller::MAX_DISPATCH_AGE,
+            "the minimum TPS must not make a fresh phone hit expire before its first logic tick"
+        );
     }
 }

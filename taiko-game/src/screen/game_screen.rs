@@ -7,8 +7,10 @@ use rhythm_mode_taiko::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::render_gauge_bar_line;
+use super::{render_gauge_bar_line, render_terminal_drum_surface};
 use crate::app::App;
+use crate::controller::ControllerSlot;
+use crate::drum_surface::DrumSurfaceLayout;
 use crate::localization::{display_width, Localizer, UiText};
 use crate::theme::Theme;
 use crate::tui::Frame;
@@ -35,7 +37,7 @@ struct LaneRows<'a> {
     bottom: &'a mut [Span<'static>],
 }
 
-pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfaceLayout> {
     let Some(game) = app.game.as_ref() else {
         let empty = Paragraph::new(Span::styled(
             app.text(UiText::GameSessionMissing),
@@ -43,15 +45,27 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
         .block(themed_block(app, app.text(UiText::Game)));
         frame.render_widget(empty, area);
-        return;
+        return None;
     };
 
+    let pointer_slot = (app.terminal_pointer_slot() == Some(ControllerSlot::One)
+        && !game.paused
+        && !app.auto_play
+        && app.leave_confirmation.is_none())
+    .then_some(ControllerSlot::One);
+    let show_keyboard_warning = !app.keyboard_repeat_is_distinguishable && !app.auto_play;
+    let controls_height = 1 + u16::from(show_keyboard_warning);
+    let footer_height = if pointer_slot.is_some() {
+        3 + controls_height
+    } else {
+        controls_height
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
             Constraint::Min(7),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(area);
 
@@ -108,7 +122,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     render_lane(app, frame, layout[1]);
 
-    let help = Paragraph::new(Line::from(vec![
+    let footer = if pointer_slot.is_some() {
+        Layout::vertical([Constraint::Length(3), Constraint::Length(controls_height)])
+            .split(layout[2])
+    } else {
+        Layout::vertical([Constraint::Length(0), Constraint::Length(controls_height)])
+            .split(layout[2])
+    };
+    let mut help_lines = vec![Line::from(vec![
         Span::styled(
             format!("{} ", app.text(UiText::Don)),
             app.theme.lane_note_don,
@@ -134,8 +155,24 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             app.theme.metadata,
         ),
         Span::styled(app.text(UiText::GameControlsHelp), app.theme.text_secondary),
-    ]));
-    frame.render_widget(help, layout[2]);
+    ])];
+    if show_keyboard_warning {
+        help_lines.push(Line::from(Span::styled(
+            app.text(UiText::ControllerKeyboardRepeatGameplay),
+            app.theme.warning,
+        )));
+    }
+    frame.render_widget(Paragraph::new(help_lines), footer[1]);
+
+    pointer_slot.and_then(|slot| {
+        render_terminal_drum_surface(
+            app,
+            frame,
+            footer[0],
+            slot,
+            game.input_flash.map(|flash| flash.action),
+        )
+    })
 }
 
 fn progress_line(

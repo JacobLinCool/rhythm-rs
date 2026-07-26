@@ -204,9 +204,269 @@ define_ui_text! {
         ja: "太鼓 // プレイモード選択"
     },
     TopModeSelectHelp => {
-        en: "↑↓ SELECT  •  ENTER CONFIRM  •  S SETTINGS",
-        zh_hant: "↑↓ 選擇  •  ENTER 確認  •  S 設定",
-        ja: "↑↓ 選択  •  ENTER 決定  •  S 設定"
+        en: "↑↓ SELECT  •  ENTER CONFIRM  •  C CONTROLLERS  •  S SETTINGS",
+        zh_hant: "↑↓ 選擇  •  ENTER 確認  •  C 控制器  •  S 設定",
+        ja: "↑↓ 選択  •  ENTER 決定  •  C コントローラー  •  S 設定"
+    },
+    TopControllers => {
+        en: "TAIKO // CONTROLLERS",
+        zh_hant: "太鼓 // 控制器",
+        ja: "太鼓 // コントローラー"
+    },
+    TopControllersHelp => {
+        en: "↑↓ FIELD  •  ENTER ACTION  •  C COPY  •  R RESET  •  ESC BACK",
+        zh_hant: "↑↓ 欄位  •  ENTER 操作  •  C 複製  •  R 重設  •  ESC 返回",
+        ja: "↑↓ 項目  •  ENTER 操作  •  C コピー  •  R リセット  •  ESC 戻る"
+    },
+    ControllerSetup => {
+        en: "Controller Setup",
+        zh_hant: "控制器設定",
+        ja: "コントローラー設定"
+    },
+    ControllerSetupDescription => {
+        en: "Keyboard, terminal pointer, and phone controllers share the same four-pad input path.",
+        zh_hant: "鍵盤、終端機觸控板與手機控制器共用同一條四鼓面輸入路徑。",
+        ja: "キーボード、端末ポインター、スマホは同じ4打面の入力経路を使います。"
+    },
+    TrustedLanOnly => {
+        en: "Trusted LAN only",
+        zh_hant: "僅限可信任區域網路",
+        ja: "信頼できるLAN専用"
+    },
+    TrustedLanWarning => {
+        en: "The phone link is unencrypted. Use it only on a network whose other users you trust.",
+        zh_hant: "手機連線未加密；只能在你信任其他使用者的網路上啟用。",
+        ja: "スマホ接続は暗号化されません。他の利用者を信頼できるネットワークだけで使ってください。"
+    },
+    ControllerBindAddress => {
+        en: "LAN bind address",
+        zh_hant: "區網綁定位址",
+        ja: "LANバインドアドレス"
+    },
+    ControllerLanServer => {
+        en: "Phone controller server",
+        zh_hant: "手機控制器伺服器",
+        ja: "スマホコントローラーサーバー"
+    },
+    ControllerTerminalPointer => {
+        en: "Terminal pointer",
+        zh_hant: "終端機觸控板／滑鼠",
+        ja: "端末ポインター"
+    },
+    ControllerPlayerOne => {
+        en: "P1 phone",
+        zh_hant: "P1 手機",
+        ja: "P1 スマホ"
+    },
+    ControllerPlayerTwo => {
+        en: "P2 phone",
+        zh_hant: "P2 手機",
+        ja: "P2 スマホ"
+    },
+    ControllerBack => {
+        en: "Back to play modes",
+        zh_hant: "返回遊玩模式",
+        ja: "プレイモードへ戻る"
+    },
+    ControllerRunning => {
+        en: "RUNNING",
+        zh_hant: "運作中",
+        ja: "稼働中"
+    },
+    ControllerStopped => {
+        en: "STOPPED",
+        zh_hant: "已停止",
+        ja: "停止中"
+    },
+    ControllerPointerPlayerOne => {
+        en: "P1",
+        zh_hant: "P1",
+        ja: "P1"
+    },
+    ControllerPointerPlayerTwo => {
+        en: "P2",
+        zh_hant: "P2",
+        ja: "P2"
+    },
+    ControllerPointerOff => {
+        en: "OFF",
+        zh_hant: "關",
+        ja: "オフ"
+    },
+    ControllerPaired => {
+        en: "PAIRED",
+        zh_hant: "已配對",
+        ja: "ペア済み"
+    },
+    ControllerWaitingPair => {
+        en: "READY TO PAIR",
+        zh_hant: "等待配對",
+        ja: "ペアリング待ち"
+    },
+    ControllerConnected => {
+        en: "CONNECTED",
+        zh_hant: "已連線",
+        ja: "接続中"
+    },
+    ControllerDisconnected => {
+        en: "DISCONNECTED",
+        zh_hant: "未連線",
+        ja: "未接続"
+    },
+    ControllerEndpoint => {
+        en: "Phone page",
+        zh_hant: "手機頁面",
+        ja: "スマホページ"
+    },
+    ControllerPairingLink => {
+        en: "Pairing link",
+        zh_hant: "配對連結",
+        ja: "ペアリングリンク"
+    },
+    ControllerPairingQr => {
+        en: "Scan this one-time pairing QR",
+        zh_hant: "掃描此一次性配對 QR Code",
+        ja: "この一度限りのペアリングQRを読み取ってください"
+    },
+    ControllerPairingQrHelp => {
+        en: "Phone on same LAN  •  Enter/Esc hide  •  C copy  •  R revoke",
+        zh_hant: "手機須在同一區網  •  Enter／Esc 隱藏  •  C 複製  •  R 撤銷",
+        ja: "同じLANのスマホ  •  Enter/Esc 非表示  •  C コピー  •  R 無効化"
+    },
+    ControllerPairingQrNeedsSpace => {
+        en: "Enlarge the terminal to display the pairing QR.",
+        zh_hant: "請放大終端機以顯示配對 QR Code。",
+        ja: "ペアリングQRを表示するにはターミナルを大きくしてください。"
+    },
+    ControllerPairingQrFailed => {
+        en: "The pairing QR could not be encoded.",
+        zh_hant: "無法編碼配對 QR Code。",
+        ja: "ペアリングQRを生成できませんでした。"
+    },
+    ControllerLinkMasked => {
+        en: "[hidden — Enter to reveal]",
+        zh_hant: "[已隱藏 — 按 Enter 顯示]",
+        ja: "[非表示 — Enterで表示]"
+    },
+    ControllerNoUnusedInvite => {
+        en: "Already paired. Press R to revoke it and create a new link.",
+        zh_hant: "已經配對；按 R 撤銷並建立新的連結。",
+        ja: "ペア済みです。Rで無効化して新しいリンクを作成します。"
+    },
+    ControllerHits => {
+        en: "Accepted / rejected hits",
+        zh_hant: "接受／拒絕敲擊",
+        ja: "受付／拒否した入力"
+    },
+    ControllerNavigationHelp => {
+        en: "Enter starts/stops the server, changes pointer assignment, or reveals a selected link.",
+        zh_hant: "Enter 可啟停伺服器、切換觸控板指派，或顯示選取的配對連結。",
+        ja: "Enterでサーバーの起動・停止、ポインター割当、選択リンクの表示を行います。"
+    },
+    ControllerPairingHelp => {
+        en: "On a P1/P2 row: C copies the one-time link; R revokes the controller and rotates the link.",
+        zh_hant: "在 P1／P2 欄位：C 複製一次性連結；R 撤銷控制器並更換連結。",
+        ja: "P1/P2項目では、Cで一度限りのリンクをコピーし、Rで接続を無効化してリンクを更新します。"
+    },
+    ControllerTrackpadHelp => {
+        en: "Trackpad mode means moving the terminal pointer and left-clicking one of four on-screen pads.",
+        zh_hant: "觸控板模式是移動終端機游標，並左鍵點擊畫面上的四個鼓面。",
+        ja: "トラックパッドでは端末のポインターを動かし、画面上の4打面を左クリックします。"
+    },
+    ControllerKeyboardRepeatLimited => {
+        en: "This terminal cannot distinguish held-key repeat. Use the trackpad or phone controller for repeat-safe play.",
+        zh_hant: "此終端機無法分辨按住按鍵的重複事件；若要避免誤觸，請改用觸控板或手機控制器。",
+        ja: "この端末ではキー長押しのリピートを判別できません。誤入力を避けるにはポインターかスマホを使ってください。"
+    },
+    ControllerKeyboardRepeatGameplay => {
+        en: "KEY HOLD-REPEAT IS UNSAFE HERE — USE TRACKPAD OR PHONE",
+        zh_hant: "此終端機無法安全辨識按住重複 — 請用觸控板或手機",
+        ja: "キー長押しの判別不可 — ポインターかスマホを使用"
+    },
+    ControllerTestHelp => {
+        en: "Controller test is live here: tap any phone pad or enable the terminal pointer, then click a pad below.",
+        zh_hant: "此頁可即時測試：敲手機鼓面，或啟用終端機觸控板後點擊下方鼓面。",
+        ja: "この画面で動作確認できます。スマホを叩くか、端末ポインターを有効にして下の打面をクリックしてください。"
+    },
+    ControllerPhoneHelp => {
+        en: "Open one P1/P2 link on a phone on the same LAN. Multi-touch uses Pointer Events.",
+        zh_hant: "在同一區網的手機開啟 P1／P2 連結；多點觸控使用 Pointer Events。",
+        ja: "同じLANのスマホでP1/P2リンクを開きます。マルチタッチはPointer Eventsを使います。"
+    },
+    ControllerStopBeforeEditing => {
+        en: "Stop the phone controller server before editing its bind address.",
+        zh_hant: "請先停止手機控制器伺服器，再編輯綁定位址。",
+        ja: "バインドアドレスを編集する前にサーバーを停止してください。"
+    },
+    ControllerBindMustBeExact => {
+        en: "Choose one exact local or LAN address; wildcard and multicast addresses are not allowed.",
+        zh_hant: "請指定一個確切的本機或區網位址；不允許萬用或多播位址。",
+        ja: "ローカルまたはLANのアドレスを1つ指定してください。ワイルドカードとマルチキャストは使えません。"
+    },
+    ControllerLoopbackOnly => {
+        en: "127.0.0.1 is local-only. A phone cannot connect; enter this computer's Wi-Fi or Ethernet IPv4 address.",
+        zh_hant: "127.0.0.1 只能在本機使用，手機無法連線；請輸入這台電腦的 Wi-Fi 或乙太網路 IPv4 位址。",
+        ja: "127.0.0.1 はこの端末専用です。スマホからは接続できないため、Wi-Fi または Ethernet の IPv4 アドレスを入力してください。"
+    },
+    ControllerInvalidBindAddress => {
+        en: "Invalid bind address",
+        zh_hant: "無效的綁定位址",
+        ja: "無効なバインドアドレス"
+    },
+    ControllerGenerationExhausted => {
+        en: "Controller server generation counter is exhausted; restart the application.",
+        zh_hant: "控制器伺服器世代計數已耗盡；請重新啟動程式。",
+        ja: "コントローラーサーバーの世代番号を使い切りました。アプリを再起動してください。"
+    },
+    ControllerServerStarted => {
+        en: "Phone controller server started.",
+        zh_hant: "手機控制器伺服器已啟動。",
+        ja: "スマホコントローラーサーバーを起動しました。"
+    },
+    ControllerServerStopped => {
+        en: "Phone controller server stopped and all sessions were revoked.",
+        zh_hant: "手機控制器伺服器已停止，所有工作階段均已撤銷。",
+        ja: "スマホコントローラーサーバーを停止し、全セッションを無効化しました。"
+    },
+    ControllerServerStartFailed => {
+        en: "Could not start the phone controller server",
+        zh_hant: "無法啟動手機控制器伺服器",
+        ja: "スマホコントローラーサーバーを起動できません"
+    },
+    ControllerServerStopFailed => {
+        en: "Controller server cleanup failed",
+        zh_hant: "控制器伺服器清理失敗",
+        ja: "コントローラーサーバーの終了処理に失敗しました"
+    },
+    ControllerStartServerFirst => {
+        en: "Start the phone controller server first.",
+        zh_hant: "請先啟動手機控制器伺服器。",
+        ja: "先にスマホコントローラーサーバーを起動してください。"
+    },
+    ControllerInviteUnavailable => {
+        en: "No unused pairing link is available; press R to rotate it.",
+        zh_hant: "沒有可用的一次性配對連結；請按 R 更換。",
+        ja: "未使用のペアリングリンクがありません。Rで更新してください。"
+    },
+    ControllerInviteCopied => {
+        en: "One-time pairing link copied.",
+        zh_hant: "已複製一次性配對連結。",
+        ja: "一度限りのペアリングリンクをコピーしました。"
+    },
+    ControllerInviteCopyFailed => {
+        en: "Could not copy the pairing link",
+        zh_hant: "無法複製配對連結",
+        ja: "ペアリングリンクをコピーできません"
+    },
+    ControllerPairingRotated => {
+        en: "Controller revoked and a new one-time pairing link was created.",
+        zh_hant: "已撤銷控制器，並建立新的單次配對連結。",
+        ja: "コントローラーを無効化し、新しい一度限りのリンクを作成しました。"
+    },
+    ControllerPairingRotateFailed => {
+        en: "Could not rotate the pairing link",
+        zh_hant: "無法更換配對連結",
+        ja: "ペアリングリンクを更新できません"
     },
     TopSettings => {
         en: "TAIKO // PLAYER SETTINGS",
@@ -374,9 +634,9 @@ define_ui_text! {
         ja: "プレイモードを選択"
     },
     ModeSelectControls => {
-        en: "Up/Down: select  •  Enter: confirm  •  S: settings  •  Esc: quit",
-        zh_hant: "上/下：選擇  •  Enter：確認  •  S：設定  •  Esc：離開",
-        ja: "上/下：選択  •  Enter：決定  •  S：設定  •  Esc：終了"
+        en: "Up/Down: select  •  Enter: confirm  •  C: controllers  •  S: settings  •  Esc: quit",
+        zh_hant: "上/下：選擇  •  Enter：確認  •  C：控制器  •  S：設定  •  Esc：離開",
+        ja: "上/下：選択  •  Enter：決定  •  C：コントローラー  •  S：設定  •  Esc：終了"
     },
     OfflineLibrary => {
         en: "Offline library",

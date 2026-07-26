@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout};
 use rhythm_chart::{ticks_from_seconds, CanonicalChart, Object, ObjectKind, Tick};
 use rhythm_core::TimedInput;
@@ -17,12 +17,14 @@ use taiko_multiplayer_protocol::{PlayerSelection, RoomRole};
 
 use crate::audio::{AudioCapability, AudioEngine, AudioNotice, GameAudio};
 use crate::audio_sync::{AudioSyncController, AudioSyncDecision};
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, MAX_TPS, MIN_TPS};
 use crate::clipboard::SystemClipboard;
+use crate::controller::{ControllerSlot, ControllerSource, ControllerStrike};
 use crate::demo_preview::{
     event_is_current as demo_event_is_current, DemoPreviewCompletion, DemoPreviewIdentity,
     DemoPreviewTask,
 };
+use crate::drum_surface::DrumSurfaceLayout;
 use crate::embedded_server_start::{
     event_is_current as embedded_start_event_is_current, EmbeddedServerStartCompletion,
     EmbeddedServerStartIdentity, EmbeddedServerStartTask, PreparedEmbeddedServer,
@@ -30,6 +32,10 @@ use crate::embedded_server_start::{
 use crate::input::{
     collect_due_offline_inputs, enqueue_offline_input, is_game_pause_toggle_key,
     map_bound_game_hit, map_menu_intent, MenuIntent,
+};
+use crate::lan_controller::{
+    discover_lan_ip, ActiveControllerSlots, ControllerSlotStatus, LanControllerConfig,
+    LanControllers, PairingInvite, MAX_DISPATCH_AGE,
 };
 use crate::library_loading::{
     event_is_current as library_load_event_is_current, LibraryLoadCompletion, LibraryLoadTask,
@@ -66,6 +72,7 @@ use crate::tui::Frame;
 
 const DEMO_DELAY: Duration = Duration::from_millis(500);
 const RESULT_DELAY: Duration = Duration::from_millis(500);
+const MAX_PENDING_CONTROLLER_STRIKES: usize = 1_024;
 const HIT_FLASH_TICKS: Tick = 200_000;
 const OFFSET_STEP_MS: i32 = 5;
 const OFFSET_MIN_MS: i32 = -500;
@@ -89,6 +96,7 @@ const MAX_AUTOPLAY_EVENTS: usize = TjaImportLimits::DEFAULT.max_objects_per_cour
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     ModeSelect,
+    Controllers,
     Settings,
     SongMenu,
     LoadWarnings,
@@ -252,6 +260,67 @@ pub(crate) struct SettingsState {
     pub(crate) capture: Option<(usize, BindingSlot)>,
     /// `(message, is_error)`
     pub(crate) status: Option<(String, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControllerSetupItem {
+    BindAddress,
+    LanServer,
+    TerminalPointer,
+    PlayerOne,
+    PlayerTwo,
+    Back,
+}
+
+impl ControllerSetupItem {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::BindAddress,
+        Self::LanServer,
+        Self::TerminalPointer,
+        Self::PlayerOne,
+        Self::PlayerTwo,
+        Self::Back,
+    ];
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControllerSetupState {
+    pub(crate) bind_ip: String,
+    pub(crate) selected: usize,
+    pub(crate) pointer_slot: Option<ControllerSlot>,
+    pub(crate) invite_revealed: [bool; 2],
+    pub(crate) last_test_action: [Option<(TaikoAction, Instant)>; 2],
+    /// `(message, is_error)`
+    pub(crate) notice: Option<(String, bool)>,
+}
+
+impl ControllerSetupState {
+    fn new(bind_ip: String) -> Self {
+        Self {
+            bind_ip,
+            selected: 0,
+            pointer_slot: None,
+            invite_revealed: [false; 2],
+            last_test_action: [None; 2],
+            notice: None,
+        }
+    }
+
+    pub(crate) fn selected_item(&self) -> ControllerSetupItem {
+        ControllerSetupItem::ALL[self.selected.min(ControllerSetupItem::ALL.len() - 1)]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedControllerStrike {
+    ingress_sequence: u64,
+    strike: ControllerStrike,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControllerDispatchClock {
+    sampled_at: Instant,
+    song_seconds: f64,
 }
 
 impl SettingsState {
@@ -589,6 +658,11 @@ pub struct App {
     pub(crate) scroll_speed_vsync: f32,
     pub(crate) calibration_offset_ms: i32,
     pub(crate) viewport_width: u16,
+    pub(crate) viewport_height: u16,
+    pub(crate) controller_setup: ControllerSetupState,
+    pub(crate) keyboard_repeat_is_distinguishable: bool,
+    pub(crate) pointer_surface: Option<DrumSurfaceLayout>,
+    pending_pointer_surface: Option<DrumSurfaceLayout>,
     pub(crate) game: Option<GameSession>,
     pub(crate) result: Option<ResultState>,
     pub(crate) local_course_selection: LocalCourseSelection,
@@ -617,6 +691,11 @@ pub struct App {
     pub(crate) preferences: PlayerPreferences,
     pub(crate) settings: SettingsState,
     clipboard: SystemClipboard,
+    lan_controllers: Option<LanControllers>,
+    lan_controller_generation: u64,
+    controller_input_sequence: u64,
+    pending_controller_strikes: Vec<QueuedControllerStrike>,
+    controller_input_drops: u64,
     pub(crate) invite_revealed: bool,
     pub(crate) invite_copy_status: Option<InviteCopyStatus>,
     pub(crate) mp_connect: MultiplayerConnectState,
@@ -800,12 +879,15 @@ impl App {
         library: SongLibrary,
         audio: Box<dyn GameAudio>,
     ) -> Result<Self> {
-        if args.tps == 0 {
-            bail!("--tps must be > 0");
+        if !(MIN_TPS..=MAX_TPS).contains(&args.tps) {
+            bail!("--tps must be between {MIN_TPS} and {MAX_TPS}");
         }
 
         let preferences = preferences_from_cli(&args);
         let audio_notice = AudioNotice::from_capability(&audio.capability());
+        let controller_bind_ip = discover_lan_ip()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .to_string();
         let mut app = Self {
             auto_play: false,
             course_setting_focus: CourseSettingFocus::AutoPlay,
@@ -813,6 +895,11 @@ impl App {
             scroll_speed_vsync: 1.0,
             calibration_offset_ms: args.calibration_offset_ms,
             viewport_width: 120,
+            viewport_height: 36,
+            controller_setup: ControllerSetupState::new(controller_bind_ip),
+            keyboard_repeat_is_distinguishable: false,
+            pointer_surface: None,
+            pending_pointer_surface: None,
             resource_backend: Arc::new(resource_backend),
             audio,
             audio_notice,
@@ -820,6 +907,11 @@ impl App {
             preferences: preferences.clone(),
             settings: SettingsState::new(preferences),
             clipboard: SystemClipboard::default(),
+            lan_controllers: None,
+            lan_controller_generation: 0,
+            controller_input_sequence: 0,
+            pending_controller_strikes: Vec::new(),
+            controller_input_drops: 0,
             invite_revealed: false,
             invite_copy_status: None,
             args,
@@ -907,7 +999,20 @@ impl App {
         let _ = self.library_load.poll();
         self.cancel_offline_preparation();
         let _ = self.offline_preparation.poll();
-        self.teardown_online()
+        self.pointer_surface = None;
+        self.pending_pointer_surface = None;
+        let online_result = self.teardown_online();
+        let controller_result = self
+            .lan_controllers
+            .take()
+            .map_or(Ok(()), LanControllers::shutdown_and_join);
+        match (online_result, controller_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(online), Err(controller)) => Err(anyhow!(
+                "{online}; LAN controller shutdown also failed: {controller}"
+            )),
+        }
     }
 
     pub fn handle_tick(&mut self) {
@@ -923,6 +1028,7 @@ impl App {
             .and_then(|()| self.poll_embedded_server_start())
             .and_then(|()| self.poll_online_bootstrap())
             .and_then(|()| self.poll_online_preparation())
+            .and_then(|()| self.drain_controller_inputs())
             .and_then(|()| match self.page {
                 Page::SongMenu | Page::LoadWarnings | Page::CourseMenu => self.tick_demo_preview(),
                 Page::Game => self.tick_game(),
@@ -930,6 +1036,7 @@ impl App {
                 Page::OnlineLobby => self.tick_online_lobby(),
                 Page::OnlineCourseSelect | Page::OnlineMatch => self.tick_online_match_phase(),
                 Page::ModeSelect
+                | Page::Controllers
                 | Page::Settings
                 | Page::OfflinePreparation
                 | Page::Result
@@ -962,6 +1069,7 @@ impl App {
         if let Err(error) = result {
             self.set_error_state(error);
         }
+        self.sync_controller_admission();
     }
 
     #[cfg(test)]
@@ -972,11 +1080,6 @@ impl App {
     pub fn handle_key_at(&mut self, key: KeyEvent, observed_at: Instant) {
         if self.should_quit {
             return;
-        }
-
-        if matches!(self.page, Page::Game | Page::LocalGame | Page::OnlineMatch) {
-            self.perf_meter
-                .record_input_dispatch(Instant::now().saturating_duration_since(observed_at));
         }
 
         if matches!(
@@ -991,8 +1094,10 @@ impl App {
             return;
         }
 
+        let previous_page = self.page;
         let result = match self.page {
             Page::ModeSelect => self.handle_mode_select_key(key),
+            Page::Controllers => self.handle_controller_setup_key(key),
             Page::Settings => self.handle_settings_key(key),
             Page::SongMenu => self.handle_song_menu_key(key),
             Page::LoadWarnings => self.handle_load_warnings_key(key),
@@ -1011,17 +1116,341 @@ impl App {
             Page::OnlineResult => self.handle_online_result_key(key),
         };
 
+        if self.page != previous_page {
+            self.invalidate_pointer_surface();
+        }
+
         if let Err(error) = result {
+            self.set_error_state(error);
+        }
+        self.sync_controller_admission();
+    }
+
+    pub(crate) fn set_pointer_surface(&mut self, surface: DrumSurfaceLayout) {
+        self.pending_pointer_surface = Some(surface);
+    }
+
+    pub(crate) fn commit_rendered_pointer_surface(&mut self) {
+        self.pointer_surface = self.pending_pointer_surface.take();
+    }
+
+    pub(crate) fn terminal_pointer_slot(&self) -> Option<ControllerSlot> {
+        self.controller_setup.pointer_slot
+    }
+
+    pub(crate) fn set_keyboard_repeat_capability(&mut self, distinguishable: bool) {
+        self.keyboard_repeat_is_distinguishable = distinguishable;
+    }
+
+    pub(crate) fn terminal_pointer_capture_requested(&self) -> bool {
+        self.pointer_surface.is_some_and(|surface| {
+            self.controller_setup.pointer_slot == Some(surface.slot)
+                && self.controller_active_slots().contains(surface.slot)
+        })
+    }
+
+    pub(crate) fn invalidate_pointer_surface(&mut self) {
+        self.pointer_surface = None;
+        self.pending_pointer_surface = None;
+    }
+
+    pub fn handle_pointer_at(&mut self, event: MouseEvent, observed_at: Instant) {
+        let Some(surface) = self.pointer_surface else {
+            return;
+        };
+        let Some(action) = surface.hit_test(event) else {
+            return;
+        };
+        let strike = ControllerStrike::local(
+            surface.slot,
+            ControllerSource::TerminalPointer,
+            action,
+            observed_at,
+        );
+        if let Err(error) = self.enqueue_controller_strike(strike) {
             self.set_error_state(error);
         }
     }
 
+    fn controller_active_slots(&self) -> ActiveControllerSlots {
+        if self.leave_confirmation.is_some() {
+            return ActiveControllerSlots::NONE;
+        }
+        match self.page {
+            Page::Controllers => ActiveControllerSlots::BOTH,
+            Page::Game
+                if self
+                    .game
+                    .as_ref()
+                    .is_some_and(|game| !game.paused && !self.auto_play) =>
+            {
+                ActiveControllerSlots::ONE
+            }
+            Page::LocalGame if self.local_game.as_ref().is_some_and(|game| !game.paused) => {
+                ActiveControllerSlots::BOTH
+            }
+            Page::OnlineMatch
+                if self.online.as_ref().is_some_and(|online| {
+                    online.phase() == crate::online_session::OnlinePhase::Playing
+                        && online.local_player_id().is_some()
+                }) =>
+            {
+                ActiveControllerSlots::ONE
+            }
+            _ => ActiveControllerSlots::NONE,
+        }
+    }
+
+    fn drain_controller_inputs(&mut self) -> Result<()> {
+        self.drain_controller_inputs_once().map(|_| ())
+    }
+
+    fn drain_controller_inputs_once(&mut self) -> Result<bool> {
+        let active_slots = self.controller_active_slots();
+        self.drain_controller_inputs_with_policy(active_slots, active_slots, true)
+    }
+
+    fn drain_controller_inputs_with_policy(
+        &mut self,
+        admission_slots: ActiveControllerSlots,
+        dispatch_slots: ActiveControllerSlots,
+        require_quiescent_snapshot: bool,
+    ) -> Result<bool> {
+        let ingress_is_stable = if let Some(controllers) = self.lan_controllers.as_mut() {
+            controllers.set_active_slots(admission_slots);
+            let before = require_quiescent_snapshot.then(|| controllers.ingress_snapshot());
+            let queued = controllers.drain_inputs(dispatch_slots);
+            let after = require_quiescent_snapshot.then(|| controllers.ingress_snapshot());
+            let now = Instant::now();
+            for strike in queued.strikes.into_iter().flatten() {
+                if strike.generation != Some(self.lan_controller_generation)
+                    || now.saturating_duration_since(strike.observed_at) > MAX_DISPATCH_AGE
+                    || !dispatch_slots.contains(strike.slot)
+                {
+                    continue;
+                }
+                self.enqueue_controller_strike(strike)?;
+            }
+            !queued.saturated
+                && match (before, after) {
+                    (Some(before), Some(after)) => after.is_stable_since(before),
+                    (None, None) => true,
+                    _ => unreachable!("snapshot policy is internally consistent"),
+                }
+        } else {
+            true
+        };
+        if !ingress_is_stable {
+            return Ok(false);
+        }
+
+        self.pending_controller_strikes.sort_by(|left, right| {
+            left.strike
+                .observed_at
+                .cmp(&right.strike.observed_at)
+                .then(left.ingress_sequence.cmp(&right.ingress_sequence))
+        });
+        let pending = std::mem::take(&mut self.pending_controller_strikes);
+        let dispatch_clock = ControllerDispatchClock {
+            sampled_at: Instant::now(),
+            song_seconds: self.audio.song_position_seconds(),
+        };
+        for queued in pending {
+            self.dispatch_controller_strike(queued.strike, dispatch_clock)?;
+        }
+        Ok(true)
+    }
+
+    fn flush_controller_inputs_before_state_change(&mut self) -> Result<()> {
+        let closing_slots = self.controller_active_slots();
+        while !self.drain_controller_inputs_with_policy(
+            ActiveControllerSlots::NONE,
+            closing_slots,
+            false,
+        )? {
+            // Admission is mutex-linearized as closed before the first drain,
+            // so only the fixed-capacity queues can remain. At most a bounded
+            // number of non-blocking passes is required.
+        }
+        Ok(())
+    }
+
+    fn sync_controller_admission(&self) {
+        if let Some(controllers) = &self.lan_controllers {
+            controllers.set_active_slots(self.controller_active_slots());
+        }
+    }
+
+    fn enqueue_controller_strike(&mut self, strike: ControllerStrike) -> Result<()> {
+        let ingress_sequence = self.controller_input_sequence;
+        self.controller_input_sequence = self
+            .controller_input_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("controller input sequence exhausted"))?;
+        if self.pending_controller_strikes.len() >= MAX_PENDING_CONTROLLER_STRIKES {
+            self.controller_input_drops = self.controller_input_drops.saturating_add(1);
+            return Ok(());
+        }
+        self.pending_controller_strikes
+            .push(QueuedControllerStrike {
+                ingress_sequence,
+                strike,
+            });
+        Ok(())
+    }
+
+    fn dispatch_controller_strike(
+        &mut self,
+        strike: ControllerStrike,
+        dispatch_clock: ControllerDispatchClock,
+    ) -> Result<()> {
+        self.perf_meter
+            .record_input_dispatch(Instant::now().saturating_duration_since(strike.observed_at));
+        match self.page {
+            Page::Controllers => {
+                self.controller_setup.last_test_action[strike.slot.index()] =
+                    Some((strike.action, Instant::now()));
+                self.play_taiko_se(strike.action.zone);
+            }
+            Page::Game
+                if strike.slot == ControllerSlot::One
+                    && self.leave_confirmation.is_none()
+                    && !self.auto_play
+                    && self.game.as_ref().is_some_and(|game| !game.paused) =>
+            {
+                let Some(last_tick) = self.game.as_ref().map(|game| game.last_tick) else {
+                    return Ok(());
+                };
+                let tick = chart_tick_from_audio_observation(
+                    dispatch_clock.song_seconds,
+                    dispatch_clock
+                        .sampled_at
+                        .saturating_duration_since(strike.observed_at)
+                        .as_secs_f64(),
+                    self.calibration_offset_ms,
+                    last_tick,
+                );
+                let accepted = self.game.as_mut().is_some_and(|game| {
+                    enqueue_offline_input(
+                        &mut game.pending_inputs,
+                        TimedInput {
+                            tick,
+                            action: strike.action,
+                        },
+                    )
+                });
+                if accepted {
+                    self.play_taiko_se(strike.action.zone);
+                }
+            }
+            Page::LocalGame
+                if self.leave_confirmation.is_none()
+                    && self.local_game.as_ref().is_some_and(|game| !game.paused) =>
+            {
+                let player = match strike.slot {
+                    ControllerSlot::One => LocalPlayerId::One,
+                    ControllerSlot::Two => LocalPlayerId::Two,
+                };
+                let last_tick = self.local_game.as_ref().map_or(0, |game| game.last_tick);
+                let tick = chart_tick_from_audio_observation(
+                    dispatch_clock.song_seconds,
+                    dispatch_clock
+                        .sampled_at
+                        .saturating_duration_since(strike.observed_at)
+                        .as_secs_f64(),
+                    self.calibration_offset_ms,
+                    last_tick,
+                );
+                let accepted = self.local_game.as_mut().is_some_and(|game| {
+                    game.queue_input(
+                        crate::local_multiplayer::LocalGameInput {
+                            player,
+                            hit: strike.action,
+                        },
+                        tick,
+                    )
+                });
+                if accepted {
+                    self.play_taiko_se(strike.action.zone);
+                }
+            }
+            Page::OnlineMatch
+                if strike.slot == ControllerSlot::One && self.leave_confirmation.is_none() =>
+            {
+                let Some(online) = self.online.as_mut() else {
+                    return Ok(());
+                };
+                if online.phase() != crate::online_session::OnlinePhase::Playing
+                    || online.local_player_id().is_none()
+                {
+                    return Ok(());
+                }
+                let tick = apply_calibration_to_tick(
+                    online.estimated_server_tick_at(strike.observed_at),
+                    self.calibration_offset_ms,
+                )
+                .max(0);
+                let wire_action = crate::online::to_drum_action(strike.action);
+                let Some(submitted) = online.submit_input(tick, wire_action)? else {
+                    return Ok(());
+                };
+                let tick = submitted.tick;
+                if let Some(runtime) = online.local_player.as_mut() {
+                    runtime.pending_inputs.push(TimedInput {
+                        tick,
+                        action: strike.action,
+                    });
+                    runtime.pending_inputs.sort_by_key(|input| input.tick);
+                }
+                self.play_taiko_se(strike.action.zone);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn controller_server_running(&self) -> bool {
+        self.lan_controllers.is_some()
+    }
+
+    pub(crate) fn controller_endpoint(&self) -> Option<String> {
+        self.lan_controllers.as_ref().map(LanControllers::endpoint)
+    }
+
+    pub(crate) fn controller_pairing_invite(&self, slot: ControllerSlot) -> Option<PairingInvite> {
+        self.lan_controllers
+            .as_ref()
+            .and_then(|controllers| controllers.pairing_invite(slot, self.ui_language()))
+    }
+
+    pub(crate) fn controller_slot_statuses(&self) -> [ControllerSlotStatus; 2] {
+        self.lan_controllers.as_ref().map_or(
+            [
+                ControllerSlotStatus {
+                    paired: false,
+                    connected: false,
+                    accepted_hits: 0,
+                    rejected_hits: 0,
+                },
+                ControllerSlotStatus {
+                    paired: false,
+                    connected: false,
+                    accepted_hits: 0,
+                    rejected_hits: 0,
+                },
+            ],
+            LanControllers::status,
+        )
+    }
+
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let size = frame.area();
-        if screen::terminal_is_too_small(self.page, size) {
+        self.pending_pointer_surface = None;
+        if screen::terminal_is_too_small_for_app(self, size) {
             screen::render_terminal_guard(self, frame, size);
             return;
         }
+        self.viewport_height = size.height;
         if size.width != self.viewport_width {
             self.viewport_width = size.width;
             if let Err(error) = self.refresh_vsync_scroll_speed() {
@@ -1037,21 +1466,34 @@ impl App {
 
         match self.page {
             Page::ModeSelect => screen::mode_select::render(self, frame, chunks[1]),
+            Page::Controllers => screen::controllers::render(self, frame, chunks[1]),
             Page::Settings => screen::settings::render(self, frame, chunks[1]),
             Page::SongMenu => screen::song_menu::render(self, frame, chunks[1]),
             Page::LoadWarnings => screen::load_warnings_screen::render(self, frame, chunks[1]),
             Page::CourseMenu => screen::course_menu::render(self, frame, chunks[1]),
             Page::OfflinePreparation => screen::offline_preparation::render(self, frame, chunks[1]),
-            Page::Game => screen::game_screen::render(self, frame, chunks[1]),
+            Page::Game => {
+                if let Some(surface) = screen::game_screen::render(self, frame, chunks[1]) {
+                    self.set_pointer_surface(surface);
+                }
+            }
             Page::Result => screen::result_screen::render(self, frame, chunks[1]),
             Page::LocalCourseSelect => screen::local_course::render(self, frame, chunks[1]),
-            Page::LocalGame => screen::local_game::render(self, frame, chunks[1]),
+            Page::LocalGame => {
+                if let Some(surface) = screen::local_game::render(self, frame, chunks[1]) {
+                    self.set_pointer_surface(surface);
+                }
+            }
             Page::LocalResult => screen::local_result::render(self, frame, chunks[1]),
             Page::Error => screen::error_screen::render(self, frame, chunks[1]),
             Page::MultiplayerConnect => screen::mp_connect::render(self, frame, chunks[1]),
             Page::OnlineLobby => screen::online_lobby::render(self, frame, chunks[1]),
             Page::OnlineCourseSelect => screen::online_course::render(self, frame, chunks[1]),
-            Page::OnlineMatch => screen::online_match::render(self, frame, chunks[1]),
+            Page::OnlineMatch => {
+                if let Some(surface) = screen::online_match::render(self, frame, chunks[1]) {
+                    self.set_pointer_surface(surface);
+                }
+            }
             Page::OnlineResult => screen::online_result::render(self, frame, chunks[1]),
         }
         if let Some(target) = self.leave_confirmation {
@@ -1118,6 +1560,19 @@ impl App {
         if matches!(
             key,
             KeyEvent {
+                code: KeyCode::Char('c' | 'C'),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        ) {
+            self.controller_setup.notice = None;
+            self.page = Page::Controllers;
+            return Ok(());
+        }
+
+        if matches!(
+            key,
+            KeyEvent {
                 code: KeyCode::Char('s' | 'S'),
                 modifiers,
                 ..
@@ -1163,6 +1618,292 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn handle_controller_setup_key(&mut self, key: KeyEvent) -> Result<()> {
+        let selected = self.controller_setup.selected_item();
+        if let Some(slot) = controller_item_slot(selected) {
+            if self.controller_setup.invite_revealed[slot.index()] {
+                match key {
+                    KeyEvent {
+                        code: KeyCode::Esc | KeyCode::Enter,
+                        ..
+                    } => {
+                        self.controller_setup.invite_revealed[slot.index()] = false;
+                        if matches!(key.code, KeyCode::Enter) {
+                            self.play_don_se()?;
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('c' | 'C'),
+                        modifiers,
+                        ..
+                    } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                        self.copy_controller_invite(slot);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('r' | 'R'),
+                        modifiers,
+                        ..
+                    } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                        self.rotate_controller_pairing(slot);
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+        }
+
+        if matches!(key.code, KeyCode::Esc) {
+            self.controller_setup.notice = None;
+            self.page = Page::ModeSelect;
+            return Ok(());
+        }
+
+        if selected == ControllerSetupItem::BindAddress {
+            match key.code {
+                KeyCode::Backspace => {
+                    if self.lan_controllers.is_some() {
+                        self.controller_setup.notice = Some((
+                            self.text(UiText::ControllerStopBeforeEditing).to_owned(),
+                            true,
+                        ));
+                    } else {
+                        pop_grapheme(&mut self.controller_setup.bind_ip);
+                        self.controller_setup.notice = None;
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && (character.is_ascii_hexdigit() || matches!(character, '.' | ':'))
+                        && self.controller_setup.bind_ip.len() < 45 =>
+                {
+                    if self.lan_controllers.is_some() {
+                        self.controller_setup.notice = Some((
+                            self.text(UiText::ControllerStopBeforeEditing).to_owned(),
+                            true,
+                        ));
+                    } else {
+                        self.controller_setup.bind_ip.push(character);
+                        self.controller_setup.notice = None;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('c' | 'C'),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        ) {
+            if let Some(slot) = controller_item_slot(selected) {
+                self.copy_controller_invite(slot);
+            }
+            return Ok(());
+        }
+
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('r' | 'R'),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        ) {
+            if let Some(slot) = controller_item_slot(selected) {
+                self.rotate_controller_pairing(slot);
+            }
+            return Ok(());
+        }
+
+        let Some(intent) = map_menu_intent(key) else {
+            return Ok(());
+        };
+        match intent {
+            MenuIntent::Quit | MenuIntent::Back => {
+                self.controller_setup.notice = None;
+                self.page = Page::ModeSelect;
+            }
+            MenuIntent::Up => {
+                self.controller_setup.selected = wrapped_selection(
+                    self.controller_setup.selected,
+                    ControllerSetupItem::ALL.len(),
+                    -1,
+                );
+                self.play_kat_se()?;
+            }
+            MenuIntent::Down => {
+                self.controller_setup.selected = wrapped_selection(
+                    self.controller_setup.selected,
+                    ControllerSetupItem::ALL.len(),
+                    1,
+                );
+                self.play_kat_se()?;
+            }
+            MenuIntent::Left | MenuIntent::Right
+                if selected == ControllerSetupItem::TerminalPointer =>
+            {
+                self.cycle_terminal_pointer(matches!(intent, MenuIntent::Right));
+                self.play_kat_se()?;
+            }
+            MenuIntent::Confirm => {
+                match selected {
+                    ControllerSetupItem::BindAddress => {}
+                    ControllerSetupItem::LanServer => self.toggle_lan_controller_server(),
+                    ControllerSetupItem::TerminalPointer => {
+                        self.cycle_terminal_pointer(true);
+                    }
+                    ControllerSetupItem::PlayerOne | ControllerSetupItem::PlayerTwo => {
+                        let slot = controller_item_slot(selected)
+                            .expect("player controller rows always map to a slot");
+                        let index = slot.index();
+                        if self.controller_pairing_invite(slot).is_some() {
+                            self.controller_setup.invite_revealed[index] = true;
+                        } else {
+                            self.controller_setup.notice = Some((
+                                self.text(UiText::ControllerNoUnusedInvite).to_owned(),
+                                true,
+                            ));
+                        }
+                    }
+                    ControllerSetupItem::Back => {
+                        self.controller_setup.notice = None;
+                        self.page = Page::ModeSelect;
+                    }
+                }
+                self.play_don_se()?;
+            }
+            MenuIntent::Left | MenuIntent::Right => {}
+        }
+        Ok(())
+    }
+
+    fn cycle_terminal_pointer(&mut self, forward: bool) {
+        self.controller_setup.pointer_slot = match (self.controller_setup.pointer_slot, forward) {
+            (None, true) | (Some(ControllerSlot::Two), false) => Some(ControllerSlot::One),
+            (Some(ControllerSlot::One), true) | (None, false) => Some(ControllerSlot::Two),
+            (Some(ControllerSlot::Two), true) | (Some(ControllerSlot::One), false) => None,
+        };
+        self.invalidate_pointer_surface();
+        self.controller_setup.notice = None;
+    }
+
+    fn toggle_lan_controller_server(&mut self) {
+        if let Some(controllers) = self.lan_controllers.take() {
+            let result = controllers.shutdown_and_join();
+            self.controller_setup.invite_revealed = [false; 2];
+            self.controller_setup.notice = Some(match result {
+                Ok(()) => (self.text(UiText::ControllerServerStopped).to_owned(), false),
+                Err(error) => (
+                    format!("{}: {error}", self.text(UiText::ControllerServerStopFailed)),
+                    true,
+                ),
+            });
+            return;
+        }
+
+        let bind_ip = match self.controller_setup.bind_ip.parse::<std::net::IpAddr>() {
+            Ok(bind_ip) if !bind_ip.is_unspecified() && !bind_ip.is_multicast() => bind_ip,
+            Ok(_) => {
+                self.controller_setup.notice = Some((
+                    self.text(UiText::ControllerBindMustBeExact).to_owned(),
+                    true,
+                ));
+                return;
+            }
+            Err(error) => {
+                self.controller_setup.notice = Some((
+                    format!(
+                        "{}: {error}",
+                        self.text(UiText::ControllerInvalidBindAddress)
+                    ),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        let Some(generation) = self.lan_controller_generation.checked_add(1) else {
+            self.controller_setup.notice = Some((
+                self.text(UiText::ControllerGenerationExhausted).to_owned(),
+                true,
+            ));
+            return;
+        };
+        match LanControllers::start(LanControllerConfig {
+            bind_ip,
+            generation,
+        }) {
+            Ok(controllers) => {
+                self.lan_controller_generation = generation;
+                self.lan_controllers = Some(controllers);
+                self.controller_setup.invite_revealed = [false; 2];
+                self.controller_setup.notice =
+                    Some((self.text(UiText::ControllerServerStarted).to_owned(), false));
+            }
+            Err(error) => {
+                self.controller_setup.notice = Some((
+                    format!(
+                        "{}: {error}",
+                        self.text(UiText::ControllerServerStartFailed)
+                    ),
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn copy_controller_invite(&mut self, slot: ControllerSlot) {
+        let Some(invite) = self.controller_pairing_invite(slot) else {
+            self.controller_setup.notice = Some((
+                self.text(UiText::ControllerInviteUnavailable).to_owned(),
+                true,
+            ));
+            return;
+        };
+        self.controller_setup.notice = Some(match self.clipboard.copy_text(invite.expose()) {
+            Ok(()) => (self.text(UiText::ControllerInviteCopied).to_owned(), false),
+            Err(error) => (
+                format!("{}: {error}", self.text(UiText::ControllerInviteCopyFailed)),
+                true,
+            ),
+        });
+    }
+
+    fn rotate_controller_pairing(&mut self, slot: ControllerSlot) {
+        let Some(controllers) = self.lan_controllers.as_ref() else {
+            self.controller_setup.notice = Some((
+                self.text(UiText::ControllerStartServerFirst).to_owned(),
+                true,
+            ));
+            return;
+        };
+        match controllers.rotate_pairing(slot) {
+            Ok(_) => {
+                self.controller_setup.invite_revealed[slot.index()] = false;
+                self.controller_setup.notice = Some((
+                    self.text(UiText::ControllerPairingRotated).to_owned(),
+                    false,
+                ));
+            }
+            Err(error) => {
+                self.controller_setup.notice = Some((
+                    format!(
+                        "{}: {error}",
+                        self.text(UiText::ControllerPairingRotateFailed)
+                    ),
+                    true,
+                ));
+            }
+        }
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1594,6 +2335,9 @@ impl App {
     }
 
     fn handle_game_key(&mut self, key: KeyEvent, observed_at: Instant) -> Result<()> {
+        if matches!(key.code, KeyCode::Esc) || is_game_pause_toggle_key(key) {
+            self.flush_controller_inputs_before_state_change()?;
+        }
         match leave_confirmation_action(self.leave_confirmation, LeaveTarget::SinglePlayer, key) {
             LeaveConfirmationAction::Open => {
                 self.leave_confirmation = Some(LeaveTarget::SinglePlayer);
@@ -1625,23 +2369,12 @@ impl App {
         let Some(action) = map_bound_game_hit(key, self.preferences.player_one) else {
             return Ok(());
         };
-
-        let Some(last_tick) = self.game.as_ref().map(|game| game.last_tick) else {
-            return Ok(());
-        };
-
-        let tick = self.current_chart_tick_at(last_tick, observed_at);
-        let accepted = self.game.as_mut().is_some_and(|game| {
-            enqueue_offline_input(&mut game.pending_inputs, TimedInput { tick, action })
-        });
-        if !accepted {
-            return Ok(());
-        }
-        match action.zone {
-            TaikoZone::Don => self.play_don_se()?,
-            TaikoZone::Kat => self.play_kat_se()?,
-        }
-        Ok(())
+        self.enqueue_controller_strike(ControllerStrike::local(
+            ControllerSlot::One,
+            ControllerSource::Keyboard,
+            action,
+            observed_at,
+        ))
     }
 
     fn toggle_game_pause(&mut self) -> Result<()> {
@@ -1739,6 +2472,9 @@ impl App {
     }
 
     fn handle_local_game_key(&mut self, key: KeyEvent, observed_at: Instant) -> Result<()> {
+        if matches!(key.code, KeyCode::Esc) || is_game_pause_toggle_key(key) {
+            self.flush_controller_inputs_before_state_change()?;
+        }
         match leave_confirmation_action(self.leave_confirmation, LeaveTarget::LocalTwoPlayer, key) {
             LeaveConfirmationAction::Open => {
                 self.leave_confirmation = Some(LeaveTarget::LocalTwoPlayer);
@@ -1772,20 +2508,16 @@ impl App {
         ) else {
             return Ok(());
         };
-        let last_tick = self.local_game.as_ref().map_or(0, |game| game.last_tick);
-        let tick = self.current_chart_tick_at(last_tick, observed_at);
-        let accepted = self
-            .local_game
-            .as_mut()
-            .is_some_and(|game| game.queue_input(input, tick));
-        if !accepted {
-            return Ok(());
-        }
-        match input.action().zone {
-            TaikoZone::Don => self.play_don_se()?,
-            TaikoZone::Kat => self.play_kat_se()?,
-        }
-        Ok(())
+        let slot = match input.player {
+            LocalPlayerId::One => ControllerSlot::One,
+            LocalPlayerId::Two => ControllerSlot::Two,
+        };
+        self.enqueue_controller_strike(ControllerStrike::local(
+            slot,
+            ControllerSource::Keyboard,
+            input.action(),
+            observed_at,
+        ))
     }
 
     fn handle_local_result_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -2968,6 +3700,9 @@ impl App {
     }
 
     fn handle_online_match_key(&mut self, key: KeyEvent, observed_at: Instant) -> Result<()> {
+        if matches!(key.code, KeyCode::Esc) {
+            self.flush_controller_inputs_before_state_change()?;
+        }
         match leave_confirmation_action(self.leave_confirmation, LeaveTarget::OnlineMatch, key) {
             LeaveConfirmationAction::Open => {
                 self.leave_confirmation = Some(LeaveTarget::OnlineMatch);
@@ -2987,32 +3722,15 @@ impl App {
             return Ok(());
         }
 
-        let player_bindings = self.preferences.player_one;
-        let Some(online) = &mut self.online else {
+        let Some(action) = map_bound_game_hit(key, self.preferences.player_one) else {
             return Ok(());
         };
-        if online.phase() != crate::online_session::OnlinePhase::Playing {
-            return Ok(());
-        }
-        if let Some(action) = map_bound_game_hit(key, player_bindings) {
-            let tick = apply_calibration_to_tick(
-                online.estimated_server_tick_at(observed_at),
-                self.calibration_offset_ms,
-            )
-            .max(0);
-            let wire_action = crate::online::to_drum_action(action);
-            if online.submit_input(tick, wire_action)?.is_none() {
-                return Ok(());
-            }
-            if let Some(runtime) = online.local_player.as_mut() {
-                runtime.pending_inputs.push(TimedInput { tick, action });
-                runtime.pending_inputs.sort_by_key(|i| i.tick);
-            }
-
-            self.play_taiko_se(action.zone);
-        }
-
-        Ok(())
+        self.enqueue_controller_strike(ControllerStrike::local(
+            ControllerSlot::One,
+            ControllerSource::Keyboard,
+            action,
+            observed_at,
+        ))
     }
 
     fn handle_online_result_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -4434,7 +5152,9 @@ fn push_bounded_utf8(target: &mut String, character: char, max_bytes: usize) -> 
 
 fn error_recovery_target(page: Page) -> ErrorRecoveryTarget {
     match page {
-        Page::ModeSelect | Page::Settings | Page::Error => ErrorRecoveryTarget::ModeSelect,
+        Page::ModeSelect | Page::Controllers | Page::Settings | Page::Error => {
+            ErrorRecoveryTarget::ModeSelect
+        }
         Page::SongMenu | Page::LoadWarnings => ErrorRecoveryTarget::SongMenu,
         Page::CourseMenu | Page::OfflinePreparation | Page::Game | Page::Result => {
             ErrorRecoveryTarget::CourseMenu
@@ -4461,6 +5181,7 @@ fn player_error_summary(page: Page) -> UiText {
         | Page::OnlineResult => UiText::OnlineSessionInterrupted,
         Page::Settings => UiText::PlayerSettingsCouldNotBeApplied,
         Page::ModeSelect
+        | Page::Controllers
         | Page::SongMenu
         | Page::LoadWarnings
         | Page::CourseMenu
@@ -4512,6 +5233,17 @@ fn wrapped_selection(current: usize, len: usize, delta: isize) -> usize {
     current
         .checked_add_signed(delta)
         .map_or_else(|| len - 1, |next| next % len)
+}
+
+fn controller_item_slot(item: ControllerSetupItem) -> Option<ControllerSlot> {
+    match item {
+        ControllerSetupItem::PlayerOne => Some(ControllerSlot::One),
+        ControllerSetupItem::PlayerTwo => Some(ControllerSlot::Two),
+        ControllerSetupItem::BindAddress
+        | ControllerSetupItem::LanServer
+        | ControllerSetupItem::TerminalPointer
+        | ControllerSetupItem::Back => None,
+    }
 }
 
 fn online_result_control_allowed(
@@ -5033,7 +5765,9 @@ pub(crate) fn build_autoplay_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use rhythm_chart::{
@@ -5276,12 +6010,28 @@ mod tests {
         terminal
             .draw(|frame| app.render(frame))
             .expect("render app");
+        app.commit_rendered_pointer_surface();
         terminal
             .backend()
             .buffer()
             .content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn render_styles_at(app: &mut App, width: u16, height: u16) -> Vec<ratatui::style::Style> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render app");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::style)
             .collect()
     }
 
@@ -5496,6 +6246,508 @@ mod tests {
         assert_eq!(GameMode::ALL[2], GameMode::OnlineMultiplayer);
         assert_eq!(wrapped_selection(0, GameMode::ALL.len(), -1), 2);
         assert_eq!(wrapped_selection(2, GameMode::ALL.len(), 1), 0);
+    }
+
+    #[test]
+    fn controller_setup_is_reachable_in_game_and_assigns_the_terminal_pointer() {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.page, Page::Controllers);
+        let rendered = render_text(&mut app);
+        assert!(rendered.contains("Controller Setup"));
+        assert!(rendered.contains("Trusted LAN only"));
+        assert!(rendered.contains("Terminal pointer"));
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.controller_setup.selected_item(),
+            ControllerSetupItem::TerminalPointer
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.controller_setup.pointer_slot, Some(ControllerSlot::One));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.controller_setup.pointer_slot, Some(ControllerSlot::Two));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.controller_setup.pointer_slot, None);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.page, Page::ModeSelect);
+    }
+
+    #[test]
+    fn controller_setup_is_responsive_at_minimum_width_in_all_languages() {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.page = Page::Controllers;
+        app.controller_setup.bind_ip = "2001:db8:1234:5678:9abc:def0:1234:5678".to_owned();
+        app.controller_setup.pointer_slot = Some(ControllerSlot::One);
+        app.controller_setup.notice = Some(("VISIBLE-CONTROLLER-NOTICE".to_owned(), false));
+
+        for language in UiLanguage::ALL {
+            app.preferences.ui_language = language;
+            let rendered = render_text_at(&mut app, 80, 24);
+            assert!(!rendered.contains(app.text(UiText::TerminalTooSmall)));
+            assert!(rendered.contains("2001:db8:1234:5678:9abc:def0:1234:5678"));
+            assert!(rendered.contains("VISIBLE-CONTROLLER-NOTICE"));
+        }
+    }
+
+    #[test]
+    fn loopback_controller_bind_is_explicitly_local_only_in_every_language() {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.page = Page::Controllers;
+        app.controller_setup.bind_ip = std::net::Ipv4Addr::LOCALHOST.to_string();
+
+        for (language, visible_prefix) in UiLanguage::ALL.into_iter().zip([
+            "127.0.0.1 is local-only",
+            "127.0.0.1 只能在本機使用",
+            "127.0.0.1 はこの端末専用",
+        ]) {
+            app.preferences.ui_language = language;
+            let rendered = render_text_at(&mut app, 80, 24);
+            assert!(
+                rendered_text_contains(&rendered, visible_prefix),
+                "missing loopback-only warning for {language:?}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_setup_manages_real_pairing_without_exposing_hidden_tokens() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.controller_setup.bind_ip = std::net::Ipv4Addr::LOCALHOST.to_string();
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.controller_setup.selected_item(),
+            ControllerSetupItem::LanServer
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.controller_server_running());
+        let first_p1 = app
+            .controller_pairing_invite(ControllerSlot::One)
+            .context("P1 pairing invite")?;
+        let p2 = app
+            .controller_pairing_invite(ControllerSlot::Two)
+            .context("P2 pairing invite")?;
+        assert_ne!(first_p1.expose(), p2.expose());
+        let first_p1_token = first_p1
+            .expose()
+            .split_once("#token=")
+            .expect("P1 pairing URL fragment")
+            .1
+            .to_owned();
+        let p2_token = p2
+            .expose()
+            .split_once("#token=")
+            .expect("P2 pairing URL fragment")
+            .1
+            .to_owned();
+        let token_is_visible =
+            |rendered: &str, token: &str| rendered.replace(' ', "").contains(token);
+        let hidden = render_text(&mut app);
+        assert!(!token_is_visible(&hidden, &first_p1_token));
+        assert!(!token_is_visible(&hidden, &p2_token));
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.controller_setup.selected_item(),
+            ControllerSetupItem::PlayerOne
+        );
+        let still_hidden = render_text(&mut app);
+        assert!(still_hidden.contains("[hidden"));
+        assert!(!token_is_visible(&still_hidden, &first_p1_token));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.controller_setup.invite_revealed[ControllerSlot::One.index()]);
+        assert!(app.controller_pairing_invite(ControllerSlot::One).is_some());
+        let revealed = render_text_at(&mut app, 180, 50);
+        assert!(rendered_text_contains(
+            &revealed,
+            app.text(UiText::ControllerPairingQr)
+        ));
+        assert!(!token_is_visible(&revealed, &first_p1_token));
+        let qr_styles = render_styles_at(&mut app, 180, 50);
+        assert!(
+            qr_styles
+                .iter()
+                .filter(|style| style.bg == Some(ratatui::style::Color::White))
+                .count()
+                > 100
+        );
+        assert!(qr_styles.iter().any(|style| {
+            style.fg == Some(ratatui::style::Color::Black)
+                && style.bg == Some(ratatui::style::Color::White)
+        }));
+
+        app.handle_key(key(KeyCode::Char('r')));
+        let replacement = app
+            .controller_pairing_invite(ControllerSlot::One)
+            .context("rotated P1 pairing invite")?;
+        assert_ne!(replacement.expose(), first_p1.expose());
+        let replacement_token = replacement
+            .expose()
+            .split_once("#token=")
+            .expect("rotated pairing URL fragment")
+            .1
+            .to_owned();
+        let rotated_hidden = render_text(&mut app);
+        assert!(!token_is_visible(&rotated_hidden, &replacement_token));
+        assert!(!token_is_visible(&rotated_hidden, &first_p1_token));
+
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.controller_server_running());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_pointer_surface_preserves_all_four_single_player_actions() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.controller_setup.pointer_slot = Some(ControllerSlot::One);
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+        let _ = render_text(&mut app);
+        let surface = app.pointer_surface.context("rendered pointer surface")?;
+
+        for area in surface.pad_areas() {
+            app.handle_pointer_at(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x + area.width / 2,
+                    row: area.y + area.height / 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+        }
+        app.drain_controller_inputs()?;
+
+        let actions = app
+            .game
+            .as_ref()
+            .context("single-player session")?
+            .pending_inputs
+            .iter()
+            .map(|input| input.action)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                TaikoAction::LEFT_KAT,
+                TaikoAction::LEFT_DON,
+                TaikoAction::RIGHT_DON,
+                TaikoAction::RIGHT_KAT,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn controller_setup_is_a_live_non_scoring_four_pad_diagnostic() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.handle_key(key(KeyCode::Char('c')));
+        app.controller_setup.pointer_slot = Some(ControllerSlot::One);
+        let _ = render_text(&mut app);
+        let surface = app.pointer_surface.context("controller test surface")?;
+
+        for area in surface.pad_areas() {
+            app.handle_pointer_at(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x + area.width / 2,
+                    row: area.y + area.height / 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Instant::now(),
+            );
+        }
+        app.drain_controller_inputs()?;
+
+        assert_eq!(app.page, Page::Controllers);
+        assert!(app.game.is_none());
+        assert!(app.local_game.is_none());
+        assert!(app.online.is_none());
+        assert_eq!(
+            app.controller_setup.last_test_action[ControllerSlot::One.index()]
+                .map(|(action, _)| action),
+            Some(TaikoAction::RIGHT_KAT)
+        );
+        assert!(app.controller_setup.last_test_action[ControllerSlot::Two.index()].is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_controller_sources_dispatch_by_observation_time_exactly_once() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+        app.audio.seek_song(1.0)?;
+
+        let now = Instant::now();
+        let older = now - Duration::from_millis(20);
+        let newer = now - Duration::from_millis(5);
+        app.enqueue_controller_strike(ControllerStrike::local(
+            ControllerSlot::One,
+            ControllerSource::Keyboard,
+            TaikoAction::RIGHT_KAT,
+            newer,
+        ))?;
+        app.enqueue_controller_strike(ControllerStrike::lan(
+            ControllerSlot::One,
+            7,
+            TaikoAction::LEFT_DON,
+            older,
+            1,
+            app.lan_controller_generation,
+        ))?;
+        app.drain_controller_inputs()?;
+
+        let pending = &app
+            .game
+            .as_ref()
+            .context("single-player game")?
+            .pending_inputs;
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].action, TaikoAction::LEFT_DON);
+        assert_eq!(pending[1].action, TaikoAction::RIGHT_KAT);
+        assert!(pending[0].tick <= pending[1].tick);
+        Ok(())
+    }
+
+    #[test]
+    fn simultaneous_keyboard_strikes_share_one_audio_clock_sample_and_tick() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+        app.audio.seek_song(1.0)?;
+
+        let observed_at = Instant::now() - Duration::from_millis(5);
+        app.handle_game_key(key(KeyCode::Char('s')), observed_at)?;
+        app.handle_game_key(key(KeyCode::Char('d')), observed_at)?;
+        app.drain_controller_inputs()?;
+
+        let pending = &app
+            .game
+            .as_ref()
+            .context("single-player game")?
+            .pending_inputs;
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].tick, pending[1].tick);
+        assert_eq!(pending[0].action, TaikoAction::LEFT_DON);
+        assert_eq!(pending[1].action, TaikoAction::RIGHT_DON);
+        Ok(())
+    }
+
+    #[test]
+    fn controller_ingress_is_bounded_and_accounts_for_overflow() -> Result<()> {
+        let mut app = test_app(
+            "unused".into(),
+            SongLibrary {
+                songs: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        for sequence in 0..MAX_PENDING_CONTROLLER_STRIKES + 17 {
+            app.enqueue_controller_strike(ControllerStrike::local(
+                ControllerSlot::One,
+                ControllerSource::Keyboard,
+                TaikoAction::LEFT_DON,
+                Instant::now() + Duration::from_nanos(sequence as u64),
+            ))?;
+        }
+        assert_eq!(
+            app.pending_controller_strikes.len(),
+            MAX_PENDING_CONTROLLER_STRIKES
+        );
+        assert_eq!(app.controller_input_drops, 17);
+        Ok(())
+    }
+
+    #[test]
+    fn gameplay_state_changes_flush_earlier_physical_hits() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+
+        app.handle_game_key(key(KeyCode::Char('s')), Instant::now())?;
+        app.handle_game_key(key(KeyCode::Char('p')), Instant::now())?;
+        let game = app.game.as_ref().context("paused game")?;
+        assert!(game.paused);
+        assert_eq!(game.pending_inputs.len(), 1);
+
+        app.handle_game_key(key(KeyCode::Char('p')), Instant::now())?;
+        app.handle_game_key(key(KeyCode::Char('s')), Instant::now())?;
+        app.handle_game_key(key(KeyCode::Esc), Instant::now())?;
+        let game = app.game.as_ref().context("leave-confirmation game")?;
+        assert!(!game.paused);
+        assert_eq!(game.pending_inputs.len(), 2);
+        assert_eq!(app.leave_confirmation, Some(LeaveTarget::SinglePlayer));
+        Ok(())
+    }
+
+    #[test]
+    fn gameplay_state_barrier_closes_admission_before_ignoring_newer_frames() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        wait_for_page(&mut app, Page::Game)?;
+        app.lan_controller_generation = 1;
+        app.lan_controllers = Some(LanControllers::start(LanControllerConfig {
+            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            generation: 1,
+        })?);
+
+        let guard = app
+            .lan_controllers
+            .as_ref()
+            .context("LAN controllers")?
+            .begin_test_in_flight_frame();
+        app.handle_game_key(key(KeyCode::Char('s')), Instant::now())?;
+        app.handle_game_key(key(KeyCode::Char('p')), Instant::now())?;
+
+        let game = app.game.as_ref().context("paused game")?;
+        assert!(game.paused);
+        assert_eq!(game.pending_inputs.len(), 1);
+        assert!(!app
+            .lan_controllers
+            .as_ref()
+            .context("LAN controllers")?
+            .test_slot_is_active(ControllerSlot::One));
+        drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_pointer_assignment_routes_only_to_the_selected_local_player() -> Result<()> {
+        let fixture = LocalUiFixture::create()?;
+        let backend = ResourceBackend::local(fixture.path.clone());
+        let library = backend.load_song_library()?;
+        let mut app = App::with_resources_and_audio(
+            test_args(fixture.path.clone()),
+            backend,
+            library,
+            Box::<TestGameAudio>::default(),
+        )?;
+        app.controller_setup.pointer_slot = Some(ControllerSlot::Two);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Char('j')));
+        wait_for_page(&mut app, Page::LocalGame)?;
+        let undersized_pointer_view = render_text_at(&mut app, 80, 27);
+        assert!(undersized_pointer_view.contains("Required: at least 80 × 30"));
+        let _ = render_text(&mut app);
+        let surface = app.pointer_surface.context("P2 pointer surface")?;
+        assert_eq!(surface.slot, ControllerSlot::Two);
+        let right_kat = surface.pad_areas()[3];
+        app.handle_pointer_at(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: right_kat.x + right_kat.width / 2,
+                row: right_kat.y + right_kat.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            Instant::now(),
+        );
+        app.drain_controller_inputs()?;
+
+        let game = app.local_game.as_ref().context("local session")?;
+        assert!(game.players[LocalPlayerId::One.index()]
+            .pending_inputs
+            .is_empty());
+        assert_eq!(
+            game.players[LocalPlayerId::Two.index()]
+                .pending_inputs
+                .iter()
+                .map(|input| input.action)
+                .collect::<Vec<_>>(),
+            vec![TaikoAction::RIGHT_KAT]
+        );
+        Ok(())
     }
 
     #[test]
@@ -5786,6 +7038,7 @@ mod tests {
             "KEEP THE RHYTHM",
             "DON",
             "KAT",
+            "KEY HOLD-REPEAT IS UNSAFE HERE",
         ] {
             assert!(
                 hud.contains(player_facing_label),
@@ -5813,6 +7066,7 @@ mod tests {
         for _ in 0..64 {
             app.handle_game_key(key(KeyCode::Char('s')), observed_at)?;
         }
+        app.drain_controller_inputs()?;
         let pending = &app
             .game
             .as_ref()
@@ -5917,6 +7171,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('s')));
         app.handle_key(key(KeyCode::Char('k')));
+        app.drain_controller_inputs()?;
         let game = app.local_game.as_ref().context("local game session")?;
         assert_eq!(
             game.players[LocalPlayerId::One.index()]
@@ -5937,6 +7192,7 @@ mod tests {
         assert!(game_text.contains("F=RIGHT KAT"));
         assert!(game_text.contains("J=LEFT KAT"));
         assert!(game_text.contains(";=RIGHT KAT"));
+        assert!(game_text.contains("KEY HOLD-REPEAT IS UNSAFE HERE"));
         assert!(!game_text.contains("Shared clock"));
         assert!(!game_text.contains("Offset"));
         Ok(())

@@ -32,6 +32,14 @@ impl UiLanguage {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 3] = [Self::English, Self::TraditionalChinese, Self::Japanese];
 
+    pub(crate) const fn web_language_tag(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::TraditionalChinese => "zh-Hant",
+            Self::Japanese => "ja",
+        }
+    }
+
     pub(crate) fn cycle(self, delta: i32) -> Self {
         if delta > 0 {
             match self {

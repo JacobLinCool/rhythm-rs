@@ -258,6 +258,12 @@ struct PendingCommand {
     sent: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmittedInput {
+    pub(crate) seq: InputSeq,
+    pub(crate) tick: taiko_multiplayer_protocol::Tick,
+}
+
 pub(crate) struct OnlineDomain {
     network: NetworkClient,
     config: OnlineClientConfig,
@@ -282,6 +288,7 @@ pub(crate) struct OnlineDomain {
     pending_commands: BTreeMap<CommandSeq, PendingCommand>,
     last_command_flush_us: Option<u64>,
     next_input_seq: InputSeq,
+    last_submitted_input_tick: Option<taiko_multiplayer_protocol::Tick>,
     last_input_ack: Option<InputSeq>,
     pending_inputs: BTreeMap<InputSeq, InputEvent>,
     highest_sent_input: Option<InputSeq>,
@@ -331,6 +338,7 @@ impl OnlineDomain {
             pending_commands: BTreeMap::new(),
             last_command_flush_us: None,
             next_input_seq: FIRST_INPUT_SEQ,
+            last_submitted_input_tick: None,
             last_input_ack: None,
             pending_inputs: BTreeMap::new(),
             highest_sent_input: None,
@@ -1063,6 +1071,7 @@ impl OnlineDomain {
         self.last_live_epoch = None;
         self.pending_inputs.clear();
         self.next_input_seq = FIRST_INPUT_SEQ;
+        self.last_submitted_input_tick = None;
         self.last_input_ack = None;
         self.highest_sent_input = None;
         self.last_input_flush_us = None;
@@ -1493,7 +1502,7 @@ impl OnlineDomain {
         &mut self,
         tick: taiko_multiplayer_protocol::Tick,
         action: DrumAction,
-    ) -> Result<Option<InputSeq>> {
+    ) -> Result<Option<SubmittedInput>> {
         if self.role() != Some(RoomRole::Player) {
             bail!("spectators cannot submit gameplay input");
         }
@@ -1514,10 +1523,23 @@ impl OnlineDomain {
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("input sequence exhausted"))?,
         );
-        self.pending_inputs
-            .insert(seq, InputEvent { seq, tick, action });
+        let effective_tick = self
+            .last_submitted_input_tick
+            .map_or(tick, |previous| tick.max(previous));
+        self.last_submitted_input_tick = Some(effective_tick);
+        self.pending_inputs.insert(
+            seq,
+            InputEvent {
+                seq,
+                tick: effective_tick,
+                action,
+            },
+        );
         self.flush_new_inputs(self.local_now_us());
-        Ok(Some(seq))
+        Ok(Some(SubmittedInput {
+            seq,
+            tick: effective_tick,
+        }))
     }
 
     pub(crate) fn preparation_proof(&self, prepared: &PreparedMatch) -> Result<PreparationProof> {
@@ -3239,7 +3261,8 @@ mod tests {
         assert_eq!(
             domain
                 .submit_input(110, DrumAction::LEFT_DON)
-                .expect("old match input"),
+                .expect("old match input")
+                .map(|submitted| submitted.seq),
             Some(FIRST_INPUT_SEQ)
         );
         domain.handle_input_ack(InputAck {
@@ -3253,7 +3276,8 @@ mod tests {
         assert_eq!(
             domain
                 .submit_input(120, DrumAction::RIGHT_KAT)
-                .expect("unacknowledged old match input"),
+                .expect("unacknowledged old match input")
+                .map(|submitted| submitted.seq),
             Some(InputSeq(2))
         );
         assert!(domain.pending_inputs.contains_key(&InputSeq(2)));
@@ -3557,7 +3581,8 @@ mod tests {
         assert_eq!(
             domain
                 .submit_input(10, DrumAction::LEFT_DON)
-                .expect("first input"),
+                .expect("first input")
+                .map(|submitted| submitted.seq),
             Some(FIRST_INPUT_SEQ)
         );
         match peer.try_recv_message().expect("first input batch") {
@@ -3607,6 +3632,45 @@ mod tests {
     }
 
     #[test]
+    fn submitted_input_ticks_are_monotonic_within_each_match_epoch() {
+        let (mut domain, mut peer) = domain();
+        establish(&mut domain, &mut peer);
+        domain.active_match_id = Some(MatchId(7));
+        domain.phase = OnlinePhase::Playing;
+
+        let first = domain
+            .submit_input(20, DrumAction::LEFT_DON)
+            .expect("first input")
+            .expect("accepted first input");
+        assert_eq!(first.tick, 20);
+        let first_batch = match peer.try_recv_message().expect("first input batch") {
+            ClientMessage::Input(batch) => batch,
+            other => panic!("unexpected message: {other:?}"),
+        };
+        assert_eq!(first_batch.events[0].tick, 20);
+
+        let clamped = domain
+            .submit_input(19, DrumAction::RIGHT_KAT)
+            .expect("clock-slew input")
+            .expect("accepted clock-slew input");
+        assert_eq!(clamped.tick, 20);
+        let second_batch = match peer.try_recv_message().expect("second input batch") {
+            ClientMessage::Input(batch) => batch,
+            other => panic!("unexpected message: {other:?}"),
+        };
+        assert_eq!(second_batch.events[0].tick, 20);
+        assert_eq!(second_batch.events[0].seq, InputSeq(2));
+
+        domain.reset_match_epoch(Some(MatchId(8)));
+        domain.phase = OnlinePhase::Playing;
+        let next_match = domain
+            .submit_input(3, DrumAction::RIGHT_DON)
+            .expect("next match input")
+            .expect("accepted next match input");
+        assert_eq!(next_match.tick, 3);
+    }
+
+    #[test]
     fn submit_input_preserves_all_four_physical_actions_on_the_wire() {
         let (mut domain, mut peer) = domain();
         establish(&mut domain, &mut peer);
@@ -3626,7 +3690,8 @@ mod tests {
             assert_eq!(
                 domain
                     .submit_input((index as i64 + 1) * 10, action)
-                    .expect("input"),
+                    .expect("input")
+                    .map(|submitted| submitted.seq),
                 Some(seq)
             );
             match peer.try_recv_message().expect("input batch") {

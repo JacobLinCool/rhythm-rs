@@ -1,3 +1,4 @@
+pub mod controllers;
 pub mod course_menu;
 pub mod error_screen;
 pub mod game_screen;
@@ -25,6 +26,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{App, LeaveTarget, Page};
+use crate::controller::ControllerSlot;
+use crate::drum_surface::{DrumSurfaceLabels, DrumSurfaceLayout, DrumSurfaceView};
 use crate::localization::{truncate_to_width, UiMessage, UiText};
 use crate::tui::Frame;
 
@@ -34,6 +37,7 @@ const GAUGE_FIXED_COLUMNS: usize = 24;
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 24;
 pub(crate) const MIN_LOCAL_GAME_HEIGHT: u16 = 27;
+pub(crate) const MIN_LOCAL_GAME_POINTER_HEIGHT: u16 = 30;
 
 pub(crate) const fn minimum_terminal_size(page: Page) -> (u16, u16) {
     let height = match page {
@@ -48,8 +52,24 @@ pub(crate) const fn terminal_is_too_small(page: Page, area: Rect) -> bool {
     area.width < required_width || area.height < required_height
 }
 
+pub(crate) fn minimum_terminal_size_for_app(app: &App) -> (u16, u16) {
+    if app.page == Page::LocalGame && app.terminal_pointer_slot().is_some() {
+        (MIN_TERMINAL_WIDTH, MIN_LOCAL_GAME_POINTER_HEIGHT)
+    } else {
+        minimum_terminal_size(app.page)
+    }
+}
+
+pub(crate) fn terminal_is_too_small_for_app(app: &App, area: Rect) -> bool {
+    if app.page == Page::LocalGame && app.terminal_pointer_slot().is_some() {
+        area.width < MIN_TERMINAL_WIDTH || area.height < MIN_LOCAL_GAME_POINTER_HEIGHT
+    } else {
+        terminal_is_too_small(app.page, area)
+    }
+}
+
 pub(crate) fn render_terminal_guard(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let (required_width, required_height) = minimum_terminal_size(app.page);
+    let (required_width, required_height) = minimum_terminal_size_for_app(app);
     let message = vec![
         Line::from(Span::styled(
             app.text(UiText::TerminalTooSmall),
@@ -148,6 +168,11 @@ pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Page::ModeSelect => (
             app.text(UiText::TopModeSelect).to_owned(),
             app.text(UiText::TopModeSelectHelp).to_owned(),
+            app.theme.metadata,
+        ),
+        Page::Controllers => (
+            app.text(UiText::TopControllers).to_owned(),
+            app.text(UiText::TopControllersHelp).to_owned(),
             app.theme.metadata,
         ),
         Page::Settings => (
@@ -336,6 +361,56 @@ pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(Line::from(Span::styled(right, right_style))).right_aligned(),
         chunks[1],
     );
+}
+
+pub(crate) fn render_terminal_drum_surface(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    slot: ControllerSlot,
+    active_action: Option<rhythm_mode_taiko::TaikoAction>,
+) -> Option<DrumSurfaceLayout> {
+    let layout = DrumSurfaceLayout::new(area, slot)?;
+    let (player, bindings) = match slot {
+        ControllerSlot::One => ("P1", app.preferences.player_one),
+        ControllerSlot::Two => ("P2", app.preferences.player_two),
+    };
+    let label = |key: char, name: &'static str, style| {
+        Line::from(vec![
+            Span::styled(
+                format!("{player} {}=", key.to_ascii_uppercase()),
+                app.theme.title,
+            ),
+            Span::styled(name.to_uppercase(), style),
+        ])
+    };
+    let labels = DrumSurfaceLabels::new(
+        label(
+            bindings.left_kat,
+            app.text(UiText::BindingLeftKat),
+            app.theme.lane_note_kat,
+        ),
+        label(
+            bindings.left_don,
+            app.text(UiText::BindingLeftDon),
+            app.theme.lane_note_don,
+        ),
+        label(
+            bindings.right_don,
+            app.text(UiText::BindingRightDon),
+            app.theme.lane_note_don,
+        ),
+        label(
+            bindings.right_kat,
+            app.text(UiText::BindingRightKat),
+            app.theme.lane_note_kat,
+        ),
+    );
+    layout.render(
+        frame,
+        DrumSurfaceView::new(labels, app.theme.border, app.theme.selection, active_action),
+    );
+    Some(layout)
 }
 
 fn binding_summary(bindings: crate::preferences::DrumBindings) -> String {
