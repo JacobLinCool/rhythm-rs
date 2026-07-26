@@ -2,9 +2,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use rhythm_chart::{format_accuracy_threshold, BranchDecisionHint};
 
 use crate::app::{App, CourseSettingFocus};
+use crate::localization::{truncate_to_width, UiMessage, UiText};
 use crate::tui::Frame;
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -14,8 +14,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .split(area);
 
     let Some(song) = app.selected_song() else {
-        let empty = Paragraph::new(line_value(app, "No selected song"))
-            .block(themed_block(app, "Course Menu"))
+        let empty = Paragraph::new(line_value(app, app.text(UiText::NoSelectedSong)))
+            .block(themed_block(app, app.text(UiText::CourseMenu)))
             .style(app.theme.text_primary);
         frame.render_widget(empty, area);
         return;
@@ -28,24 +28,21 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             let level = course
                 .level
                 .map_or_else(|| "?".to_owned(), |v| v.to_string());
+            let entry = app.localizer().message(UiMessage::CourseListEntry {
+                index: course.index + 1,
+                name: &course.name,
+                level: &level,
+                objects: course.object_count,
+            });
             ListItem::new(Line::from(Span::styled(
-                format!(
-                    "{:>2}. {:<12} Lv {}  notes={}",
-                    course.index + 1,
-                    course.name,
-                    level,
-                    course.object_count
-                ),
+                truncate_to_width(&entry, usize::from(chunks[0].width.saturating_sub(5))),
                 app.theme.text_primary,
             )))
         })
         .collect::<Vec<_>>();
 
     let list = List::new(items)
-        .block(themed_block(
-            app,
-            "Course Menu (Enter/Don to start, Esc to back)",
-        ))
+        .block(themed_block(app, app.text(UiText::CourseMenuTitle)))
         .highlight_style(app.theme.selection)
         .highlight_symbol(">> ");
 
@@ -54,99 +51,81 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let mut lines = vec![
-        kv_line(app, "Song", song.title.clone()),
-        kv_line(app, "Subtitle", song.subtitle.clone()),
-        kv_line(app, "Artist", song.artist.clone()),
+        kv_line(app, app.text(UiText::Song), song.title.clone()),
+        kv_line(app, app.text(UiText::Subtitle), song.subtitle.clone()),
+        kv_line(app, app.text(UiText::Artist), song.artist.clone()),
         line_value(app, ""),
-        line_value(app, "Settings (Tab/Shift+Tab focus, Left/Right adjust):"),
+        line_value(app, app.text(UiText::CourseSettingsHelp)),
         setting_line(
             app,
-            "Auto Play",
+            app.text(UiText::AutoPlaySetting),
             if app.auto_play {
-                "ON".to_owned()
+                app.text(UiText::On).to_owned()
             } else {
-                "OFF".to_owned()
+                app.text(UiText::Off).to_owned()
             },
             CourseSettingFocus::AutoPlay,
         ),
         setting_line(
             app,
-            "Music Volume",
+            app.text(UiText::MusicVolume),
             format!("{}%", app.args.songvol),
             CourseSettingFocus::SongVolume,
         ),
         setting_line(
             app,
-            "SE Volume",
+            app.text(UiText::SeVolume),
             format!("{}%", app.args.sevol),
             CourseSettingFocus::SeVolume,
         ),
         setting_line(
             app,
-            "Note Offset",
-            app.note_offset_label(),
-            CourseSettingFocus::NoteOffset,
+            app.text(UiText::Calibration),
+            app.calibration_offset_label(),
+            CourseSettingFocus::CalibrationOffset,
         ),
         setting_line(
             app,
-            "Music Offset",
-            app.music_offset_label(),
-            CourseSettingFocus::MusicOffset,
-        ),
-        setting_line(
-            app,
-            "Scroll Speed",
+            app.text(UiText::ScrollSpeed),
             app.scroll_speed_label(),
             CourseSettingFocus::ScrollSpeed,
         ),
         Line::from(vec![
-            Span::styled("Total Offset: ", app.theme.label),
-            Span::styled(app.total_offset_label(), app.theme.value),
-        ]),
-        Line::from(vec![
-            Span::styled("Tip: ", app.theme.label),
-            Span::styled(
-                "Tab focus setting, Left/Right adjust (5ms step, ±500ms), Up/Down select course",
-                app.theme.metadata,
-            ),
+            Span::styled(format!("{}: ", app.text(UiText::Tip)), app.theme.label),
+            Span::styled(app.text(UiText::CourseSettingsTip), app.theme.metadata),
         ]),
         line_value(app, ""),
     ];
 
     if let Some(course) = app.selected_course() {
-        lines.push(kv_line(app, "Selected", course.name.clone()));
-        lines.push(kv_line(app, "Objects", course.object_count.to_string()));
+        let stars = course
+            .level
+            .map_or_else(|| "?".to_owned(), |level| level.to_string());
         lines.push(kv_line(
             app,
-            "Branch Segments",
-            course.branch_segment_count.to_string(),
+            app.text(UiText::SelectedCourse),
+            course.name.clone(),
         ));
-        lines.push(line_value(app, ""));
-
-        if course.branch_decisions.is_empty() {
-            lines.push(line_value(app, "Branch Decision: (none)"));
-        } else {
-            lines.push(line_value(app, "Branch Decision Table:"));
-            for decision in &course.branch_decisions {
-                lines.push(Line::from(vec![
-                    Span::styled("- ", app.theme.text_secondary),
-                    Span::styled(
-                        format!(
-                            "seg={} tick={:.3}s route_count={} hint={}",
-                            decision.segment_id,
-                            decision.decision_tick as f64 / 1_000_000.0,
-                            decision.route_count,
-                            format_hint(decision.hint.as_ref())
-                        ),
-                        app.theme.metadata,
-                    ),
-                ]));
-            }
-        }
+        lines.push(kv_line(app, app.text(UiText::Stars), stars));
+        lines.push(kv_line(
+            app,
+            app.text(UiText::NoteObjectCount),
+            course.object_count.to_string(),
+        ));
+        lines.push(kv_line(
+            app,
+            app.text(UiText::Branching),
+            app.text(if course.branch_segment_count > 0 {
+                UiText::Yes
+            } else {
+                UiText::No
+            })
+            .to_owned(),
+        ));
     }
 
     let info = Paragraph::new(lines)
-        .block(themed_block(app, "Course Info"))
+        .block(themed_block(app, app.text(UiText::CourseInfo)))
         .style(app.theme.text_primary)
         .wrap(Wrap { trim: true });
     frame.render_widget(info, chunks[1]);
@@ -181,18 +160,4 @@ fn setting_line(app: &App, label: &str, value: String, focus: CourseSettingFocus
         Span::styled(format!("{label}: "), label_style),
         Span::styled(value, value_style),
     ])
-}
-
-fn format_hint(hint: Option<&BranchDecisionHint>) -> String {
-    match hint {
-        Some(BranchDecisionHint::Accuracy { low, high }) => format!(
-            "p,{},{}",
-            format_accuracy_threshold(*low),
-            format_accuracy_threshold(*high)
-        ),
-        Some(BranchDecisionHint::Roll { low, high }) => format!("r,{low},{high}"),
-        Some(BranchDecisionHint::Score { low, high }) => format!("s,{low},{high}"),
-        Some(BranchDecisionHint::Raw(raw)) => format!("raw:{raw}"),
-        None => "none".to_owned(),
-    }
 }

@@ -1,8 +1,96 @@
 use encoding_rs::SHIFT_JIS;
 use rhythm_chart::{BranchDecisionHint, ChartImporter, ImportError, TICKS_PER_SECOND};
-use rhythm_importer_tja::{build_branch_decision_table, TjaImporter};
+use rhythm_importer_tja::{
+    build_branch_decision_table, TjaImportLimits, TjaImporter, DEFAULT_BALLOON_HITS,
+    TJA_IMPORTER_SEMANTICS_DESCRIPTOR, TJA_IMPORTER_SEMANTICS_SHA256,
+    TJA_IMPORTER_SEMANTICS_VERSION,
+};
+use sha2::{Digest, Sha256};
 
 const NOSFERATU_TJA: &[u8] = include_bytes!("../../taiko-game/samples/Nosferatu.tja");
+
+fn tempo_micros_at(chart: &rhythm_chart::CanonicalChart, tick: rhythm_chart::Tick) -> u32 {
+    let index = chart.tempo_map.partition_point(|tempo| tempo.tick <= tick);
+    chart.tempo_map[index.saturating_sub(1)].micros_per_quarter
+}
+
+#[test]
+fn nosferatu_ura_preserves_every_equal_bpm_scroll_pair() {
+    let song = TjaImporter
+        .import_song(NOSFERATU_TJA)
+        .expect("import Nosferatu");
+    let chart = song
+        .courses
+        .iter()
+        .map(|course| &course.chart)
+        .find(|chart| chart.metadata.difficulty_name.as_deref() == Some("4"))
+        .expect("Nosferatu Ura course");
+    let reference_micros = tempo_micros_at(chart, 0);
+    assert_eq!(reference_micros, 300_000, "the chart starts at 200 BPM");
+
+    let pairs = chart
+        .objects
+        .iter()
+        .map(|object| {
+            (
+                object.scroll_scaled,
+                tempo_micros_at(chart, object.start_tick),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        pairs,
+        std::collections::BTreeSet::from([
+            (630_000, 150_000),     // 400 BPM × 0.63
+            (840_000, 200_000),     // 300 BPM × 0.84
+            (1_260_000, 300_000),   // 200 BPM × 1.26
+            (5_040_000, 1_200_000), // 50 BPM × 5.04
+        ])
+    );
+
+    for object in &chart.objects {
+        let object_micros = tempo_micros_at(chart, object.start_tick);
+        let normalized_speed = i128::from(object.scroll_scaled) * i128::from(reference_micros)
+            / i128::from(object_micros);
+        assert_eq!(
+            normalized_speed, 1_260_000,
+            "object {} at tick {} changed visual speed",
+            object.id, object.start_tick
+        );
+    }
+}
+
+#[test]
+fn nosferatu_non_ura_courses_preserve_the_literal_point_67_scroll() {
+    let song = TjaImporter
+        .import_song(NOSFERATU_TJA)
+        .expect("import Nosferatu");
+
+    for difficulty in ["0", "1", "2", "3"] {
+        let chart = song
+            .courses
+            .iter()
+            .map(|course| &course.chart)
+            .find(|chart| chart.metadata.difficulty_name.as_deref() == Some(difficulty))
+            .expect("Nosferatu non-Ura course");
+        let object = chart
+            .objects
+            .iter()
+            .find(|object| {
+                object.scroll_scaled == 670_000
+                    && tempo_micros_at(chart, object.start_tick) == 200_000
+            })
+            .expect("300 BPM × 0.67 object");
+
+        let normalized_speed = i128::from(object.scroll_scaled)
+            * i128::from(tempo_micros_at(chart, 0))
+            / i128::from(tempo_micros_at(chart, object.start_tick));
+        assert_eq!(
+            normalized_speed, 1_005_000,
+            "course {difficulty} must honor the source's literal 0.67 multiplier"
+        );
+    }
+}
 
 #[test]
 fn deterministic_import_is_stable() {
@@ -161,6 +249,33 @@ LEVEL:9
 }
 
 #[test]
+fn branch_decision_before_chart_start_is_clamped_to_zero() {
+    let raw = r#"
+TITLE:Immediate Branch
+BPM:120
+COURSE:Oni
+LEVEL:9
+#START
+#BRANCHSTART p,70,85
+#N
+1000,
+#E
+0100,
+#M
+0010,
+#BRANCHEND
+#END
+"#;
+
+    let importer = TjaImporter;
+    let song = importer.import_song(raw.as_bytes()).expect("import song");
+    let points = &song.courses[0].branch_decisions;
+
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].decision_tick, 0);
+}
+
+#[test]
 fn branch_accuracy_threshold_supports_decimal_values() {
     let raw = r#"
 TITLE:Branch Accuracy Decimal
@@ -193,7 +308,7 @@ LEVEL:9
 }
 
 #[test]
-fn branch_accuracy_negative_thresholds_are_accepted() {
+fn branch_accuracy_thresholds_outside_zero_to_one_hundred_are_rejected() {
     let raw = r#"
 TITLE:Branch Accuracy Negative
 BPM:120
@@ -212,20 +327,18 @@ LEVEL:9
 "#;
 
     let importer = TjaImporter;
-    let chart = importer.import(raw.as_bytes()).expect("import");
+    let error = importer.import(raw.as_bytes()).expect_err("must reject");
+    assert!(error.to_string().contains("0..=100 percent"), "{error}");
 
-    assert_eq!(chart.branch_segments.len(), 1);
-    assert_eq!(
-        chart.branch_segments[0].decision_hint,
-        Some(BranchDecisionHint::Accuracy {
-            low: -20_000,
-            high: -10_000,
-        })
-    );
+    let over_one_hundred = raw.replace("p,-2,-1", "p,80,100.0001");
+    let error = importer
+        .import(over_one_hundred.as_bytes())
+        .expect_err("must reject");
+    assert!(error.to_string().contains("0..=100 percent"), "{error}");
 }
 
 #[test]
-fn branch_roll_negative_thresholds_are_accepted() {
+fn branch_roll_negative_thresholds_are_rejected() {
     let raw = r#"
 TITLE:Branch Roll Negative
 BPM:120
@@ -244,12 +357,10 @@ LEVEL:9
 "#;
 
     let importer = TjaImporter;
-    let chart = importer.import(raw.as_bytes()).expect("import");
-
-    assert_eq!(chart.branch_segments.len(), 1);
-    assert_eq!(
-        chart.branch_segments[0].decision_hint,
-        Some(BranchDecisionHint::Roll { low: -2, high: -1 })
+    let error = importer.import(raw.as_bytes()).expect_err("must reject");
+    assert!(
+        error.to_string().contains("must be non-negative"),
+        "{error}"
     );
 }
 
@@ -271,6 +382,27 @@ COURSE:Oni
     let err = importer.import(raw.as_bytes()).expect_err("must fail");
 
     assert!(matches!(err, ImportError::InvalidFormat(_)));
+}
+
+#[test]
+fn branch_without_any_playable_object_is_rejected() {
+    let raw = r#"
+TITLE:Empty Branch
+BPM:120
+COURSE:Oni
+#START
+#BRANCHSTART p,70,80
+#N
+0,
+#E
+0,
+#M
+0,
+#BRANCHEND
+#END
+"#;
+
+    assert_invalid_contains(raw, "contains no playable objects");
 }
 
 #[test]
@@ -308,21 +440,55 @@ COURSE:Oni
 }
 
 #[test]
-fn nested_roll_start_in_same_stream_is_ignored() {
+fn nested_roll_start_in_same_stream_is_rejected() {
     let raw = r#"
 TITLE:Nested Roll Start
 BPM:120
 COURSE:Oni
 #START
-900000000000000000000000000000000009000000000008,
+500000000000000000000000000000000006000000000008,
 #END
 "#;
 
     let importer = TjaImporter;
-    let chart = importer.import(raw.as_bytes()).expect("import");
+    let error = importer.import(raw.as_bytes()).expect_err("must reject");
+    assert!(error.to_string().contains("nested roll start"), "{error}");
+}
 
+#[test]
+fn roll_end_before_start_is_rejected_instead_of_clamped() {
+    let raw = r#"
+TITLE:Backwards Roll
+BPM:120
+COURSE:Oni
+#START
+5,
+#DELAY -10
+8,
+#END
+"#;
+
+    let error = TjaImporter.import(raw.as_bytes()).expect_err("must reject");
+    assert!(
+        error.to_string().contains("roll end precedes start"),
+        "{error}"
+    );
+}
+
+#[test]
+fn big_roll_preserves_the_big_flag() {
+    let raw = r#"
+TITLE:Big Roll
+BPM:120
+COURSE:Oni
+#START
+6008,
+#END
+"#;
+
+    let chart = TjaImporter.import(raw.as_bytes()).expect("import");
     assert_eq!(chart.objects.len(), 1);
-    assert!(chart.objects[0].end_tick >= chart.objects[0].start_tick);
+    assert_eq!(chart.objects[0].flags, rhythm_importer_tja::FLAG_BIG);
 }
 
 #[test]
@@ -426,6 +592,365 @@ LEVEL:6
 }
 
 #[test]
+fn bpm_scroll_and_measure_directives_apply_at_the_next_symbol_boundary() {
+    let raw = r#"
+TITLE:Mid-measure speed boundary
+BPM:200
+COURSE:Oni
+LEVEL:10
+#START
+#MEASURE 3/4
+#SCROLL 1.26
+1000
+#BPMCHANGE 400
+#SCROLL 0.63
+1000
+#BPMCHANGE 50
+#SCROLL 5.04
+1000,
+#END
+"#;
+
+    let chart = TjaImporter.import(raw.as_bytes()).expect("import");
+    let objects = chart
+        .objects
+        .iter()
+        .map(|object| {
+            (
+                object.start_tick,
+                object.scroll_scaled,
+                tempo_micros_at(&chart, object.start_tick),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        objects,
+        vec![
+            (0, 1_260_000, 300_000),
+            (300_000, 630_000, 150_000),
+            (450_000, 5_040_000, 1_200_000),
+        ]
+    );
+    assert_eq!(
+        chart
+            .signatures
+            .iter()
+            .map(|signature| (signature.tick, signature.numerator, signature.denominator))
+            .collect::<Vec<_>>(),
+        vec![(0, 3, 4)]
+    );
+}
+
+#[test]
+fn long_roll_duration_integrates_mid_measure_bpm_changes() {
+    let raw = r#"
+TITLE:Mid-measure roll boundary
+BPM:200
+COURSE:Oni
+LEVEL:10
+#START
+#MEASURE 3/4
+#SCROLL 1.26
+5000
+#BPMCHANGE 400
+#SCROLL 0.63
+0000
+#BPMCHANGE 50
+#SCROLL 5.04
+0008,
+#END
+"#;
+
+    let chart = TjaImporter.import(raw.as_bytes()).expect("import");
+    assert_eq!(chart.objects.len(), 1);
+    let roll = &chart.objects[0];
+    assert_eq!(roll.kind, rhythm_chart::ObjectKind::Roll);
+    assert_eq!(roll.start_tick, 0);
+    assert_eq!(roll.end_tick, 1_350_000);
+    assert_eq!(roll.scroll_scaled, 1_260_000);
+    assert_eq!(
+        chart
+            .tempo_map
+            .iter()
+            .map(|tempo| (tempo.tick, tempo.micros_per_quarter))
+            .collect::<Vec<_>>(),
+        vec![(0, 300_000), (300_000, 150_000), (450_000, 1_200_000)]
+    );
+}
+
+#[test]
+fn strict_numeric_contract_rejects_invalid_metadata() {
+    for (field, value, expected) in [
+        ("BPM", "garbage", "invalid BPM"),
+        ("BPM", "NaN", "must be finite"),
+        ("BPM", "0", "finite and positive"),
+        ("BPM", "-1", "finite and positive"),
+        ("BPM", "0.001", "outside the canonical tempo range"),
+        ("BPM", "120000001", "outside the canonical tempo range"),
+        ("OFFSET", "garbage", "invalid OFFSET"),
+        ("OFFSET", "NaN", "must be finite"),
+        (
+            "OFFSET",
+            "9223372036854.775808",
+            "outside the canonical tick range",
+        ),
+        ("DEMOSTART", "NaN", "must be finite"),
+        ("DEMOSTART", "-0.1", "must be non-negative"),
+    ] {
+        let raw = format!(
+            "TITLE:Invalid Numeric\nBPM:120\n{field}:{value}\nCOURSE:Oni\n#START\n1,\n#END\n"
+        );
+        assert_invalid_contains(&raw, expected);
+    }
+
+    let missing_bpm = "TITLE:Missing BPM\nCOURSE:Oni\n#START\n1,\n#END\n";
+    assert_invalid_contains(missing_bpm, "missing required");
+}
+
+#[test]
+fn strict_numeric_contract_rejects_malformed_chart_directives_even_without_notes() {
+    for (directive, expected) in [
+        ("#BPMCHANGE garbage", "invalid #BPMCHANGE"),
+        ("#BPMCHANGE NaN", "must be finite"),
+        ("#BPMCHANGE 0", "finite and positive"),
+        ("#SCROLL garbage", "invalid #SCROLL"),
+        ("#SCROLL NaN", "must be finite"),
+        ("#SCROLL 2148", "outside the canonical fixed-point range"),
+        ("#DELAY garbage", "invalid #DELAY"),
+        ("#DELAY inf", "must be finite"),
+        ("#MEASURE 4", "requires numerator/denominator"),
+        ("#MEASURE 4/0", "must be non-zero"),
+        ("#MEASURE 256/4", "numerator must be"),
+    ] {
+        let raw = simple_chart(&format!("{directive}\n0,"));
+        assert_invalid_contains(&raw, expected);
+    }
+}
+
+#[test]
+fn strict_headers_reject_invalid_course_and_level() {
+    for raw in [
+        "TITLE:Bad Course\nBPM:120\nCOURSE:Impossible\n#START\n1,\n#END\n",
+        "TITLE:Bad Level\nBPM:120\nCOURSE:Oni\nLEVEL:0\n#START\n1,\n#END\n",
+        "TITLE:Bad Level\nBPM:120\nCOURSE:Oni\nLEVEL:11\n#START\n1,\n#END\n",
+        "TITLE:Bad Level\nBPM:120\nCOURSE:Oni\nLEVEL:nope\n#START\n1,\n#END\n",
+    ] {
+        assert_invalid_contains(
+            raw,
+            if raw.contains("COURSE:Impossible") {
+                "unsupported COURSE"
+            } else {
+                "LEVEL must be in 1..=10"
+            },
+        );
+    }
+}
+
+#[test]
+fn balloon_counts_are_strict_and_exact() {
+    let cases = [
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:0\n#START\n7008,\n#END\n",
+            "must be positive",
+        ),
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:-1\n#START\n7008,\n#END\n",
+            "hit counts must be",
+        ),
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:65536\n#START\n7008,\n#END\n",
+            "hit counts must be",
+        ),
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:5,bad\n#START\n7008,\n#END\n",
+            "hit counts must be",
+        ),
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:5,\n#START\n7008,\n#END\n",
+            "hit counts must be",
+        ),
+        (
+            "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:5,6\n#START\n7008,\n#END\n",
+            "BALLOON values must match",
+        ),
+    ];
+    for (raw, expected) in cases {
+        assert_invalid_contains(raw, expected);
+    }
+
+    let valid = "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:5\n#START\n7008,\n#END\n";
+    let chart = TjaImporter.import(valid.as_bytes()).expect("valid balloon");
+    assert_eq!(chart.objects[0].required_hits, 5);
+
+    let explicit_default = "TITLE:B\nBPM:120\nCOURSE:Oni\nBALLOON:\n#START\n700800007008,\n#END\n";
+    let chart = TjaImporter
+        .import(explicit_default.as_bytes())
+        .expect("explicit empty BALLOON uses the documented default");
+    assert_eq!(chart.objects.len(), 2);
+    assert!(chart
+        .objects
+        .iter()
+        .all(|object| object.required_hits == DEFAULT_BALLOON_HITS));
+
+    let missing_header = "TITLE:B\nBPM:120\nCOURSE:Oni\n#START\n700800007008,\n#END\n";
+    let chart = TjaImporter
+        .import(missing_header.as_bytes())
+        .expect("missing BALLOON uses the documented application default");
+    assert_eq!(chart.objects.len(), 2);
+    assert!(chart
+        .objects
+        .iter()
+        .all(|object| object.required_hits == DEFAULT_BALLOON_HITS));
+}
+
+#[test]
+fn optional_audio_and_legacy_score_metadata_accept_missing_or_empty_values() {
+    let raw = r#"
+TITLE:Silent Chart
+WAVE:
+BPM:120
+SCOREMODE:
+COURSE:Oni
+LEVEL:5
+SCOREINIT:
+SCOREDIFF:
+#START
+1000,
+#END
+"#;
+
+    let song = TjaImporter
+        .import_song(raw.as_bytes())
+        .expect("empty optional metadata is valid");
+    assert_eq!(song.audio_path, None);
+
+    let paired_score_init = raw.replace("SCOREINIT:", "SCOREINIT:500,1200");
+    TjaImporter
+        .import_song(paired_score_init.as_bytes())
+        .expect("one- and two-player legacy SCOREINIT values are valid and ignored");
+    assert_eq!(song.courses[0].chart.metadata.audio_path, None);
+
+    let without_optional_headers = raw
+        .replace("WAVE:\n", "")
+        .replace("SCOREMODE:\n", "")
+        .replace("SCOREINIT:\n", "")
+        .replace("SCOREDIFF:\n", "");
+    let song = TjaImporter
+        .import_song(without_optional_headers.as_bytes())
+        .expect("missing optional metadata is valid");
+    assert_eq!(song.audio_path, None);
+}
+
+#[test]
+fn nonempty_legacy_score_metadata_remains_strictly_validated() {
+    for (field, scope) in [
+        ("SCOREMODE:not-a-number", "metadata"),
+        ("SCOREINIT:not-a-number", "course"),
+        ("SCOREDIFF:not-a-number", "course"),
+    ] {
+        let raw = match scope {
+            "metadata" => format!("TITLE:X\nBPM:120\n{field}\nCOURSE:Oni\n#START\n1,\n#END\n"),
+            "course" => {
+                format!("TITLE:X\nBPM:120\nCOURSE:Oni\n{field}\n#START\n1,\n#END\n")
+            }
+            _ => unreachable!(),
+        };
+        assert_invalid_contains(
+            raw,
+            if field.starts_with("SCOREINIT") {
+                "one or two unsigned integers"
+            } else {
+                "must be an unsigned integer"
+            },
+        );
+    }
+
+    for value in ["1,2,3", "1,", ",2"] {
+        let raw = format!("TITLE:X\nBPM:120\nCOURSE:Oni\nSCOREINIT:{value}\n#START\n1,\n#END\n");
+        assert_invalid_contains(raw, "one or two unsigned integers");
+    }
+}
+
+#[test]
+fn strict_source_structure_prevents_silent_content_loss() {
+    let cases = [
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n#START\n1,\n#START\n1,\n#END\n",
+            "nested #START",
+        ),
+        ("TITLE:X\nBPM:120\nCOURSE:Oni\n#START\n1,\n", "missing #END"),
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n#END\n",
+            "#END without an open course",
+        ),
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n1,\n#START\n1,\n#END\n",
+            "expected a metadata/header",
+        ),
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n#START\n1x,\n#END\n",
+            "chart data may contain only",
+        ),
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n#START\n#UNKNOWN\n1,\n#END\n",
+            "unsupported or malformed directive",
+        ),
+        (
+            "TITLE:X\nBPM:120\nCOURSE:Oni\n#START\n#SECTION\n1,\n#END\n",
+            "#SECTION is unsupported",
+        ),
+        ("TITLE:X\nBPM:120\nCOURSE:Oni\n", "no complete courses"),
+    ];
+    for (raw, expected) in cases {
+        assert_invalid_contains(raw, expected);
+    }
+}
+
+#[test]
+fn content_after_branch_end_is_rejected_instead_of_dropped_by_upstream_parser() {
+    let raw = r#"
+TITLE:Branch Tail
+BPM:120
+COURSE:Oni
+#START
+#BRANCHSTART p,70,85
+#N
+1,
+#E
+2,
+#M
+3,
+#BRANCHEND
+4,
+#END
+"#;
+
+    assert_invalid_contains(raw, "only #END may follow #BRANCHEND");
+}
+
+#[test]
+fn unknown_branch_condition_kind_is_rejected() {
+    let raw = r#"
+TITLE:Unknown Branch
+BPM:120
+COURSE:Oni
+#START
+#BRANCHSTART custom,1,2
+#N
+1,
+#E
+2,
+#M
+3,
+#BRANCHEND
+#END
+"#;
+
+    assert_invalid_contains(raw, "unsupported branch condition kind");
+}
+
+#[test]
 fn shift_jis_input_is_supported() {
     let source = "TITLE:テスト\nBPM:120\nCOURSE:Oni\n#START\n1,\n#END\n";
     let (encoded, _, had_errors) = SHIFT_JIS.encode(source);
@@ -489,6 +1014,183 @@ LEVEL:10
         "signature capacity unexpectedly large: len={} cap={}",
         chart.signatures.len(),
         chart.signatures.capacity()
+    );
+}
+
+#[test]
+fn bounded_semantics_fingerprint_is_pinned() {
+    assert_eq!(TJA_IMPORTER_SEMANTICS_VERSION, 3);
+    assert_eq!(
+        hex::encode(Sha256::digest(TJA_IMPORTER_SEMANTICS_DESCRIPTOR.as_bytes())),
+        TJA_IMPORTER_SEMANTICS_SHA256
+    );
+}
+
+#[test]
+fn note_symbol_limit_rejects_the_first_parser_amplifying_symbol() {
+    let raw = simple_chart("000,");
+    let limits = TjaImportLimits {
+        max_note_symbols_per_course: 2,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "note symbols per course 3 > 2");
+}
+
+#[test]
+fn segment_limit_rejects_the_first_excess_comma() {
+    let raw = simple_chart("0,0,");
+    let limits = TjaImportLimits {
+        max_segments_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "segments per course 2 > 1");
+}
+
+#[test]
+fn object_limit_rejects_the_first_excess_object_token_before_parse() {
+    let raw = simple_chart("1100,");
+    let limits = TjaImportLimits {
+        max_objects_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "objects per course 2 > 1");
+}
+
+#[test]
+fn event_limit_rejects_the_first_excess_canonical_event() {
+    let raw = simple_chart("1000,\n1000,");
+    let limits = TjaImportLimits {
+        max_events_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "events per course 2 > 1");
+}
+
+#[test]
+fn tempo_limit_rejects_the_first_excess_canonical_change() {
+    let raw = simple_chart("1,\n#BPMCHANGE 180\n1,");
+    let limits = TjaImportLimits {
+        max_tempo_changes_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "tempo changes per course 2 > 1");
+}
+
+#[test]
+fn signature_limit_rejects_the_first_excess_canonical_change() {
+    let raw = simple_chart("#MEASURE 3/4\n1,\n#MEASURE 5/4\n1,");
+    let limits = TjaImportLimits {
+        max_time_signatures_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "time signatures per course 2 > 1");
+}
+
+#[test]
+fn branch_segment_limit_rejects_before_allocating_the_excess_cycle() {
+    let raw = repeated_branch_chart();
+    let limits = TjaImportLimits {
+        max_branch_segments_per_course: 1,
+        max_branch_decisions_per_course: 8,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "branch segments per course 2 > 1");
+}
+
+#[test]
+fn branch_decision_limit_rejects_before_pushing_the_excess_decision() {
+    let raw = repeated_branch_chart();
+    let limits = TjaImportLimits {
+        max_branch_segments_per_course: 8,
+        max_branch_decisions_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(&raw, limits, "branch decisions per course 2 > 1");
+}
+
+#[test]
+fn aggregate_limit_cannot_be_multiplied_by_multiple_courses() {
+    let raw = r#"
+TITLE:Aggregate Bound
+BPM:120
+COURSE:Easy
+#START
+1,
+#END
+COURSE:Oni
+#START
+1,
+#END
+"#;
+    let limits = TjaImportLimits {
+        max_total_objects: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(raw, limits, "total objects 2 > 1");
+}
+
+#[test]
+fn balloon_header_is_bounded_before_upstream_header_allocation() {
+    let raw = r#"
+TITLE:Balloon Bound
+BPM:120
+COURSE:Oni
+BALLOON:1,2
+#START
+7,8,
+#END
+"#;
+    let limits = TjaImportLimits {
+        max_balloon_values_per_course: 1,
+        ..TjaImportLimits::default()
+    };
+
+    assert_limit_error(raw, limits, "balloon values per course 2 > 1");
+}
+
+fn simple_chart(body: &str) -> String {
+    format!("TITLE:Bounded\nBPM:120\nCOURSE:Oni\n#START\n{body}\n#END\n")
+}
+
+fn repeated_branch_chart() -> String {
+    simple_chart(
+        "#BRANCHSTART p,70,85\n\
+         #N\n1,\n\
+         #E\n1,\n\
+         #M\n1,\n\
+         #N\n1,\n\
+         #E\n1,\n\
+         #M\n1,\n\
+         #BRANCHEND",
+    )
+}
+
+fn assert_limit_error(raw: impl AsRef<[u8]>, limits: TjaImportLimits, expected: &str) {
+    let error = TjaImporter
+        .import_song_with_limits(raw.as_ref(), limits)
+        .expect_err("limit must reject input");
+    assert!(
+        error.to_string().contains(expected),
+        "expected {expected:?}, got {error}"
+    );
+}
+
+fn assert_invalid_contains(raw: impl AsRef<[u8]>, expected: &str) {
+    let error = TjaImporter
+        .import(raw.as_ref())
+        .expect_err("input must be rejected");
+    assert!(
+        error.to_string().contains(expected),
+        "expected {expected:?}, got {error}"
     );
 }
 

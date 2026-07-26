@@ -332,26 +332,28 @@ fn match_text(song: &SongEntry, songdir: &Path, text: &str) -> bool {
     }
 
     let chart_rel = song
-        .source_path
+        .source_path()
         .strip_prefix(songdir)
-        .unwrap_or(&song.source_path)
+        .unwrap_or_else(|_| song.source_path())
         .display()
         .to_string();
-    let audio_rel = song
-        .audio_path
-        .strip_prefix(songdir)
-        .unwrap_or(&song.audio_path)
-        .display()
-        .to_string();
-
     let needle = text.to_ascii_lowercase();
-    let fields = [
+    let mut fields = vec![
         song.title.to_ascii_lowercase(),
         song.subtitle.to_ascii_lowercase(),
         song.artist.to_ascii_lowercase(),
         chart_rel.to_ascii_lowercase(),
-        audio_rel.to_ascii_lowercase(),
     ];
+    if let Some(audio_path) = song.audio_path() {
+        fields.push(
+            audio_path
+                .strip_prefix(songdir)
+                .unwrap_or(audio_path)
+                .display()
+                .to_string()
+                .to_ascii_lowercase(),
+        );
+    }
 
     fields.iter().any(|field| field.contains(&needle))
 }
@@ -371,6 +373,7 @@ mod tests {
             index: 0,
             name: name.to_owned(),
             level: Some(level),
+            canonical_chart_hash: "0".repeat(64),
             object_count: 1,
             branch_segment_count: usize::from(branch),
             base_bpm: Some(bpm),
@@ -378,6 +381,7 @@ mod tests {
                 vec![BranchDecisionPoint {
                     segment_id: 1,
                     decision_tick: TICKS_PER_SECOND,
+                    default_route_id: 0,
                     route_count: 3,
                     hint: None,
                 }]
@@ -395,6 +399,7 @@ mod tests {
                     c.branch_decisions.push(BranchDecisionPoint {
                         segment_id: 1,
                         decision_tick: TICKS_PER_SECOND,
+                        default_route_id: 0,
                         route_count: 3,
                         hint: None,
                     });
@@ -403,16 +408,10 @@ mod tests {
         }
 
         SongEntry {
-            source_locator: crate::loader::ResourceLocator::LocalPath(PathBuf::from(format!(
-                "/songs/{title}.tja"
-            ))),
-            audio_locator: crate::loader::ResourceLocator::LocalPath(PathBuf::from(format!(
-                "/songs/{title}.ogg"
-            ))),
-            chart_content_hash: None,
-            audio_content_hash: None,
-            source_path: PathBuf::from(format!("/songs/{title}.tja")),
-            audio_path: PathBuf::from(format!("/songs/{title}.ogg")),
+            origin: crate::loader::SongOrigin::Local {
+                source_path: PathBuf::from(format!("/songs/{title}.tja")),
+                audio_path: Some(PathBuf::from(format!("/songs/{title}.ogg"))),
+            },
             title: title.to_owned(),
             subtitle: String::new(),
             artist: artist.to_owned(),

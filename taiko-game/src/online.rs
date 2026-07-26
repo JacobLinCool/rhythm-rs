@@ -1,3077 +1,3932 @@
+#[cfg(test)]
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::path::Path;
-use std::sync::mpsc::{self, Receiver};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+#[cfg(test)]
+use crossterm::event::{KeyCode, KeyModifiers};
 use futures_util::{SinkExt, StreamExt};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use reqwest::Url;
-use rhythm_core::{ControlledEngine, Tick, TimedInput};
-use rhythm_importer_tja::TjaImporter;
-use rhythm_mode_taiko::{TaikoAction, TaikoMode, TaikoScoreState};
+use rhythm_core::{Tick, TimedInput};
+use rhythm_mode_taiko::{TaikoAction, TaikoMode, TaikoRuntime, TaikoSide, TaikoZone};
 use taiko_multiplayer_protocol::{
-    ClientHello, ClientMessage, FinalResultReport, HostSelectSongRequest, InputEvent,
-    JoinRoomRequest, MatchSongSelection, PingPayload, PlayerStateUpdate, ReadyRequest, RoomPhase,
-    RoomPlayerSnapshot, RoomRole, RoomSnapshot, ServerMessage, PROTOCOL_VERSION,
+    ClientBuild, ClientHello, ClientMessage, ContentHash, DisplayName, DrumAction, DrumSide,
+    DrumZone, InvitationToken, JoinRole, LiveStateSnapshot, ResumeRequest, RoomCode, ServerMessage,
+    MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, WIRE_SCHEMA_SHA256,
+};
+#[cfg(test)]
+use taiko_multiplayer_protocol::{
+    CourseId, FinalResult, MatchId, PlayerId, PlayerLiveState, PlayerSelection, RoomRole,
+    RoomSnapshot, StateSeq,
 };
 use tokio::runtime::Builder;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::connect_async;
+use tokio::sync::watch;
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::audio::AudioEngine;
-use crate::branch::BranchController;
-use crate::cli::{OnlineAction, OnlineCommandArgs};
-use crate::headless::HeadlessEventSource;
-use crate::input::{map_game_hit, map_menu_intent, MenuIntent};
-use crate::loader::{ResourceLocator, SongLibrary};
-use crate::resource::{ResourceBackend, SongAudioSource};
-use crate::screen::game_screen::{render_lane_view, LaneRenderOptions};
-use crate::song_filter::SongFilter;
-use crate::theme::Theme;
-use crate::tui::{Frame, Tui, UiEvent};
+use crate::invite::MultiplayerInvite;
+#[cfg(test)]
+use crate::loader::SongEntry;
+#[cfg(test)]
+use crate::online_preparation::{
+    validate_authoritative_song_identity, OnlinePreparationTask, PreparationCompletion,
+    PreparationEvent, PreparationIdentity, PreparationRequest,
+};
+#[cfg(test)]
+use crate::resource::ResourceBackend;
 
-const ONLINE_FPS: u32 = 120;
-const ONLINE_TPS: u32 = 240;
-const AUDIO_DRIFT_RESYNC_THRESHOLD_SECONDS: f64 = 0.2;
-const AUDIO_DRIFT_RESYNC_INTERVAL: Duration = Duration::from_secs(1);
-const PING_INTERVAL: Duration = Duration::from_millis(800);
-const CLOCK_SAMPLE_WINDOW: usize = 64;
-const CLOCK_OUTLIER_MAD_SCALE: f64 = 6.0;
-const CLOCK_OUTLIER_FIXED_MARGIN_MS: f64 = 20.0;
-const CLOCK_SLEW_MAX_PER_SECOND_MS: f64 = 50.0;
-const CLOCK_DRIFT_RECALC_INTERVAL_MS: u64 = 4_000;
-const CLOCK_DRIFT_PPM_LIMIT: f64 = 500.0;
-const LOBBY_DEMO_DELAY: Duration = Duration::from_millis(500);
-const LOBBY_FILTER_ROOT: &str = "/";
+const OUTBOUND_CAPACITY: usize = 256;
+const RELIABLE_INBOUND_CAPACITY: usize = 256;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+const GRACEFUL_LEAVE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const GRACEFUL_COMPLETION_WAIT: Duration = Duration::from_secs(16);
+const MIN_SERVER_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+const STABLE_CONNECTION_WINDOW: Duration = Duration::from_secs(30);
 
-pub fn run_online_command(args: OnlineCommandArgs) -> Result<()> {
-    if args.headless {
-        return run_online_headless(args);
-    }
-
-    let mut app = OnlineApp::new(args)?;
-    let mut tui = Tui::new(ONLINE_TPS, ONLINE_FPS)?;
-    tui.enter()?;
-
-    while !app.should_quit {
-        match tui.next_event()? {
-            UiEvent::Tick => app.handle_tick()?,
-            UiEvent::Frame => {
-                tui.draw(|frame| app.render(frame))?;
-            }
-            UiEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                app.handle_key(key)?;
-            }
-            UiEvent::Resize(width, height) => {
-                tui.resize(Rect::new(0, 0, width, height))?;
-            }
-            UiEvent::Key(_) => {}
-        }
-    }
-
-    tui.exit()?;
-    app.shutdown();
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoomIntent {
+    Create,
+    Join {
+        room_code: RoomCode,
+        invitation_token: InvitationToken,
+        role: JoinRole,
+    },
 }
 
-fn run_online_headless(args: OnlineCommandArgs) -> Result<()> {
-    let label = match &args.action {
-        OnlineAction::Create(a) => a.name.clone(),
-        OnlineAction::Join(a) => a.name.clone(),
-        OnlineAction::Spectate(a) => a.name.clone(),
-    };
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    crate::headless::spawn_stdin_reader(cmd_tx);
-    OnlineApp::run_headless(args, label, None, None, cmd_rx)
+#[derive(Debug, Clone)]
+pub(crate) struct ReconnectPolicy {
+    pub(crate) initial_delay: Duration,
+    pub(crate) maximum_delay: Duration,
+    pub(crate) maximum_attempts: u32,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(250),
+            maximum_delay: Duration::from_secs(5),
+            maximum_attempts: 32,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    pub(crate) fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        if attempt <= 1 {
+            return Duration::ZERO;
+        }
+        let exponent = attempt.saturating_sub(2).min(31);
+        let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+        self.initial_delay
+            .saturating_mul(multiplier)
+            .min(self.maximum_delay)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OnlineClientConfig {
+    pub(crate) server_url: Url,
+    pub(crate) display_name: DisplayName,
+    pub(crate) client_build: ClientBuild,
+    pub(crate) room_intent: RoomIntent,
+    pub(crate) reconnect: ReconnectPolicy,
+}
+
+impl OnlineClientConfig {
+    pub(crate) fn create(server_url: &str, display_name: &str) -> Result<Self> {
+        Self::new(server_url, display_name, RoomIntent::Create)
+    }
+
+    pub(crate) fn join(
+        server_url: &str,
+        display_name: &str,
+        room_code: &str,
+        invitation_token: &str,
+        role: JoinRole,
+    ) -> Result<Self> {
+        Self::new(
+            server_url,
+            display_name,
+            RoomIntent::Join {
+                room_code: RoomCode::parse(room_code).context("invalid room code")?,
+                invitation_token: InvitationToken::parse(invitation_token)
+                    .context("invalid invitation token")?,
+                role,
+            },
+        )
+    }
+
+    fn new(server_url: &str, display_name: &str, room_intent: RoomIntent) -> Result<Self> {
+        let server_url = MultiplayerInvite::normalize_server(server_url)?;
+        multiplayer_ws_url(server_url.as_str())?;
+        Ok(Self {
+            server_url,
+            display_name: DisplayName::new(display_name).context("invalid display name")?,
+            client_build: ClientBuild::new(format!("taiko-game/{}", env!("CARGO_PKG_VERSION")))
+                .expect("package version is a valid client build"),
+            room_intent,
+            reconnect: ReconnectPolicy::default(),
+        })
+    }
+
+    pub(crate) fn requires_authoritative_resources(&self) -> bool {
+        !matches!(
+            &self.room_intent,
+            RoomIntent::Join {
+                role: JoinRole::Spectator,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientMode {
-    Player,
-    Spectator,
+struct AttemptPlan {
+    ordinal: u32,
+    delay: Duration,
+}
+
+struct ReconnectBudget<'a> {
+    policy: &'a ReconnectPolicy,
+    attempts_started: u32,
+    backoff_attempt: u32,
+}
+
+impl<'a> ReconnectBudget<'a> {
+    fn new(policy: &'a ReconnectPolicy) -> Self {
+        Self {
+            policy,
+            attempts_started: 0,
+            backoff_attempt: 1,
+        }
+    }
+
+    fn begin_attempt(&mut self) -> Option<AttemptPlan> {
+        if self.attempts_started >= self.policy.maximum_attempts {
+            return None;
+        }
+        self.attempts_started += 1;
+        Some(AttemptPlan {
+            ordinal: self.attempts_started,
+            delay: self.policy.delay_for_attempt(self.backoff_attempt),
+        })
+    }
+
+    fn record_failure(&mut self, stable_connection: bool) -> Option<AttemptPlan> {
+        if stable_connection {
+            self.attempts_started = 0;
+            self.backoff_attempt = 1;
+        }
+        if self.attempts_started >= self.policy.maximum_attempts {
+            return None;
+        }
+        if !stable_connection {
+            self.backoff_attempt = self.backoff_attempt.saturating_add(1);
+        }
+        Some(AttemptPlan {
+            ordinal: self.attempts_started + 1,
+            delay: self.policy.delay_for_attempt(self.backoff_attempt),
+        })
+    }
+
+    fn attempts_started(&self) -> u32 {
+        self.attempts_started
+    }
+}
+
+struct ConnectionHealthTracker {
+    affiliated_at: Option<tokio::time::Instant>,
+    stable: bool,
+}
+
+impl ConnectionHealthTracker {
+    fn new() -> Self {
+        Self {
+            affiliated_at: None,
+            stable: false,
+        }
+    }
+
+    fn observe(&mut self, message: &ServerMessage, observed_at: tokio::time::Instant) {
+        match message {
+            ServerMessage::MembershipGranted(_) => {
+                self.affiliated_at.get_or_insert(observed_at);
+            }
+            ServerMessage::HeartbeatAck(_) => {
+                if self.affiliated_at.is_some_and(|affiliated_at| {
+                    observed_at
+                        .checked_duration_since(affiliated_at)
+                        .is_some_and(|duration| duration >= STABLE_CONNECTION_WINDOW)
+                }) {
+                    self.stable = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_stable(&self) -> bool {
+        self.stable
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransportFault {
+    pub(crate) message: String,
+    pub(crate) terminal: bool,
 }
 
 #[derive(Debug)]
 pub(crate) enum NetworkEvent {
+    Connecting {
+        attempt: u32,
+        delay: Duration,
+    },
     Server(Box<ServerMessage>),
-    Closed(String),
+    Disconnected {
+        reason: String,
+        next_attempt: u32,
+        retry_in: Duration,
+    },
+}
+
+enum TransportCommand {
+    Message(Box<ClientMessage>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GracefulShutdownError {
+    AlreadyStopped,
+    ControlChannelClosed,
+    NotConnected { phase: &'static str },
+    MissingLeave,
+    LeaveNotLast,
+    MessageWrite { index: usize, reason: String },
+    ControlWrite { reason: String },
+    LeaveRejected { reason: String },
+    PeerClosedBeforeLeaveAck,
+    PeerProtocol { reason: String },
+    CloseWrite { reason: String },
+    FlushTimedOut,
+    CompletionChannelClosed,
+    CompletionWaitTimedOut,
+}
+
+impl std::fmt::Display for GracefulShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyStopped => formatter.write_str("online transport is already stopped"),
+            Self::ControlChannelClosed => {
+                formatter.write_str("online transport control channel is closed")
+            }
+            Self::NotConnected { phase } => {
+                write!(
+                    formatter,
+                    "cannot leave gracefully while transport is {phase}"
+                )
+            }
+            Self::MissingLeave => {
+                formatter.write_str("graceful shutdown batch is missing LeaveRoom")
+            }
+            Self::LeaveNotLast => {
+                formatter.write_str("LeaveRoom must be the final graceful shutdown command")
+            }
+            Self::MessageWrite { index, reason } => {
+                write!(
+                    formatter,
+                    "failed to write graceful message {}: {reason}",
+                    index + 1
+                )
+            }
+            Self::ControlWrite { reason } => {
+                write!(
+                    formatter,
+                    "failed to write graceful control frame: {reason}"
+                )
+            }
+            Self::LeaveRejected { reason } => {
+                write!(formatter, "server rejected LeaveRoom: {reason}")
+            }
+            Self::PeerClosedBeforeLeaveAck => {
+                formatter.write_str("server closed before acknowledging LeaveRoom")
+            }
+            Self::PeerProtocol { reason } => {
+                write!(
+                    formatter,
+                    "invalid server response during graceful shutdown: {reason}"
+                )
+            }
+            Self::CloseWrite { reason } => {
+                write!(formatter, "failed to flush websocket Close frame: {reason}")
+            }
+            Self::FlushTimedOut => formatter.write_str("graceful websocket flush timed out"),
+            Self::CompletionChannelClosed => {
+                formatter.write_str("transport stopped without graceful completion")
+            }
+            Self::CompletionWaitTimedOut => {
+                formatter.write_str("timed out waiting for graceful transport completion")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GracefulShutdownError {}
+
+type GracefulShutdownResult = std::result::Result<(), GracefulShutdownError>;
+
+#[derive(Clone)]
+struct GracefulShutdownRequest {
+    messages: Arc<[ClientMessage]>,
+    completion: SyncSender<GracefulShutdownResult>,
+}
+
+impl GracefulShutdownRequest {
+    fn complete(&self, result: GracefulShutdownResult) {
+        let _ = self.completion.try_send(result);
+    }
+}
+
+#[derive(Clone)]
+enum TransportControl {
+    Running,
+    ImmediateShutdown,
+    GracefulShutdown(GracefulShutdownRequest),
 }
 
 pub(crate) struct NetworkClient {
-    outbound: tokio_mpsc::UnboundedSender<ClientMessage>,
-    inbound: Receiver<NetworkEvent>,
+    outbound: tokio_mpsc::Sender<TransportCommand>,
+    reliable_inbound: Receiver<NetworkEvent>,
+    latest_live: Arc<Mutex<Option<LiveStateSnapshot>>>,
+    resume: Arc<Mutex<Option<ResumeRequest>>>,
+    fault: Arc<Mutex<Option<TransportFault>>>,
+    control: watch::Sender<TransportControl>,
+    stopped: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_graceful_completion: Option<GracefulShutdownResult>,
 }
 
 impl NetworkClient {
-    pub(crate) fn connect(server: &str, name: &str, action: &OnlineAction) -> Result<Self> {
-        let ws_url = multiplayer_ws_url(server)?;
-        let (outbound_tx, outbound_rx) = tokio_mpsc::unbounded_channel::<ClientMessage>();
-        let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
+    pub(crate) fn connect(config: &OnlineClientConfig) -> Result<Self> {
+        let ws_url = multiplayer_ws_url(config.server_url.as_str())?;
+        let schema_hash =
+            ContentHash::parse(WIRE_SCHEMA_SHA256).expect("wire schema constant is valid");
+        let (outbound_tx, outbound_rx) = tokio_mpsc::channel(OUTBOUND_CAPACITY);
+        let (control_tx, control_rx) = watch::channel(TransportControl::Running);
+        let (event_tx, event_rx) = mpsc::sync_channel(RELIABLE_INBOUND_CAPACITY);
+        let latest_live = Arc::new(Mutex::new(None));
+        let resume = Arc::new(Mutex::new(None));
+        let fault = Arc::new(Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
 
-        let hello = ClientMessage::Hello(ClientHello {
-            protocol_version: PROTOCOL_VERSION,
-            name: name.to_owned(),
-        });
-        let join = match action {
-            OnlineAction::Create(_) => ClientMessage::CreateRoom,
-            OnlineAction::Join(args) => ClientMessage::JoinRoom(JoinRoomRequest {
-                room_code: args.room.to_ascii_uppercase(),
-                spectate: false,
-            }),
-            OnlineAction::Spectate(args) => ClientMessage::JoinRoom(JoinRoomRequest {
-                room_code: args.room.to_ascii_uppercase(),
-                spectate: true,
-            }),
-        };
+        let thread_live = Arc::clone(&latest_live);
+        let thread_resume = Arc::clone(&resume);
+        let thread_fault = Arc::clone(&fault);
+        let display_name = config.display_name.clone();
+        let client_build = config.client_build.clone();
+        let reconnect = config.reconnect.clone();
 
-        thread::spawn(move || {
-            let runtime = match Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = event_tx.send(NetworkEvent::Closed(format!(
-                        "failed to initialize online runtime: {error}"
-                    )));
-                    return;
-                }
-            };
-
-            runtime.block_on(async move {
-                let stream = match connect_async(ws_url.as_str()).await {
-                    Ok((stream, _)) => stream,
+        thread::Builder::new()
+            .name("taiko-online-transport".to_owned())
+            .spawn(move || {
+                let runtime = match Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = event_tx.send(NetworkEvent::Closed(format!(
-                            "failed to connect to {}: {error}",
-                            ws_url
-                        )));
+                        set_transport_fault(
+                            &thread_fault,
+                            format!("failed to initialize network runtime: {error}"),
+                            true,
+                        );
                         return;
                     }
                 };
 
-                let (mut write, mut read) = stream.split();
-                for initial_message in [hello, join] {
-                    let raw = match serde_json::to_string(&initial_message) {
-                        Ok(raw) => raw,
-                        Err(error) => {
-                            let _ = event_tx.send(NetworkEvent::Closed(format!(
-                                "failed to encode initial message: {error}"
-                            )));
-                            return;
-                        }
-                    };
-                    if let Err(error) = write.send(WsMessage::Text(raw.into())).await {
-                        let _ = event_tx.send(NetworkEvent::Closed(format!(
-                            "failed to send initial message: {error}"
-                        )));
-                        return;
-                    }
-                }
-
-                let mut outbound_rx = outbound_rx;
-                loop {
-                    tokio::select! {
-                        outgoing = outbound_rx.recv() => {
-                            let Some(outgoing) = outgoing else {
-                                break;
-                            };
-                            let raw = match serde_json::to_string(&outgoing) {
-                                Ok(raw) => raw,
-                                Err(error) => {
-                                    let _ = event_tx.send(NetworkEvent::Closed(format!("failed to encode outgoing message: {error}")));
-                                    break;
-                                }
-                            };
-                            if let Err(error) = write.send(WsMessage::Text(raw.into())).await {
-                                let _ = event_tx.send(NetworkEvent::Closed(format!("failed to send outgoing message: {error}")));
-                                break;
-                            }
-                        }
-                        incoming = read.next() => {
-                            let Some(incoming) = incoming else {
-                                let _ = event_tx.send(NetworkEvent::Closed("connection closed".to_owned()));
-                                break;
-                            };
-                            match incoming {
-                                Ok(WsMessage::Text(raw)) => {
-                                    match serde_json::from_str::<ServerMessage>(&raw) {
-                                        Ok(message) => {
-                                            if event_tx.send(NetworkEvent::Server(Box::new(message))).is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(error) => {
-                                            let _ = event_tx.send(NetworkEvent::Closed(format!("failed to decode server message: {error}")));
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(WsMessage::Close(frame)) => {
-                                    let reason = frame
-                                        .map(|f| f.reason.to_string())
-                                        .unwrap_or_else(|| "server closed websocket".to_owned());
-                                    let _ = event_tx.send(NetworkEvent::Closed(reason));
-                                    break;
-                                }
-                                Ok(WsMessage::Ping(payload)) => {
-                                    if let Err(error) = write.send(WsMessage::Pong(payload)).await {
-                                        let _ = event_tx.send(NetworkEvent::Closed(format!("failed to send pong: {error}")));
-                                        break;
-                                    }
-                                }
-                                Ok(WsMessage::Pong(_)) | Ok(WsMessage::Binary(_)) | Ok(WsMessage::Frame(_)) => {}
-                                Err(error) => {
-                                    let _ = event_tx.send(NetworkEvent::Closed(format!("websocket error: {error}")));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        });
+                runtime.block_on(run_transport_supervisor(
+                    ws_url,
+                    display_name,
+                    client_build,
+                    schema_hash,
+                    reconnect,
+                    outbound_rx,
+                    control_rx,
+                    event_tx,
+                    thread_live,
+                    thread_resume,
+                    thread_fault,
+                ));
+            })
+            .context("failed to spawn online transport thread")?;
 
         Ok(Self {
             outbound: outbound_tx,
-            inbound: event_rx,
+            reliable_inbound: event_rx,
+            latest_live,
+            resume,
+            fault,
+            control: control_tx,
+            stopped,
+            #[cfg(test)]
+            test_graceful_completion: None,
         })
     }
 
-    pub(crate) fn send(&self, message: ClientMessage) -> Result<()> {
+    pub(crate) fn try_send(&self, message: ClientMessage) -> Result<()> {
         self.outbound
-            .send(message)
-            .map_err(|_| anyhow!("online connection is closed"))
+            .try_send(TransportCommand::Message(Box::new(message)))
+            .map_err(|error| match error {
+                tokio_mpsc::error::TrySendError::Full(_) => {
+                    anyhow!("online writer queue is full")
+                }
+                tokio_mpsc::error::TrySendError::Closed(_) => {
+                    anyhow!("online transport is closed")
+                }
+            })
     }
 
     pub(crate) fn try_recv(&self) -> Result<Option<NetworkEvent>> {
-        match self.inbound.try_recv() {
-            Ok(message) => Ok(Some(message)),
+        if let Some(fault) = self
+            .fault
+            .lock()
+            .expect("transport fault mutex poisoned")
+            .take()
+        {
+            if fault.terminal {
+                bail!(fault.message);
+            }
+            return Ok(Some(NetworkEvent::Disconnected {
+                reason: fault.message,
+                next_attempt: 0,
+                retry_in: Duration::ZERO,
+            }));
+        }
+
+        match self.reliable_inbound.try_recv() {
+            Ok(event) => Ok(Some(event)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
-                bail!("online connection channel disconnected")
+                bail!("online transport event channel disconnected")
             }
         }
+    }
+
+    pub(crate) fn take_latest_live(&self) -> Option<LiveStateSnapshot> {
+        self.latest_live
+            .lock()
+            .expect("latest live-state mutex poisoned")
+            .take()
+    }
+
+    pub(crate) fn set_resume(&self, resume: ResumeRequest) {
+        *self.resume.lock().expect("resume mutex poisoned") = Some(resume);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            let _ = self.control.send(TransportControl::ImmediateShutdown);
+        }
+    }
+
+    pub(crate) fn shutdown_gracefully(&self, messages: Vec<ClientMessage>) -> Result<()> {
+        validate_graceful_messages(&messages)?;
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return Err(GracefulShutdownError::AlreadyStopped.into());
+        }
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let request = GracefulShutdownRequest {
+            messages: messages.into(),
+            completion: completion_tx,
+        };
+        self.control
+            .send(TransportControl::GracefulShutdown(request.clone()))
+            .map_err(|_| GracefulShutdownError::ControlChannelClosed)?;
+
+        #[cfg(test)]
+        if let Some(result) = self.test_graceful_completion.clone() {
+            request.complete(result);
+        }
+
+        match completion_rx.recv_timeout(GRACEFUL_COMPLETION_WAIT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(GracefulShutdownError::CompletionChannelClosed.into())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.control.send(TransportControl::ImmediateShutdown);
+                Err(GracefulShutdownError::CompletionWaitTimedOut.into())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, TestNetworkPeer) {
+        let (outbound_tx, outbound_rx) = tokio_mpsc::channel(OUTBOUND_CAPACITY);
+        let (control_tx, control_rx) = watch::channel(TransportControl::Running);
+        let (event_tx, event_rx) = mpsc::sync_channel(RELIABLE_INBOUND_CAPACITY);
+        let latest_live = Arc::new(Mutex::new(None));
+        let resume = Arc::new(Mutex::new(None));
+        let fault = Arc::new(Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                outbound: outbound_tx,
+                reliable_inbound: event_rx,
+                latest_live: Arc::clone(&latest_live),
+                resume: Arc::clone(&resume),
+                fault,
+                control: control_tx,
+                stopped,
+                test_graceful_completion: Some(Ok(())),
+            },
+            TestNetworkPeer {
+                outbound: outbound_rx,
+                events: event_tx,
+                latest_live,
+                resume,
+                control: control_rx,
+            },
+        )
+    }
+}
+
+impl Drop for NetworkClient {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestNetworkPeer {
+    outbound: tokio_mpsc::Receiver<TransportCommand>,
+    events: SyncSender<NetworkEvent>,
+    latest_live: Arc<Mutex<Option<LiveStateSnapshot>>>,
+    resume: Arc<Mutex<Option<ResumeRequest>>>,
+    control: watch::Receiver<TransportControl>,
+}
+
+#[cfg(test)]
+impl TestNetworkPeer {
+    pub(crate) fn send_event(&self, event: NetworkEvent) {
+        self.events
+            .try_send(event)
+            .expect("test event queue has room");
+    }
+
+    pub(crate) fn send_server(&self, message: ServerMessage) {
+        self.send_event(NetworkEvent::Server(Box::new(message)));
+    }
+
+    pub(crate) fn set_live(&self, live: LiveStateSnapshot) {
+        *self.latest_live.lock().expect("test live mutex poisoned") = Some(live);
+    }
+
+    pub(crate) fn try_recv_message(&mut self) -> Option<ClientMessage> {
+        self.outbound
+            .try_recv()
+            .ok()
+            .map(|TransportCommand::Message(message)| *message)
+    }
+
+    pub(crate) fn resume_request(&self) -> Option<ResumeRequest> {
+        self.resume
+            .lock()
+            .expect("test resume mutex poisoned")
+            .clone()
+    }
+
+    pub(crate) fn take_graceful_shutdown_messages(&mut self) -> Option<Vec<ClientMessage>> {
+        self.control.has_changed().ok()?;
+        match self.control.borrow_and_update().clone() {
+            TransportControl::GracefulShutdown(request) => Some(request.messages.to_vec()),
+            TransportControl::Running | TransportControl::ImmediateShutdown => None,
+        }
+    }
+}
+
+fn validate_graceful_messages(
+    messages: &[ClientMessage],
+) -> std::result::Result<taiko_multiplayer_protocol::CommandSeq, GracefulShutdownError> {
+    let leave_positions = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(
+                message,
+                ClientMessage::Command(taiko_multiplayer_protocol::CommandEnvelope {
+                    command: taiko_multiplayer_protocol::ClientCommand::LeaveRoom,
+                    ..
+                })
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(&leave_index) = leave_positions.last() else {
+        return Err(GracefulShutdownError::MissingLeave);
+    };
+    if leave_positions.len() != 1 || leave_index + 1 != messages.len() {
+        return Err(GracefulShutdownError::LeaveNotLast);
+    }
+    let ClientMessage::Command(envelope) = &messages[leave_index] else {
+        unreachable!("leave position only matches command envelopes");
+    };
+    Ok(envelope.seq)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transport_supervisor(
+    ws_url: Url,
+    display_name: DisplayName,
+    client_build: ClientBuild,
+    schema_hash: ContentHash,
+    reconnect: ReconnectPolicy,
+    mut outbound_rx: tokio_mpsc::Receiver<TransportCommand>,
+    mut control_rx: watch::Receiver<TransportControl>,
+    event_tx: SyncSender<NetworkEvent>,
+    latest_live: Arc<Mutex<Option<LiveStateSnapshot>>>,
+    resume: Arc<Mutex<Option<ResumeRequest>>>,
+    fault: Arc<Mutex<Option<TransportFault>>>,
+) {
+    let mut budget = ReconnectBudget::new(&reconnect);
+    loop {
+        if complete_disconnected_control(&control_rx, "not connected") {
+            return;
+        }
+        let Some(attempt) = budget.begin_attempt() else {
+            set_transport_fault(
+                &fault,
+                format!(
+                    "reconnect attempt budget exhausted after {} attempts",
+                    budget.attempts_started()
+                ),
+                true,
+            );
+            return;
+        };
+        if emit_reliable(
+            &event_tx,
+            NetworkEvent::Connecting {
+                attempt: attempt.ordinal,
+                delay: attempt.delay,
+            },
+            &fault,
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        if !attempt.delay.is_zero() {
+            let sleep = tokio::time::sleep(attempt.delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    changed = control_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        if complete_disconnected_control(&control_rx, "waiting to reconnect") {
+                            return;
+                        }
+                    }
+                    command = outbound_rx.recv() => match command {
+                        None => return,
+                        Some(TransportCommand::Message(_)) => {
+                            // Reliable messages live in OnlineDomain and are replayed
+                            // after Welcome. Never retain stale heartbeats/time-sync here.
+                        }
+                    }
+                }
+            }
+        }
+
+        while outbound_rx.try_recv().is_ok() {}
+
+        let hello = ClientMessage::Hello(ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            wire_schema_sha256: schema_hash.clone(),
+            client_build: client_build.clone(),
+            display_name: display_name.clone(),
+            resume: resume.lock().expect("resume mutex poisoned").clone(),
+        });
+
+        match run_one_connection(
+            &ws_url,
+            hello,
+            &schema_hash,
+            &mut outbound_rx,
+            &mut control_rx,
+            &event_tx,
+            &latest_live,
+            &fault,
+        )
+        .await
+        {
+            ConnectionExit::Shutdown => return,
+            ConnectionExit::Terminal(message) => {
+                set_transport_fault(&fault, message, true);
+                return;
+            }
+            ConnectionExit::Retry {
+                reason,
+                stable_connection,
+            } => {
+                let Some(next) = budget.record_failure(stable_connection) else {
+                    if complete_disconnected_control(&control_rx, "connection lost") {
+                        return;
+                    }
+                    set_transport_fault(
+                        &fault,
+                        format!(
+                            "reconnect attempt budget exhausted after {} attempts: {reason}",
+                            budget.attempts_started()
+                        ),
+                        true,
+                    );
+                    return;
+                };
+                if emit_reliable(
+                    &event_tx,
+                    NetworkEvent::Disconnected {
+                        reason,
+                        next_attempt: next.ordinal,
+                        retry_in: next.delay,
+                    },
+                    &fault,
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+enum ConnectionExit {
+    Shutdown,
+    Retry {
+        reason: String,
+        stable_connection: bool,
+    },
+    Terminal(String),
+}
+
+fn complete_disconnected_control(
+    control_rx: &watch::Receiver<TransportControl>,
+    phase: &'static str,
+) -> bool {
+    match control_rx.borrow().clone() {
+        TransportControl::Running => false,
+        TransportControl::ImmediateShutdown => true,
+        TransportControl::GracefulShutdown(request) => {
+            request.complete(Err(GracefulShutdownError::NotConnected { phase }));
+            true
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_connection(
+    ws_url: &Url,
+    hello: ClientMessage,
+    expected_schema_hash: &ContentHash,
+    outbound_rx: &mut tokio_mpsc::Receiver<TransportCommand>,
+    control_rx: &mut watch::Receiver<TransportControl>,
+    event_tx: &SyncSender<NetworkEvent>,
+    latest_live: &Arc<Mutex<Option<LiveStateSnapshot>>>,
+    fault: &Arc<Mutex<Option<TransportFault>>>,
+) -> ConnectionExit {
+    let ws_config = WebSocketConfig::default()
+        .read_buffer_size(16 * 1024)
+        .write_buffer_size(16 * 1024)
+        .max_write_buffer_size(MAX_WIRE_MESSAGE_BYTES.saturating_add(16 * 1024))
+        .max_message_size(Some(MAX_WIRE_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WIRE_MESSAGE_BYTES));
+    let connection = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_async_with_config(ws_url.as_str(), Some(ws_config), true),
+    );
+    tokio::pin!(connection);
+    let connection = loop {
+        tokio::select! {
+            result = &mut connection => break result,
+            changed = control_rx.changed() => {
+                if changed.is_err() {
+                    return ConnectionExit::Shutdown;
+                }
+                if complete_disconnected_control(control_rx, "connecting") {
+                    return ConnectionExit::Shutdown;
+                }
+            }
+        }
+    };
+    let (stream, _) = match connection {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            return ConnectionExit::Retry {
+                reason: format!("connection to {ws_url} failed: {error}"),
+                stable_connection: false,
+            };
+        }
+        Err(_) => {
+            return ConnectionExit::Retry {
+                reason: format!("connection to {ws_url} timed out"),
+                stable_connection: false,
+            };
+        }
+    };
+    let (mut write, mut read) = stream.split();
+
+    if let Err(error) = send_wire_message(&mut write, &hello).await {
+        return ConnectionExit::Retry {
+            reason: error,
+            stable_connection: false,
+        };
+    }
+
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let first = loop {
+        let incoming = tokio::select! {
+            result = tokio::time::timeout_at(handshake_deadline, read.next()) => result,
+            changed = control_rx.changed() => {
+                if changed.is_err() {
+                    return ConnectionExit::Shutdown;
+                }
+                let control = control_rx.borrow().clone();
+                match control {
+                    TransportControl::Running => continue,
+                    TransportControl::ImmediateShutdown => {
+                        let _ = send_ws_frame(&mut write, WsMessage::Close(None)).await;
+                        return ConnectionExit::Shutdown;
+                    }
+                    TransportControl::GracefulShutdown(request) => {
+                        let _ = send_ws_frame(&mut write, WsMessage::Close(None)).await;
+                        request.complete(Err(GracefulShutdownError::NotConnected {
+                            phase: "performing the protocol handshake",
+                        }));
+                        return ConnectionExit::Shutdown;
+                    }
+                }
+            }
+        };
+        let message = match incoming {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(error))) => {
+                return ConnectionExit::Retry {
+                    reason: format!("handshake read failed: {error}"),
+                    stable_connection: false,
+                };
+            }
+            Ok(None) => {
+                return ConnectionExit::Retry {
+                    reason: "server closed during handshake".to_owned(),
+                    stable_connection: false,
+                };
+            }
+            Err(_) => {
+                return ConnectionExit::Retry {
+                    reason: "server handshake timed out".to_owned(),
+                    stable_connection: false,
+                };
+            }
+        };
+        match message {
+            WsMessage::Ping(payload) => {
+                if let Err(error) = send_ws_frame(&mut write, WsMessage::Pong(payload)).await {
+                    return ConnectionExit::Retry {
+                        reason: format!("failed to send handshake pong: {error}"),
+                        stable_connection: false,
+                    };
+                }
+            }
+            WsMessage::Pong(_) => {}
+            WsMessage::Close(frame) => {
+                return ConnectionExit::Retry {
+                    reason: frame
+                        .map(|frame| frame.reason.to_string())
+                        .unwrap_or_else(|| "server closed during handshake".to_owned()),
+                    stable_connection: false,
+                };
+            }
+            other => break other,
+        }
+    };
+    let first = match decode_server_message(first) {
+        Ok(message) => message,
+        Err(error) => return ConnectionExit::Terminal(error),
+    };
+    let server_silence_timeout = match &first {
+        ServerMessage::Welcome(welcome)
+            if welcome.protocol_version == PROTOCOL_VERSION
+                && &welcome.wire_schema_sha256 == expected_schema_hash =>
+        {
+            Duration::from_millis(u64::from(welcome.heartbeat_interval_ms).saturating_mul(3))
+                .max(MIN_SERVER_SILENCE_TIMEOUT)
+        }
+        ServerMessage::Welcome(welcome) => {
+            return ConnectionExit::Terminal(format!(
+                "server protocol schema mismatch: version={} schema={}",
+                welcome.protocol_version, welcome.wire_schema_sha256
+            ));
+        }
+        ServerMessage::Fatal(error) if error.retryable => {
+            return ConnectionExit::Retry {
+                reason: protocol_error_reason(error),
+                stable_connection: false,
+            };
+        }
+        ServerMessage::Fatal(_) => {
+            if emit_server_message(first.clone(), event_tx, latest_live, fault).is_err() {
+                return ConnectionExit::Terminal("local reliable reader is too slow".to_owned());
+            }
+            return ConnectionExit::Shutdown;
+        }
+        _ => {
+            return ConnectionExit::Terminal(
+                "protocol violation: first server message was not Welcome".to_owned(),
+            );
+        }
+    };
+    let mut connection_health = ConnectionHealthTracker::new();
+    if emit_server_message(first, event_tx, latest_live, fault).is_err() {
+        return ConnectionExit::Terminal("local reliable reader is too slow".to_owned());
+    }
+
+    let server_silence = tokio::time::sleep(server_silence_timeout);
+    tokio::pin!(server_silence);
+    loop {
+        tokio::select! {
+            biased;
+            changed = control_rx.changed() => {
+                if changed.is_err() {
+                    return ConnectionExit::Shutdown;
+                }
+                let control = control_rx.borrow().clone();
+                match control {
+                    TransportControl::Running => {}
+                    TransportControl::ImmediateShutdown => {
+                        let _ = send_ws_frame(&mut write, WsMessage::Close(None)).await;
+                        return ConnectionExit::Shutdown;
+                    }
+                    TransportControl::GracefulShutdown(request) => {
+                        let result = flush_graceful_shutdown(
+                            &mut write,
+                            &mut read,
+                            &request.messages,
+                        )
+                        .await;
+                        request.complete(result);
+                        return ConnectionExit::Shutdown;
+                    }
+                }
+            }
+            _ = &mut server_silence => {
+                return ConnectionExit::Retry {
+                    reason: "server stopped acknowledging the connection".to_owned(),
+                    stable_connection: connection_health.is_stable(),
+                };
+            }
+            outgoing = outbound_rx.recv() => {
+                match outgoing {
+                    Some(TransportCommand::Message(message)) => {
+                        if let Err(error) = send_wire_message(&mut write, &message).await {
+                            return ConnectionExit::Retry {
+                                reason: error,
+                                stable_connection: connection_health.is_stable(),
+                            };
+                        }
+                    }
+                    None => {
+                        let _ = send_ws_frame(&mut write, WsMessage::Close(None)).await;
+                        return ConnectionExit::Shutdown;
+                    }
+                }
+            }
+            incoming = read.next() => {
+                let message = match incoming {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        return ConnectionExit::Retry {
+                            reason: format!("websocket read failed: {error}"),
+                            stable_connection: connection_health.is_stable(),
+                        };
+                    }
+                    None => {
+                        return ConnectionExit::Retry {
+                            reason: "server closed the websocket".to_owned(),
+                            stable_connection: connection_health.is_stable(),
+                        };
+                    }
+                };
+                server_silence
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + server_silence_timeout);
+                match message {
+                    WsMessage::Ping(payload) => {
+                        if let Err(error) = send_ws_frame(&mut write, WsMessage::Pong(payload)).await {
+                            return ConnectionExit::Retry {
+                                reason: format!("failed to send websocket pong: {error}"),
+                                stable_connection: connection_health.is_stable(),
+                            };
+                        }
+                    }
+                    WsMessage::Pong(_) => {}
+                    WsMessage::Close(frame) => {
+                        let reason = frame
+                            .map(|frame| frame.reason.to_string())
+                            .unwrap_or_else(|| "server closed the websocket".to_owned());
+                        return ConnectionExit::Retry {
+                            reason,
+                            stable_connection: connection_health.is_stable(),
+                        };
+                    }
+                    other => {
+                        let server_message = match decode_server_message(other) {
+                            Ok(message) => message,
+                            Err(error) => return ConnectionExit::Terminal(error),
+                        };
+                        connection_health.observe(
+                            &server_message,
+                            tokio::time::Instant::now(),
+                        );
+                        match server_message {
+                            ServerMessage::Fatal(error) if error.retryable => {
+                                return ConnectionExit::Retry {
+                                    reason: protocol_error_reason(&error),
+                                    stable_connection: connection_health.is_stable(),
+                                };
+                            }
+                            fatal @ ServerMessage::Fatal(_) => {
+                                if emit_server_message(fatal, event_tx, latest_live, fault).is_err() {
+                                    return ConnectionExit::Terminal(
+                                        "local reliable reader is too slow".to_owned(),
+                                    );
+                                }
+                                return ConnectionExit::Shutdown;
+                            }
+                            message => {
+                                if emit_server_message(message, event_tx, latest_live, fault).is_err() {
+                                    return ConnectionExit::Terminal(
+                                        "local reliable reader is too slow".to_owned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn flush_graceful_shutdown<S, R, ReadError>(
+    write: &mut S,
+    read: &mut R,
+    messages: &[ClientMessage],
+) -> GracefulShutdownResult
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+    R: futures_util::Stream<Item = std::result::Result<WsMessage, ReadError>> + Unpin,
+    ReadError: std::fmt::Display,
+{
+    let leave_seq = validate_graceful_messages(messages)?;
+    let leave_index = messages
+        .len()
+        .checked_sub(1)
+        .ok_or(GracefulShutdownError::MissingLeave)?;
+    let leave_message = &messages[leave_index];
+    tokio::time::timeout(GRACEFUL_FLUSH_TIMEOUT, async {
+        for (index, message) in messages.iter().enumerate() {
+            send_wire_message(write, message)
+                .await
+                .map_err(|reason| GracefulShutdownError::MessageWrite { index, reason })?;
+        }
+
+        let mut leave_retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + GRACEFUL_LEAVE_RETRY_INTERVAL,
+            GRACEFUL_LEAVE_RETRY_INTERVAL,
+        );
+        leave_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                incoming = read.next() => {
+                    let incoming = incoming
+                        .ok_or(GracefulShutdownError::PeerClosedBeforeLeaveAck)?
+                        .map_err(|error| GracefulShutdownError::PeerProtocol {
+                            reason: format!("websocket read failed: {error}"),
+                        })?;
+                    match incoming {
+                        WsMessage::Ping(payload) => {
+                            send_ws_frame(write, WsMessage::Pong(payload))
+                                .await
+                                .map_err(|reason| GracefulShutdownError::ControlWrite { reason })?;
+                        }
+                        WsMessage::Pong(_) => {}
+                        WsMessage::Close(_) => {
+                            return Err(GracefulShutdownError::PeerClosedBeforeLeaveAck);
+                        }
+                        text @ WsMessage::Text(_) => {
+                            let message = decode_server_message(text)
+                                .map_err(|reason| GracefulShutdownError::PeerProtocol { reason })?;
+                            match message {
+                                ServerMessage::CommandAck(ack) if ack.seq == leave_seq => {
+                                    match ack.outcome {
+                                        taiko_multiplayer_protocol::CommandOutcome::Applied { .. } => break,
+                                        taiko_multiplayer_protocol::CommandOutcome::Rejected {
+                                            error,
+                                            ..
+                                        } => {
+                                            return Err(GracefulShutdownError::LeaveRejected {
+                                                reason: protocol_error_reason(&error),
+                                            });
+                                        }
+                                    }
+                                }
+                                ServerMessage::Fatal(error) => {
+                                    return Err(GracefulShutdownError::PeerProtocol {
+                                        reason: protocol_error_reason(&error),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        other => {
+                            return Err(GracefulShutdownError::PeerProtocol {
+                                reason: format!("unexpected websocket frame: {other:?}"),
+                            });
+                        }
+                    }
+                }
+                _ = leave_retry.tick() => {
+                    send_wire_message(write, leave_message)
+                        .await
+                        .map_err(|reason| GracefulShutdownError::MessageWrite {
+                            index: leave_index,
+                            reason,
+                        })?;
+                }
+            }
+        }
+
+        send_ws_frame(write, WsMessage::Close(None))
+            .await
+            .map_err(|reason| GracefulShutdownError::CloseWrite { reason })
+    })
+    .await
+    .map_err(|_| GracefulShutdownError::FlushTimedOut)?
+}
+
+async fn send_wire_message<S>(
+    write: &mut S,
+    message: &ClientMessage,
+) -> std::result::Result<(), String>
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let raw = serde_json::to_string(message).map_err(|error| format!("encode failed: {error}"))?;
+    if raw.len() > MAX_WIRE_MESSAGE_BYTES {
+        return Err(format!(
+            "outgoing protocol message exceeds {MAX_WIRE_MESSAGE_BYTES} bytes"
+        ));
+    }
+    send_ws_frame(write, WsMessage::Text(raw.into())).await
+}
+
+async fn send_ws_frame<S>(write: &mut S, message: WsMessage) -> std::result::Result<(), String>
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::time::timeout(WRITE_TIMEOUT, write.send(message))
+        .await
+        .map_err(|_| "websocket write timed out".to_owned())?
+        .map_err(|error| format!("websocket write failed: {error}"))
+}
+
+fn protocol_error_reason(error: &taiko_multiplayer_protocol::ProtocolError) -> String {
+    format!("{:?}: {}", error.code, error.message)
+}
+
+fn decode_server_message(message: WsMessage) -> std::result::Result<ServerMessage, String> {
+    let WsMessage::Text(raw) = message else {
+        return Err("protocol violation: expected a JSON text frame".to_owned());
+    };
+    serde_json::from_str(&raw).map_err(|error| format!("invalid server message: {error}"))
+}
+
+fn emit_server_message(
+    message: ServerMessage,
+    event_tx: &SyncSender<NetworkEvent>,
+    latest_live: &Arc<Mutex<Option<LiveStateSnapshot>>>,
+    fault: &Arc<Mutex<Option<TransportFault>>>,
+) -> std::result::Result<(), ()> {
+    match message {
+        ServerMessage::LiveState(live) => {
+            let mut slot = latest_live.lock().expect("latest live mutex poisoned");
+            if slot.as_ref().is_none_or(|current| {
+                current.match_id != live.match_id || current.state_seq < live.state_seq
+            }) {
+                *slot = Some(live);
+            }
+            Ok(())
+        }
+        reliable => emit_reliable(event_tx, NetworkEvent::Server(Box::new(reliable)), fault),
+    }
+}
+
+fn emit_reliable(
+    event_tx: &SyncSender<NetworkEvent>,
+    event: NetworkEvent,
+    fault: &Arc<Mutex<Option<TransportFault>>>,
+) -> std::result::Result<(), ()> {
+    match event_tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(_)) => {
+            set_transport_fault(
+                fault,
+                "local reliable event queue overflowed; closing slow client".to_owned(),
+                true,
+            );
+            Err(())
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => Err(()),
+    }
+}
+
+fn set_transport_fault(
+    fault: &Arc<Mutex<Option<TransportFault>>>,
+    message: String,
+    terminal: bool,
+) {
+    let mut slot = fault.lock().expect("transport fault mutex poisoned");
+    if slot.is_none() || terminal {
+        *slot = Some(TransportFault { message, terminal });
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedMatch {
-    pub(crate) selection: MatchSongSelection,
-    pub(crate) branch_decisions: Vec<rhythm_importer_tja::BranchDecisionPoint>,
-    pub(crate) chart: rhythm_chart::CanonicalChart,
-    pub(crate) audio_source: SongAudioSource,
+    pub(crate) match_id: taiko_multiplayer_protocol::MatchId,
+    pub(crate) selection: taiko_multiplayer_protocol::PlayerSelection,
+    pub(crate) audio: Option<crate::audio::PreparedSongAudio>,
 }
 
 pub(crate) struct LocalPlayerRuntime {
-    pub(crate) engine: ControlledEngine<TaikoMode>,
-    pub(crate) branch_controller: BranchController,
+    pub(crate) match_id: taiko_multiplayer_protocol::MatchId,
+    pub(crate) gameplay: TaikoRuntime,
     pub(crate) pending_inputs: Vec<TimedInput<TaikoAction>>,
-    pub(crate) input_seq: u64,
-    pub(crate) state_seq: u64,
-    pub(crate) final_seq: u64,
     pub(crate) last_tick: Tick,
     pub(crate) last_output: rhythm_core::FrameOutput<TaikoMode>,
-    pub(crate) sent_final: bool,
     pub(crate) music_started: bool,
+    pub(crate) audio_sync: Option<crate::audio_sync::AudioSyncController>,
     pub(crate) judge_flash: Option<crate::app::JudgeFlashState>,
     pub(crate) input_flash: Option<crate::app::InputFlashState>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ClockSyncState {
-    current_offset_ms: i64,
-    target_offset_ms: i64,
-    drift_ppm: f64,
-    offset_median_ms: i64,
-    p50_rtt_ms: f64,
-    p95_rtt_ms: f64,
-    jitter_ms: f64,
-    accepted_samples: u64,
-    rejected_samples: u64,
-    large_correction_count: u64,
-    rtt_window_ms: VecDeque<f64>,
-    offset_window_ms: VecDeque<i64>,
-    last_rtt_sample_ms: Option<f64>,
-    last_slew_local_ms: Option<u64>,
-    drift_anchor_local_ms: Option<u64>,
-    drift_anchor_offset_ms: i64,
-}
-
-impl ClockSyncState {
-    pub(crate) fn observe_sample(
-        &mut self,
-        client_send_ms: u64,
-        client_receive_ms: u64,
-        server_send_ms: u64,
-    ) {
-        if client_receive_ms < client_send_ms {
-            self.rejected_samples = self.rejected_samples.saturating_add(1);
-            return;
-        }
-
-        let sample_rtt_ms = client_receive_ms.saturating_sub(client_send_ms) as f64;
-        if !sample_rtt_ms.is_finite() || sample_rtt_ms < 0.0 {
-            self.rejected_samples = self.rejected_samples.saturating_add(1);
-            return;
-        }
-
-        if self.rtt_window_ms.len() >= 8 {
-            let median_rtt =
-                median_f64(self.rtt_window_ms.iter().copied()).unwrap_or(sample_rtt_ms);
-            let mad = median_absolute_deviation_f64(self.rtt_window_ms.iter().copied(), median_rtt)
-                .unwrap_or(0.0)
-                .max(1.0);
-            let outlier_cutoff =
-                median_rtt + mad * CLOCK_OUTLIER_MAD_SCALE + CLOCK_OUTLIER_FIXED_MARGIN_MS;
-            if sample_rtt_ms > outlier_cutoff {
-                self.rejected_samples = self.rejected_samples.saturating_add(1);
-                return;
-            }
-        }
-
-        let midpoint_ms = client_send_ms.saturating_add(client_receive_ms) / 2;
-        let sample_offset_ms = server_send_ms as i64 - midpoint_ms as i64;
-
-        if let Some(prev_rtt_ms) = self.last_rtt_sample_ms {
-            let deviation = (sample_rtt_ms - prev_rtt_ms).abs();
-            self.jitter_ms = if self.accepted_samples == 0 {
-                deviation
-            } else {
-                self.jitter_ms * 0.75 + deviation * 0.25
-            };
-        }
-        self.last_rtt_sample_ms = Some(sample_rtt_ms);
-
-        push_window(&mut self.rtt_window_ms, sample_rtt_ms, CLOCK_SAMPLE_WINDOW);
-        push_window(
-            &mut self.offset_window_ms,
-            sample_offset_ms,
-            CLOCK_SAMPLE_WINDOW,
-        );
-
-        self.p50_rtt_ms =
-            percentile_f64(self.rtt_window_ms.iter().copied(), 0.5).unwrap_or(sample_rtt_ms);
-        self.p95_rtt_ms =
-            percentile_f64(self.rtt_window_ms.iter().copied(), 0.95).unwrap_or(sample_rtt_ms);
-        self.offset_median_ms =
-            median_i64(self.offset_window_ms.iter().copied()).unwrap_or(sample_offset_ms);
-        self.target_offset_ms = self.offset_median_ms;
-        self.accepted_samples = self.accepted_samples.saturating_add(1);
-
-        if (self.target_offset_ms - self.current_offset_ms).abs() > 80 {
-            self.large_correction_count = self.large_correction_count.saturating_add(1);
-        }
-
-        self.update_drift(client_receive_ms);
-    }
-
-    fn update_drift(&mut self, local_now_ms: u64) {
-        let Some(anchor_local_ms) = self.drift_anchor_local_ms else {
-            self.drift_anchor_local_ms = Some(local_now_ms);
-            self.drift_anchor_offset_ms = self.offset_median_ms;
-            return;
-        };
-
-        let elapsed_ms = local_now_ms.saturating_sub(anchor_local_ms);
-        if elapsed_ms < CLOCK_DRIFT_RECALC_INTERVAL_MS {
-            return;
-        }
-
-        let delta_offset_ms = self.offset_median_ms - self.drift_anchor_offset_ms;
-        let drift_ppm = (delta_offset_ms as f64 / elapsed_ms as f64) * 1_000_000.0;
-        let drift_ppm = drift_ppm.clamp(-CLOCK_DRIFT_PPM_LIMIT, CLOCK_DRIFT_PPM_LIMIT);
-        self.drift_ppm = self.drift_ppm * 0.9 + drift_ppm * 0.1;
-
-        self.drift_anchor_local_ms = Some(local_now_ms);
-        self.drift_anchor_offset_ms = self.offset_median_ms;
-    }
-
-    pub(crate) fn tick(&mut self, local_now_ms: u64) {
-        let Some(last_slew_local_ms) = self.last_slew_local_ms else {
-            self.last_slew_local_ms = Some(local_now_ms);
-            if self.accepted_samples > 0 {
-                self.current_offset_ms = self.target_offset_ms;
-            }
-            return;
-        };
-
-        let dt_ms = local_now_ms.saturating_sub(last_slew_local_ms);
-        self.last_slew_local_ms = Some(local_now_ms);
-        if dt_ms == 0 {
-            return;
-        }
-
-        let diff_ms = self.target_offset_ms - self.current_offset_ms;
-        if diff_ms == 0 {
-            return;
-        }
-
-        let max_step_ms = (CLOCK_SLEW_MAX_PER_SECOND_MS * dt_ms as f64 / 1000.0)
-            .max(1.0)
-            .round() as i64;
-        let step_ms = diff_ms.clamp(-max_step_ms, max_step_ms);
-        self.current_offset_ms = self.current_offset_ms.saturating_add(step_ms);
-    }
-
-    pub(crate) fn estimated_server_now_ms(&self, local_now_ms: u64) -> u64 {
-        let mut server_now_ms = local_now_ms as i128 + self.current_offset_ms as i128;
-        if let Some(anchor_local_ms) = self.drift_anchor_local_ms {
-            let elapsed_ms = local_now_ms.saturating_sub(anchor_local_ms) as f64;
-            let drift_ms = (elapsed_ms * self.drift_ppm / 1_000_000.0).round() as i128;
-            server_now_ms += drift_ms;
-        }
-        server_now_ms.max(0) as u64
-    }
-
-    fn has_sample(&self) -> bool {
-        self.accepted_samples > 0
-    }
-}
-
-impl Default for ClockSyncState {
-    fn default() -> Self {
-        Self {
-            current_offset_ms: 0,
-            target_offset_ms: 0,
-            drift_ppm: 0.0,
-            offset_median_ms: 0,
-            p50_rtt_ms: 0.0,
-            p95_rtt_ms: 0.0,
-            jitter_ms: 0.0,
-            accepted_samples: 0,
-            rejected_samples: 0,
-            large_correction_count: 0,
-            rtt_window_ms: VecDeque::new(),
-            offset_window_ms: VecDeque::new(),
-            last_rtt_sample_ms: None,
-            last_slew_local_ms: None,
-            drift_anchor_local_ms: None,
-            drift_anchor_offset_ms: 0,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct LobbySongBrowser {
-    query: String,
-    filter_error: Option<String>,
-    filtered_song_indices: Vec<usize>,
-    selection_index: usize,
-}
-
-impl LobbySongBrowser {
-    fn new(song_count: usize) -> Self {
-        Self {
-            query: String::new(),
-            filter_error: None,
-            filtered_song_indices: (0..song_count).collect(),
-            selection_index: 0,
-        }
-    }
-
-    fn selected_song_index(&self) -> Option<usize> {
-        self.filtered_song_indices
-            .get(self.selection_index)
-            .copied()
-    }
-
-    fn move_selection(&mut self, delta: i32) {
-        if self.filtered_song_indices.is_empty() {
-            self.selection_index = 0;
-            return;
-        }
-
-        let len = self.filtered_song_indices.len() as i32;
-        let current = self.selection_index as i32;
-        let next = (current + delta).rem_euclid(len);
-        self.selection_index = next as usize;
-    }
-
-    fn sync_to_song_index(&mut self, song_index: usize) -> bool {
-        let Some(next_position) = self
-            .filtered_song_indices
-            .iter()
-            .position(|index| *index == song_index)
-        else {
-            return false;
-        };
-        self.selection_index = next_position;
-        true
-    }
-
-    fn rebuild_filter(&mut self, songs: &[crate::loader::SongEntry]) {
-        let previous_selected = self.selected_song_index();
-
-        if self.query.is_empty() {
-            self.filter_error = None;
-            self.filtered_song_indices = (0..songs.len()).collect();
-        } else {
-            match SongFilter::parse(&self.query) {
-                Ok(filter) => {
-                    self.filter_error = None;
-                    let root = Path::new(LOBBY_FILTER_ROOT);
-                    self.filtered_song_indices = songs
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, song)| filter.matches(song, root).then_some(index))
-                        .collect();
-                }
-                Err(error) => {
-                    self.filter_error = Some(error);
-                    self.filtered_song_indices.clear();
-                }
-            }
-        }
-
-        if let Some(previous_selected) = previous_selected {
-            self.selection_index = self
-                .filtered_song_indices
-                .iter()
-                .position(|index| *index == previous_selected)
-                .unwrap_or_default();
-        } else {
-            self.selection_index = 0;
-        }
-
-        if self.selection_index >= self.filtered_song_indices.len() {
-            self.selection_index = self.filtered_song_indices.len().saturating_sub(1);
-        }
-    }
-
-    fn clear_query(&mut self, songs: &[crate::loader::SongEntry]) {
-        self.query.clear();
-        self.rebuild_filter(songs);
-    }
-
-    fn handle_search_key(&mut self, key: KeyEvent, songs: &[crate::loader::SongEntry]) -> bool {
-        match key {
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } if !self.query.is_empty() => {
-                self.clear_query(songs);
-                true
-            }
-            KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            } => {
-                if self.query.pop().is_some() {
-                    self.rebuild_filter(songs);
-                }
-                true
-            }
-            KeyEvent {
-                code: KeyCode::Delete,
-                ..
-            } => {
-                if !self.query.is_empty() {
-                    self.clear_query(songs);
-                }
-                true
-            }
-            KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers,
-                ..
-            } if modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.query.is_empty() {
-                    self.clear_query(songs);
-                }
-                true
-            }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if !modifiers.contains(KeyModifiers::CONTROL)
-                && !modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.query.push(c);
-                self.rebuild_filter(songs);
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum OnlineEvent {
-    Init {
-        song_count: usize,
-    },
-    Connected {
-        protocol_version: u32,
-        session_id: String,
-    },
-    Error {
-        code: String,
-        message: String,
-    },
-    RoomCreated {
-        room_code: String,
-    },
-    RoomJoined {
-        room_code: String,
-        role: RoomRole,
-    },
-    Snapshot {
-        phase: RoomPhase,
-        player_count: usize,
-        song_title: Option<String>,
-    },
-    SongSelected {
-        title: String,
-        course_index: usize,
-    },
-    Ready,
-    Unready,
-    Countdown {
-        start_at_ms: u64,
-    },
-    MatchStarted {
-        start_at_ms: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LobbySubState {
-    BrowsingSongs,
-    SelectingCourse,
-}
-
-pub(crate) struct OnlineApp {
-    mode: ClientMode,
-    network: NetworkClient,
-    theme: Theme,
-    should_quit: bool,
-    status_message: String,
-    error_message: Option<String>,
-    room_code: Option<String>,
-    actor_id: Option<String>,
-    role: Option<RoomRole>,
-    snapshot: Option<RoomSnapshot>,
-    live_states: HashMap<String, PlayerStateUpdate>,
-    final_results: HashMap<String, FinalResultReport>,
-    ready: bool,
-    lobby_song_browser: LobbySongBrowser,
-    host_course_index: usize,
-    lobby_sub_state: LobbySubState,
-    local_course_index: usize,
-    lobby_demo_pending: Option<(Instant, usize)>,
-    lobby_demo_playing_song: Option<usize>,
-    resource_backend: ResourceBackend,
-    song_library: SongLibrary,
-    importer: TjaImporter,
-    prepared_match: Option<PreparedMatch>,
-    local_player: Option<LocalPlayerRuntime>,
-    audio: AudioEngine,
-    local_unix_base_ms: u64,
-    local_mono_base: Instant,
-    clock_sync: ClockSyncState,
-    last_ping_sent: Instant,
-    last_drift_sync: Instant,
-    headless: bool,
-    headless_label: String,
-    headless_room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
-    headless_event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
-}
-
-impl OnlineApp {
-    fn new(args: OnlineCommandArgs) -> Result<Self> {
-        let (server, name, mode) = match &args.action {
-            OnlineAction::Create(args) => (&args.server, &args.name, ClientMode::Player),
-            OnlineAction::Join(args) => (&args.server, &args.name, ClientMode::Player),
-            OnlineAction::Spectate(args) => (&args.server, &args.name, ClientMode::Spectator),
-        };
-
-        let network = NetworkClient::connect(server, name, &args.action)?;
-        let resource_endpoint = resource_http_endpoint(server)?;
-        let resource_backend = ResourceBackend::remote(&resource_endpoint, false)
-            .context("failed to initialize remote resource backend")?;
-        let song_library = resource_backend
-            .load_song_library()
-            .context("failed to load song library from server")?;
-
-        let local_unix_base_ms = now_unix_ms();
-        let local_mono_base = Instant::now();
-
-        Ok(Self {
-            mode,
-            network,
-            theme: Theme::taiko_vivid(Theme::detect()),
-            should_quit: false,
-            status_message: "connecting...".to_owned(),
-            error_message: None,
-            room_code: None,
-            actor_id: None,
-            role: None,
-            snapshot: None,
-            live_states: HashMap::new(),
-            final_results: HashMap::new(),
-            ready: false,
-            lobby_song_browser: LobbySongBrowser::new(song_library.songs.len()),
-            host_course_index: 0,
-            lobby_sub_state: LobbySubState::BrowsingSongs,
-            local_course_index: 0,
-            lobby_demo_pending: None,
-            lobby_demo_playing_song: None,
-            resource_backend,
-            song_library,
-            importer: TjaImporter,
-            prepared_match: None,
-            local_player: None,
-            audio: AudioEngine::new(100, 100)?,
-            local_unix_base_ms,
-            local_mono_base,
-            clock_sync: ClockSyncState::default(),
-            last_ping_sent: Instant::now(),
-            last_drift_sync: Instant::now(),
-            headless: false,
-            headless_label: String::new(),
-            headless_room_code_tx: None,
-            headless_event_tx: None,
-        })
-    }
-
-    pub fn new_headless(
-        args: OnlineCommandArgs,
-        label: String,
-        room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
-        event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
-    ) -> Result<Self> {
-        let (server, name, mode) = match &args.action {
-            OnlineAction::Create(args) => (&args.server, &args.name, ClientMode::Player),
-            OnlineAction::Join(args) => (&args.server, &args.name, ClientMode::Player),
-            OnlineAction::Spectate(args) => (&args.server, &args.name, ClientMode::Spectator),
-        };
-
-        let network = NetworkClient::connect(server, name, &args.action)?;
-        let resource_endpoint = resource_http_endpoint(server)?;
-        let resource_backend = ResourceBackend::remote(&resource_endpoint, true)
-            .context("failed to initialize remote resource backend")?;
-        let song_library = resource_backend
-            .load_song_library()
-            .context("failed to load song library from server")?;
-
-        let local_unix_base_ms = now_unix_ms();
-        let local_mono_base = Instant::now();
-
-        let song_count = song_library.songs.len();
-        println!("[{label}] INIT songs={song_count}");
-        if let Some(tx) = &event_tx {
-            let _ = tx.send(OnlineEvent::Init { song_count });
-        }
-
-        Ok(Self {
-            mode,
-            network,
-            theme: Theme::taiko_vivid(Theme::detect()),
-            should_quit: false,
-            status_message: "connecting...".to_owned(),
-            error_message: None,
-            room_code: None,
-            actor_id: None,
-            role: None,
-            snapshot: None,
-            live_states: HashMap::new(),
-            final_results: HashMap::new(),
-            ready: false,
-            lobby_song_browser: LobbySongBrowser::new(song_library.songs.len()),
-            host_course_index: 0,
-            lobby_sub_state: LobbySubState::BrowsingSongs,
-            local_course_index: 0,
-            lobby_demo_pending: None,
-            lobby_demo_playing_song: None,
-            resource_backend,
-            song_library,
-            importer: TjaImporter,
-            prepared_match: None,
-            local_player: None,
-            audio: AudioEngine::new_noop(),
-            local_unix_base_ms,
-            local_mono_base,
-            clock_sync: ClockSyncState::default(),
-            last_ping_sent: Instant::now(),
-            last_drift_sync: Instant::now(),
-            headless: true,
-            headless_label: label,
-            headless_room_code_tx: room_code_tx,
-            headless_event_tx: event_tx,
-        })
-    }
-
-    pub fn run_headless(
-        args: OnlineCommandArgs,
-        label: String,
-        room_code_tx: Option<std::sync::mpsc::SyncSender<String>>,
-        event_tx: Option<std::sync::mpsc::Sender<OnlineEvent>>,
-        command_rx: std::sync::mpsc::Receiver<crate::headless::HeadlessCommand>,
-    ) -> Result<()> {
-        let mut app = OnlineApp::new_headless(args, label, room_code_tx, event_tx)?;
-        let mut events = HeadlessEventSource::new(ONLINE_TPS, command_rx);
-
-        while !app.should_quit {
-            match events.next_event()? {
-                UiEvent::Tick => app.handle_tick()?,
-                UiEvent::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    app.handle_key(key)?;
-                }
-                _ => {}
-            }
-        }
-
-        app.shutdown();
-        Ok(())
-    }
-
-    fn headless_log(&self, event: &str) {
-        if self.headless {
-            println!("[{}] {event}", self.headless_label);
-        }
-    }
-
-    fn emit_event(&self, event: OnlineEvent) {
-        if let Some(tx) = &self.headless_event_tx {
-            let _ = tx.send(event);
-        }
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.audio.stop_song();
-    }
-
-    fn local_now_ms(&self) -> u64 {
-        self.local_unix_base_ms
-            .saturating_add(self.local_mono_base.elapsed().as_millis() as u64)
-    }
-
-    fn estimated_server_now_ms(&self) -> u64 {
-        self.clock_sync.estimated_server_now_ms(self.local_now_ms())
-    }
-
-    fn handle_tick(&mut self) -> Result<()> {
-        let local_now_ms = self.local_now_ms();
-        self.clock_sync.tick(local_now_ms);
-
-        while let Some(event) = self.network.try_recv()? {
-            match event {
-                NetworkEvent::Server(message) => self.handle_server_message(*message)?,
-                NetworkEvent::Closed(reason) => {
-                    self.error_message = Some(reason);
-                    self.should_quit = true;
-                    return Ok(());
-                }
-            }
-        }
-
-        self.tick_lobby_demo_preview()?;
-
-        if self.last_ping_sent.elapsed() >= PING_INTERVAL {
-            let nonce = local_now_ms;
-            let client_send_ms = local_now_ms;
-            self.network
-                .send(ClientMessage::Ping(PingPayload {
-                    nonce,
-                    client_send_ms: Some(client_send_ms),
-                    server_send_ms: None,
-                }))
-                .ok();
-            self.last_ping_sent = Instant::now();
-        }
-
-        self.ensure_prepared_match()?;
-        self.tick_player_runtime()?;
-        self.tick_spectate_audio()?;
-        Ok(())
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        if self.error_message.is_some() {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        if self.current_phase() == RoomPhase::Lobby {
-            self.handle_lobby_key(key)?;
-            return Ok(());
-        }
-
-        if matches!(key.code, KeyCode::Esc) {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        if self.mode == ClientMode::Player
-            && matches!(
-                self.current_phase(),
-                RoomPhase::Countdown | RoomPhase::Playing
-            )
-        {
-            if let Some(action) = map_game_hit(key) {
-                self.push_local_input(action)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_lobby_key(&mut self, key: KeyEvent) -> Result<()> {
-        match self.lobby_sub_state {
-            LobbySubState::BrowsingSongs => self.handle_lobby_browsing_key(key),
-            LobbySubState::SelectingCourse => self.handle_lobby_course_key(key),
-        }
-    }
-
-    fn handle_lobby_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
-        if self
-            .lobby_song_browser
-            .handle_search_key(key, &self.song_library.songs)
-        {
-            self.normalize_host_course_selection();
-            return Ok(());
-        }
-
-        let Some(intent) = map_menu_intent(key) else {
-            return Ok(());
-        };
-
-        match intent {
-            MenuIntent::Quit | MenuIntent::Back => {
-                self.should_quit = true;
-            }
-            MenuIntent::Up => {
-                let previous = self.lobby_song_browser.selected_song_index();
-                self.lobby_song_browser.move_selection(-1);
-                if previous != self.lobby_song_browser.selected_song_index() {
-                    self.host_course_index = 0;
-                }
-            }
-            MenuIntent::Down => {
-                let previous = self.lobby_song_browser.selected_song_index();
-                self.lobby_song_browser.move_selection(1);
-                if previous != self.lobby_song_browser.selected_song_index() {
-                    self.host_course_index = 0;
-                }
-            }
-            MenuIntent::Confirm => {
-                if self.is_local_host() {
-                    // Host locks the song and enters course selection
-                    let Some(song) = self.selected_lobby_song() else {
-                        return Ok(());
-                    };
-                    let Some(source_id) = remote_locator_id(&song.source_locator) else {
-                        bail!("host selection song is not a remote song");
-                    };
-                    self.network
-                        .send(ClientMessage::HostSelectSong(HostSelectSongRequest {
-                            source_id: source_id.to_owned(),
-                            course_index: self.host_course_index,
-                        }))?;
-                    self.status_message = "song locked".to_owned();
-                    self.local_course_index = 0;
-                    self.lobby_sub_state = LobbySubState::SelectingCourse;
-                }
-                // Non-host: song is locked by server broadcast, sub_state
-                // transitions in sync_host_selection_from_song / ingest_snapshot
-            }
-            MenuIntent::Left | MenuIntent::Right => {
-                // Also move song selection (same as Up/Down)
-                let delta = if intent == MenuIntent::Left { -1 } else { 1 };
-                let previous = self.lobby_song_browser.selected_song_index();
-                self.lobby_song_browser.move_selection(delta);
-                if previous != self.lobby_song_browser.selected_song_index() {
-                    self.host_course_index = 0;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_lobby_course_key(&mut self, key: KeyEvent) -> Result<()> {
-        let Some(intent) = map_menu_intent(key) else {
-            return Ok(());
-        };
-
-        let course_len = self
-            .selected_lobby_song()
-            .map(|s| s.courses.len())
-            .unwrap_or(0);
-
-        match intent {
-            MenuIntent::Back => {
-                // Go back to song browsing; cancel ready if was ready
-                if self.ready {
-                    self.ready = false;
-                    self.network
-                        .send(ClientMessage::Ready(ReadyRequest { ready: false }))?;
-                    self.headless_log("UNREADY");
-                    self.emit_event(OnlineEvent::Unready);
-                }
-                self.lobby_sub_state = LobbySubState::BrowsingSongs;
-                self.status_message = "back to song list".to_owned();
-            }
-            MenuIntent::Quit => {
-                self.should_quit = true;
-            }
-            MenuIntent::Up | MenuIntent::Left => {
-                if course_len > 0 {
-                    if self.local_course_index == 0 {
-                        self.local_course_index = course_len - 1;
-                    } else {
-                        self.local_course_index -= 1;
-                    }
-                }
-            }
-            MenuIntent::Down | MenuIntent::Right => {
-                if course_len > 0 {
-                    self.local_course_index = (self.local_course_index + 1) % course_len;
-                }
-            }
-            MenuIntent::Confirm => {
-                if self.role != Some(RoomRole::Player) {
-                    return Ok(());
-                }
-                // Confirm course selection → auto-ready
-                if !self.ready {
-                    self.ready = true;
-                    self.network
-                        .send(ClientMessage::Ready(ReadyRequest { ready: true }))?;
-                    self.headless_log("READY");
-                    self.emit_event(OnlineEvent::Ready);
-                    self.status_message =
-                        format!("course {} selected — ready!", self.local_course_index);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_server_message(&mut self, message: ServerMessage) -> Result<()> {
-        match message {
-            ServerMessage::Hello(hello) => {
-                self.headless_log(&format!(
-                    "CONNECTED protocol={} session={}",
-                    hello.protocol_version, hello.session.session_id
-                ));
-                self.emit_event(OnlineEvent::Connected {
-                    protocol_version: hello.protocol_version,
-                    session_id: hello.session.session_id.clone(),
-                });
-                self.status_message = format!(
-                    "connected (protocol={}, session={})",
-                    hello.protocol_version, hello.session.session_id
-                );
-            }
-            ServerMessage::Error(error) => {
-                self.headless_log(&format!(
-                    "ERROR code={} message={}",
-                    error.code, error.message
-                ));
-                self.emit_event(OnlineEvent::Error {
-                    code: error.code.clone(),
-                    message: error.message.clone(),
-                });
-                let fatal = matches!(
-                    error.code.as_str(),
-                    "unsupported_protocol"
-                        | "protocol_violation"
-                        | "invalid_name"
-                        | "room_not_found"
-                        | "room_full"
-                        | "already_joined"
-                        | "unknown_session"
-                );
-                if fatal {
-                    self.error_message = Some(format!("{}: {}", error.code, error.message));
-                } else {
-                    self.status_message = format!("error: {}: {}", error.code, error.message);
-                }
-            }
-            ServerMessage::RoomCreated(created) => {
-                self.headless_log(&format!("ROOM_CREATED code={}", created.room_code));
-                self.emit_event(OnlineEvent::RoomCreated {
-                    room_code: created.room_code.clone(),
-                });
-                if let Some(tx) = self.headless_room_code_tx.take() {
-                    let _ = tx.send(created.room_code.clone());
-                }
-                self.room_code = Some(created.room_code.clone());
-                self.actor_id = Some(created.player_id);
-                self.role = Some(RoomRole::Player);
-                self.status_message = format!("room created: {}", created.room_code);
-            }
-            ServerMessage::RoomJoined(joined) => {
-                self.headless_log(&format!(
-                    "ROOM_JOINED code={} role={:?}",
-                    joined.room_code, joined.role
-                ));
-                self.emit_event(OnlineEvent::RoomJoined {
-                    room_code: joined.room_code.clone(),
-                    role: joined.role,
-                });
-                self.room_code = Some(joined.room_code.clone());
-                self.actor_id = Some(joined.actor_id);
-                self.role = Some(joined.role);
-                self.status_message =
-                    format!("joined room {} as {:?}", joined.room_code, joined.role);
-            }
-            ServerMessage::RoomSnapshot(snapshot) => {
-                self.headless_log(&format!(
-                    "SNAPSHOT phase={:?} players={} song={}",
-                    snapshot.phase,
-                    snapshot.players.len(),
-                    snapshot
-                        .song
-                        .as_ref()
-                        .map(|s| s.title.as_str())
-                        .unwrap_or("(none)")
-                ));
-                self.emit_event(OnlineEvent::Snapshot {
-                    phase: snapshot.phase,
-                    player_count: snapshot.players.len(),
-                    song_title: snapshot.song.as_ref().map(|s| s.title.clone()),
-                });
-                self.ingest_snapshot(snapshot);
-            }
-            ServerMessage::SongSelected(selection) => {
-                self.headless_log(&format!(
-                    "SONG_SELECTED title=\"{}\" course={}",
-                    selection.title, selection.course_index
-                ));
-                self.emit_event(OnlineEvent::SongSelected {
-                    title: selection.title.clone(),
-                    course_index: selection.course_index,
-                });
-                self.status_message = format!(
-                    "song selected: {} [{}]",
-                    selection.title, selection.course_index
-                );
-                self.sync_host_selection_from_song(&selection);
-            }
-            ServerMessage::MatchCountdown(countdown) => {
-                self.headless_log(&format!("COUNTDOWN start_at_ms={}", countdown.start_at_ms));
-                self.emit_event(OnlineEvent::Countdown {
-                    start_at_ms: countdown.start_at_ms,
-                });
-                self.status_message =
-                    format!("match countdown started: {} ms", countdown.start_at_ms);
-                if let Some(snapshot) = self.snapshot.as_mut() {
-                    snapshot.phase = RoomPhase::Countdown;
-                    snapshot.start_at_ms = Some(countdown.start_at_ms);
-                    snapshot.song = Some(countdown.song.clone());
-                }
-                self.sync_host_selection_from_song(&countdown.song);
-            }
-            ServerMessage::MatchStarted(started) => {
-                self.headless_log(&format!(
-                    "MATCH_STARTED start_at_ms={}",
-                    started.start_at_ms
-                ));
-                self.emit_event(OnlineEvent::MatchStarted {
-                    start_at_ms: started.start_at_ms,
-                });
-                self.status_message = "match started".to_owned();
-                if let Some(snapshot) = self.snapshot.as_mut() {
-                    snapshot.phase = RoomPhase::Playing;
-                    snapshot.start_at_ms = Some(started.start_at_ms);
-                }
-            }
-            ServerMessage::InputEvent(_) => {}
-            ServerMessage::PlayerStateUpdate(update) => {
-                self.live_states
-                    .insert(update.player_id.clone(), update.state.clone());
-            }
-            ServerMessage::FinalResult(final_result) => {
-                self.final_results
-                    .insert(final_result.player_id.clone(), final_result.report.clone());
-            }
-            ServerMessage::Pong(pong) => {
-                self.handle_pong(pong);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_pong(&mut self, pong: PingPayload) {
-        let Some(client_send_ms) = pong.client_send_ms else {
-            return;
-        };
-        let Some(server_send_ms) = pong.server_send_ms else {
-            return;
-        };
-
-        let client_receive_ms = self.local_now_ms();
-        self.clock_sync
-            .observe_sample(client_send_ms, client_receive_ms, server_send_ms);
-    }
-
-    fn ingest_snapshot(&mut self, snapshot: RoomSnapshot) {
-        self.room_code = Some(snapshot.room_code.clone());
-        self.ready = self
-            .actor_id
-            .as_deref()
-            .and_then(|actor| {
-                snapshot
-                    .players
-                    .iter()
-                    .find(|player| player.player_id == actor)
-                    .map(|player| player.ready)
-            })
-            .unwrap_or(false);
-
-        for player in &snapshot.players {
-            if let Some(state) = &player.last_state {
-                self.live_states
-                    .insert(player.player_id.clone(), state.clone());
-            }
-            if let Some(result) = &player.final_result {
-                self.final_results
-                    .insert(player.player_id.clone(), result.clone());
-            }
-        }
-
-        if let Some(song) = &snapshot.song {
-            self.sync_host_selection_from_song(song);
-        }
-        self.snapshot = Some(snapshot);
-    }
-
-    fn sync_host_selection_from_song(&mut self, song: &MatchSongSelection) {
-        if let Some((song_idx, course_idx)) = self.find_song_and_course(song) {
-            if !self.lobby_song_browser.sync_to_song_index(song_idx) {
-                self.lobby_song_browser
-                    .clear_query(&self.song_library.songs);
-                let _ = self.lobby_song_browser.sync_to_song_index(song_idx);
-            }
-            self.host_course_index = course_idx;
-        }
-        self.normalize_host_course_selection();
-
-        // When a song is locked, auto-enter course selection for all players
-        if self.lobby_sub_state == LobbySubState::BrowsingSongs
-            && self.current_phase() == RoomPhase::Lobby
-        {
-            self.local_course_index = 0;
-            self.lobby_sub_state = LobbySubState::SelectingCourse;
-        }
-    }
-
-    fn is_local_host(&self) -> bool {
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                let actor = self.actor_id.as_deref()?;
-                snapshot
-                    .players
-                    .iter()
-                    .find(|player| player.player_id == actor)
-                    .map(|player| player.is_host)
-            })
-            .unwrap_or(false)
-    }
-
-    fn selected_lobby_song(&self) -> Option<&crate::loader::SongEntry> {
-        let song_index = self.lobby_song_browser.selected_song_index()?;
-        self.song_library.songs.get(song_index)
-    }
-
-    fn selected_lobby_song_index(&self) -> Option<usize> {
-        self.lobby_song_browser.selected_song_index()
-    }
-
-    fn normalize_host_course_selection(&mut self) {
-        let Some(song) = self.selected_lobby_song() else {
-            self.host_course_index = 0;
-            return;
-        };
-
-        if song.courses.is_empty() {
-            self.host_course_index = 0;
-            return;
-        }
-
-        if self.host_course_index >= song.courses.len() {
-            self.host_course_index = song.courses.len() - 1;
-        }
-    }
-
-    fn clear_lobby_demo(&mut self) -> Result<()> {
-        self.lobby_demo_pending = None;
-        self.lobby_demo_playing_song = None;
-        self.audio.stop_song()?;
-        Ok(())
-    }
-
-    fn tick_lobby_demo_preview(&mut self) -> Result<()> {
-        if self.current_phase() != RoomPhase::Lobby {
-            if self.lobby_demo_pending.is_some() || self.lobby_demo_playing_song.is_some() {
-                self.clear_lobby_demo()?;
-            }
-            return Ok(());
-        }
-
-        let Some(song_index) = self.selected_lobby_song_index() else {
-            if self.lobby_demo_pending.is_some() || self.lobby_demo_playing_song.is_some() {
-                self.clear_lobby_demo()?;
-            }
-            return Ok(());
-        };
-
-        if self.lobby_demo_playing_song == Some(song_index) && !self.audio.is_song_finished() {
-            self.lobby_demo_pending = None;
-            return Ok(());
-        }
-
-        if self
-            .lobby_demo_pending
-            .is_none_or(|(_, pending_song_index)| pending_song_index != song_index)
-        {
-            self.audio.stop_song()?;
-            self.lobby_demo_playing_song = None;
-            self.lobby_demo_pending = Some((Instant::now() + LOBBY_DEMO_DELAY, song_index));
-            return Ok(());
-        }
-
-        let Some((deadline, pending_song_index)) = self.lobby_demo_pending else {
-            return Ok(());
-        };
-        if Instant::now() < deadline {
-            return Ok(());
-        }
-
-        let song = self
-            .song_library
-            .songs
-            .get(pending_song_index)
-            .ok_or_else(|| anyhow!("invalid lobby demo song index {pending_song_index}"))?;
-        let audio_source = self.resource_backend.load_song_audio(song)?;
-        self.audio
-            .play_song(audio_source, song.demo_start_seconds, true)?;
-        self.lobby_demo_playing_song = Some(pending_song_index);
-        self.lobby_demo_pending = None;
-        Ok(())
-    }
-
-    fn ensure_prepared_match(&mut self) -> Result<()> {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return Ok(());
-        };
-        let Some(song) = snapshot.song.as_ref() else {
-            self.prepared_match = None;
-            self.local_player = None;
-            return Ok(());
-        };
-
-        if self
-            .prepared_match
-            .as_ref()
-            .is_some_and(|prepared| prepared.selection == *song)
-        {
-            return Ok(());
-        }
-
-        let Some((song_idx, course_idx)) = self.find_song_and_course(song) else {
-            bail!(
-                "selected song not found in local library: source_id={}, course_index={}",
-                song.source_id,
-                song.course_index
-            );
-        };
-
-        let song_entry = &self.song_library.songs[song_idx];
-        let chart_hash = song_entry
-            .chart_content_hash
-            .as_deref()
-            .ok_or_else(|| anyhow!("song {} missing chart_content_hash", song.title))?;
-        let audio_hash = song_entry
-            .audio_content_hash
-            .as_deref()
-            .ok_or_else(|| anyhow!("song {} missing audio_content_hash", song.title))?;
-        if chart_hash != song.chart_content_hash || audio_hash != song.audio_content_hash {
-            bail!(
-                "resource hash mismatch for {}: expected chart={} audio={}, local chart={} audio={}",
-                song.title,
-                song.chart_content_hash,
-                song.audio_content_hash,
-                chart_hash,
-                audio_hash
-            );
-        }
-
-        let chart = self
-            .resource_backend
-            .load_course_chart(song_entry, course_idx, &self.importer)
-            .with_context(|| {
-                format!(
-                    "failed to load selected chart source_id={} course_index={}",
-                    song.source_id, course_idx
-                )
-            })?;
-        let audio_source = self
-            .resource_backend
-            .load_song_audio(song_entry)
-            .with_context(|| format!("failed to load selected audio for {}", song.title))?;
-
-        let course = song_entry
-            .courses
-            .get(course_idx)
-            .ok_or_else(|| anyhow!("selected course index is out of range"))?;
-
-        self.prepared_match = Some(PreparedMatch {
-            selection: song.clone(),
-            branch_decisions: course.branch_decisions.clone(),
-            chart,
-            audio_source,
-        });
-        self.local_player = None;
-
-        Ok(())
-    }
-
-    fn tick_player_runtime(&mut self) -> Result<()> {
-        if self.mode != ClientMode::Player {
-            return Ok(());
-        }
-
-        if !matches!(
-            self.current_phase(),
-            RoomPhase::Countdown | RoomPhase::Playing | RoomPhase::Finished
-        ) {
-            self.local_player = None;
-            return Ok(());
-        }
-
-        let Some(prepared) = self.prepared_match.as_ref() else {
-            return Ok(());
-        };
-
-        if self.local_player.is_none() {
-            let mut engine = ControlledEngine::<TaikoMode>::new_controlled(&prepared.chart)?;
-            let initial = engine
-                .step_to_with_controls(0, &[], &[])
-                .context("failed to bootstrap local online engine")?;
-            self.local_player = Some(LocalPlayerRuntime {
-                engine,
-                branch_controller: BranchController::new(
-                    crate::cli::BranchPolicy::Auto,
-                    0,
-                    prepared.branch_decisions.clone(),
-                ),
-                pending_inputs: Vec::new(),
-                input_seq: 0,
-                state_seq: 0,
-                final_seq: 0,
-                last_tick: 0,
-                last_output: initial,
-                sent_final: false,
-                music_started: false,
-                judge_flash: None,
-                input_flash: None,
-            });
-        }
-
-        let now_tick = self.estimated_server_tick().max(0);
-        let phase = self.current_phase();
-        let Some(runtime) = self.local_player.as_mut() else {
-            return Ok(());
-        };
-
-        if matches!(phase, RoomPhase::Playing | RoomPhase::Finished) && !runtime.music_started {
-            let start_seconds = (now_tick as f64 / 1_000_000.0).max(0.0);
-            self.audio.stop_song()?;
-            self.audio
-                .play_song(prepared.audio_source.clone(), start_seconds, false)?;
-            runtime.music_started = true;
-        }
-
-        let frame_tick = now_tick.max(runtime.last_tick);
-        let controls = runtime
-            .branch_controller
-            .controls_for_tick(frame_tick, runtime.engine.score())
-            .map_err(|error| anyhow!(error))?;
-        let frame_inputs = collect_due_inputs(&mut runtime.pending_inputs, frame_tick);
-
-        let output = runtime
-            .engine
-            .step_to_with_controls(frame_tick, &controls, &frame_inputs)
-            .context("online player engine step failed")?;
-
-        let replay_hash = output.replay_hash;
-        let recent_judges = output.judges.clone();
-        let state_score = output.score.clone();
-        let state_frame_view = output.frame_view.clone();
-        let frame_finished = output.finished;
-        runtime.last_tick = frame_tick;
-        runtime.last_output = output;
-        runtime.state_seq = runtime.state_seq.saturating_add(1);
-
-        self.network
-            .send(ClientMessage::PlayerStateUpdate(PlayerStateUpdate {
-                seq: runtime.state_seq,
-                now_tick: frame_tick,
-                score: state_score,
-                frame_view: state_frame_view,
-                recent_judges,
-                replay_hash,
-            }))?;
-
-        if frame_finished && !runtime.sent_final {
-            runtime.final_seq = runtime.final_seq.saturating_add(1);
-            let final_result = runtime.engine.finalize();
-            self.network
-                .send(ClientMessage::FinalResult(FinalResultReport {
-                    seq: runtime.final_seq,
-                    finish_tick: frame_tick,
-                    replay_hash,
-                    result: final_result,
-                }))?;
-            runtime.sent_final = true;
-        }
-
-        Ok(())
-    }
-
-    fn tick_spectate_audio(&mut self) -> Result<()> {
-        if self.mode != ClientMode::Spectator {
-            return Ok(());
-        }
-
-        let phase = self.current_phase();
-        if !matches!(phase, RoomPhase::Playing | RoomPhase::Finished) {
-            return Ok(());
-        }
-
-        let Some(prepared) = self.prepared_match.as_ref() else {
-            return Ok(());
-        };
-
-        let target_seconds = (self.estimated_server_tick() as f64 / 1_000_000.0).max(0.0);
-        if self.audio.is_song_finished() {
-            self.audio
-                .play_song(prepared.audio_source.clone(), target_seconds, false)?;
-            self.last_drift_sync = Instant::now();
-            return Ok(());
-        }
-
-        if self.last_drift_sync.elapsed() >= AUDIO_DRIFT_RESYNC_INTERVAL {
-            let current_seconds = self.audio.song_position_seconds();
-            let drift = (current_seconds - target_seconds).abs();
-            if drift > AUDIO_DRIFT_RESYNC_THRESHOLD_SECONDS {
-                self.audio
-                    .play_song(prepared.audio_source.clone(), target_seconds, false)?;
-            }
-            self.last_drift_sync = Instant::now();
-        }
-
-        Ok(())
-    }
-
-    fn push_local_input(&mut self, action: TaikoAction) -> Result<()> {
-        if self.mode != ClientMode::Player {
-            return Ok(());
-        }
-        let tick = self.estimated_server_tick().max(0);
-        let Some(runtime) = self.local_player.as_mut() else {
-            return Ok(());
-        };
-
-        runtime.pending_inputs.push(TimedInput { tick, action });
-        runtime.pending_inputs.sort_by_key(|input| input.tick);
-        runtime.input_seq = runtime.input_seq.saturating_add(1);
-
-        self.network.send(ClientMessage::InputEvent(InputEvent {
-            seq: runtime.input_seq,
-            tick,
-            action,
-        }))?;
-
-        match action {
-            TaikoAction::Don => {
-                self.audio.play_don()?;
-            }
-            TaikoAction::Kat => {
-                self.audio.play_kat()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn current_phase(&self) -> RoomPhase {
-        self.snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.phase)
-            .unwrap_or(RoomPhase::Lobby)
-    }
-
-    fn estimated_server_tick(&self) -> Tick {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return 0;
-        };
-
-        let Some(start_at_ms) = snapshot.start_at_ms else {
-            return snapshot.server_tick;
-        };
-
-        let server_now_ms = self.estimated_server_now_ms();
-        if server_now_ms <= start_at_ms {
-            return 0;
-        }
-        server_now_ms
-            .saturating_sub(start_at_ms)
-            .saturating_mul(1000) as Tick
-    }
-
-    fn find_song_and_course(&self, selection: &MatchSongSelection) -> Option<(usize, usize)> {
-        self.song_library
-            .songs
-            .iter()
-            .enumerate()
-            .find_map(|(song_idx, song)| {
-                let source_id = remote_locator_id(&song.source_locator)?;
-                if source_id != selection.source_id {
-                    return None;
-                }
-                if song
-                    .courses
-                    .iter()
-                    .any(|course| course.index == selection.course_index)
-                {
-                    Some((song_idx, selection.course_index))
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn render(&self, frame: &mut Frame<'_>) {
-        let area = frame.area();
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(4),
-                Constraint::Min(12),
-                Constraint::Length(10),
-            ])
-            .split(area);
-
-        self.render_header(frame, layout[0]);
-
-        if self.current_phase() == RoomPhase::Lobby {
-            self.render_lobby(frame, layout[1]);
-        } else {
-            self.render_multiplayer_lanes(frame, layout[1]);
-        }
-
-        self.render_ranking(frame, layout[2]);
-    }
-
-    fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let room_code = self.room_code.as_deref().unwrap_or("<pending>");
-        let role = match self.role {
-            Some(RoomRole::Player) => "player",
-            Some(RoomRole::Spectator) => "spectator",
-            None => "pending",
-        };
-        let server_now_ms = self.estimated_server_now_ms();
-        let countdown = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.start_at_ms)
-            .map(|start_at_ms| {
-                if server_now_ms >= start_at_ms {
-                    "started".to_owned()
-                } else {
-                    format!("t-{}ms", start_at_ms.saturating_sub(server_now_ms))
-                }
-            })
-            .unwrap_or_else(|| "idle".to_owned());
-        let clock_info = if self.clock_sync.has_sample() {
-            format!(
-                "RTT p50/p95 {:.1}/{:.1}ms | Jit {:.1}ms | Off cur/tgt/med {:+}/{:+}/{:+}ms | Drift {:+.1}ppm | ok/drop {}:{} | corr {}",
-                self.clock_sync.p50_rtt_ms,
-                self.clock_sync.p95_rtt_ms,
-                self.clock_sync.jitter_ms,
-                self.clock_sync.current_offset_ms,
-                self.clock_sync.target_offset_ms,
-                self.clock_sync.offset_median_ms,
-                self.clock_sync.drift_ppm,
-                self.clock_sync.accepted_samples,
-                self.clock_sync.rejected_samples,
-                self.clock_sync.large_correction_count
-            )
-        } else {
-            "RTT syncing...".to_owned()
-        };
-        let controls = if self.current_phase() == RoomPhase::Lobby {
-            if self.is_local_host() {
-                "Lobby host = Type filter, Arrow select song, Left/Right course, Enter lock song, R ready, Esc quit"
-            } else {
-                "Lobby guest = R ready, Esc quit"
-            }
-        } else if self.mode == ClientMode::Player {
-            "Playing = Don/Kat input, Esc quit"
-        } else {
-            "Spectate = Esc quit"
-        };
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Online Room ", self.theme.label),
-                Span::styled(room_code, self.theme.value),
-                Span::styled(" | Phase ", self.theme.label),
-                Span::styled(format!("{:?}", self.current_phase()), self.theme.value),
-                Span::styled(" | Role ", self.theme.label),
-                Span::styled(role, self.theme.value),
-                Span::styled(" | Countdown ", self.theme.label),
-                Span::styled(countdown, self.theme.value),
-            ]),
-            Line::from(vec![
-                Span::styled("Status: ", self.theme.label),
-                Span::styled(&self.status_message, self.theme.metadata),
-            ]),
-            Line::from(vec![
-                Span::styled("Clock: ", self.theme.label),
-                Span::styled(clock_info, self.theme.metadata),
-                Span::styled(" | Controls: ", self.theme.label),
-                Span::styled(controls, self.theme.metadata),
-            ]),
-        ];
-
-        let widget = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.border)
-                    .title("Taiko Online")
-                    .title_style(self.theme.title),
-            )
-            .wrap(Wrap { trim: true });
-        frame.render_widget(widget, area);
-    }
-
-    fn render_lobby(&self, frame: &mut Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-            .split(area);
-
-        let server_selected_song_index = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.song.as_ref())
-            .and_then(|song| {
-                self.find_song_and_course(song)
-                    .map(|(song_index, _)| song_index)
-            });
-        let list_items = if self.lobby_song_browser.filtered_song_indices.is_empty() {
-            vec![ListItem::new(Line::from(Span::styled(
-                "(no matching songs)",
-                self.theme.warning,
-            )))]
-        } else {
-            self.lobby_song_browser
-                .filtered_song_indices
-                .iter()
-                .filter_map(|index| {
-                    self.song_library
-                        .songs
-                        .get(*index)
-                        .map(|song| (index, song))
-                })
-                .map(|(index, song)| {
-                    let subtitle = if song.subtitle.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" - {}", song.subtitle)
-                    };
-                    let mut spans = vec![
-                        Span::styled(song.title.clone(), self.theme.text_primary),
-                        Span::styled(subtitle, self.theme.text_secondary),
-                    ];
-                    if server_selected_song_index == Some(*index) {
-                        spans.push(Span::styled(" [LOCKED]", self.theme.success));
-                    }
-                    ListItem::new(Line::from(spans))
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let list_title = if self.is_local_host() {
-            "Lobby Song Menu (Type to filter, Arrow move, Left/Right course, Enter lock)"
-        } else {
-            "Lobby Song Menu (Host selecting; Arrow to browse local list)"
-        };
-        let list = List::new(list_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.border)
-                    .title(list_title)
-                    .title_style(self.theme.title),
-            )
-            .highlight_style(self.theme.selection)
-            .highlight_symbol(">> ");
-
-        let mut state = ListState::default();
-        state.select(
-            (!self.lobby_song_browser.filtered_song_indices.is_empty())
-                .then_some(self.lobby_song_browser.selection_index),
-        );
-        frame.render_stateful_widget(list, chunks[0], &mut state);
-
-        let kv_line = |label: &str, value: String| {
-            Line::from(vec![
-                Span::styled(format!("{label}: "), self.theme.label),
-                Span::styled(value, self.theme.value),
-            ])
-        };
-        let text_line =
-            |text: &str| Line::from(Span::styled(text.to_owned(), self.theme.text_primary));
-        let mut info_lines = vec![
-            kv_line(
-                "Search",
-                if self.lobby_song_browser.query.is_empty() {
-                    "<empty>".to_owned()
-                } else {
-                    self.lobby_song_browser.query.clone()
-                },
-            ),
-            kv_line(
-                "Matches",
-                format!(
-                    "{}/{}",
-                    self.lobby_song_browser.filtered_song_indices.len(),
-                    self.song_library.songs.len()
-                ),
-            ),
-        ];
-
-        if let Some(error) = &self.lobby_song_browser.filter_error {
-            info_lines.push(Line::from(vec![
-                Span::styled("Filter error: ", self.theme.label),
-                Span::styled(error.clone(), self.theme.error),
-            ]));
-        }
-
-        if let Some(song) = self.selected_lobby_song() {
-            let bpm = song
-                .courses
-                .first()
-                .and_then(|course| course.base_bpm)
-                .unwrap_or_default();
-            let selected_course = song
-                .courses
-                .get(self.host_course_index)
-                .map(|course| {
-                    format!(
-                        "{} (#{}, Lv {})",
-                        course.name,
-                        course.index + 1,
-                        course
-                            .level
-                            .map_or_else(|| "?".to_owned(), |value| value.to_string())
-                    )
-                })
-                .unwrap_or_else(|| "<invalid course>".to_owned());
-
-            info_lines.extend(vec![
-                text_line(""),
-                kv_line("Selected", format!("{} / {}", song.title, selected_course)),
-                kv_line("Subtitle", song.subtitle.clone()),
-                kv_line("Artist", song.artist.clone()),
-                kv_line("BPM", format!("{bpm:.2}")),
-                kv_line("Chart", song.source_path.display().to_string()),
-                kv_line("Audio", song.audio_path.display().to_string()),
-                kv_line("Courses", song.courses.len().to_string()),
-                kv_line("Branching", song.has_branching().to_string()),
-            ]);
-        } else {
-            info_lines.extend(vec![
-                text_line(""),
-                text_line("No song matched current filter"),
-            ]);
-        }
-
-        if let Some(snapshot) = &self.snapshot {
-            info_lines.push(text_line(""));
-            if let Some(song) = &snapshot.song {
-                info_lines.push(kv_line(
-                    "Server Song",
-                    format!("{} [course {}]", song.title, song.course_index + 1),
-                ));
-            } else {
-                info_lines.push(kv_line("Server Song", "<not selected>".to_owned()));
-            }
-            info_lines.push(text_line(""));
-            info_lines.push(Line::from(Span::styled("Players:", self.theme.label)));
-            for player in &snapshot.players {
-                let status = if player.dnf {
-                    "DNF"
-                } else if !player.online {
-                    "offline"
-                } else if player.ready {
-                    "ready"
-                } else {
-                    "waiting"
-                };
-                info_lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "- {}{}",
-                            player.name,
-                            if player.is_host { " [HOST]" } else { "" }
-                        ),
-                        self.theme.value,
-                    ),
-                    Span::styled(format!(" -> {status}"), self.theme.metadata),
-                ]));
-            }
-            info_lines.push(kv_line("Spectators", snapshot.spectators.len().to_string()));
-        } else {
-            info_lines.push(text_line(""));
-            info_lines.push(Line::from(Span::styled(
-                "Waiting for room snapshot...",
-                self.theme.metadata,
-            )));
-        }
-
-        let info = Paragraph::new(info_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.border)
-                    .title("Lobby Info")
-                    .title_style(self.theme.title),
-            )
-            .wrap(Wrap { trim: true });
-        frame.render_widget(info, chunks[1]);
-    }
-
-    fn render_multiplayer_lanes(&self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            let widget = Paragraph::new("Waiting for room snapshot")
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(self.theme.border),
-                )
-                .wrap(Wrap { trim: true });
-            frame.render_widget(widget, area);
-            return;
-        };
-
-        let player_count = snapshot.players.len().max(1);
-        let rows = if player_count <= 2 { 1 } else { 2 };
-        let cols = if player_count <= 1 { 1 } else { 2 };
-
-        let row_constraints = (0..rows)
-            .map(|_| Constraint::Ratio(1, rows as u32))
-            .collect::<Vec<_>>();
-        let row_areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(row_constraints)
-            .split(area);
-
-        let mut player_iter = snapshot.players.iter();
-        for row_area in row_areas.iter().copied() {
-            let col_constraints = (0..cols)
-                .map(|_| Constraint::Ratio(1, cols as u32))
-                .collect::<Vec<_>>();
-            let col_areas = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(col_constraints)
-                .split(row_area);
-            for col_area in col_areas.iter().copied() {
-                let Some(player) = player_iter.next() else {
-                    break;
-                };
-                self.render_player_lane_tile(frame, col_area, player);
-            }
-        }
-    }
-
-    fn render_player_lane_tile(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        player: &RoomPlayerSnapshot,
-    ) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.border)
-            .title(format!(
-                "{}{}{}",
-                player.name,
-                if player.is_host { " [HOST]" } else { "" },
-                if player.dnf { " [DNF]" } else { "" }
-            ))
-            .title_style(self.theme.title);
-        frame.render_widget(block, area);
-
-        let inner = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        if inner.width < 4 || inner.height < 6 {
-            return;
-        }
-
-        let Some((frame_view, score)) = self.player_live_view(player) else {
-            let widget = Paragraph::new("no live frame")
-                .style(self.theme.metadata)
-                .wrap(Wrap { trim: true });
-            frame.render_widget(widget, inner);
-            return;
-        };
-
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(5)])
-            .split(inner);
-
-        let header = Paragraph::new(vec![Line::from(vec![
-            Span::styled("Score ", self.theme.label),
-            Span::styled(format!("{}", score.score), self.theme.value),
-            Span::styled(" | Combo ", self.theme.label),
-            Span::styled(format!("{}", score.combo), self.theme.value),
-            Span::styled(" | Gauge ", self.theme.label),
-            Span::styled(format!("{:.1}%", score.gauge * 100.0), self.theme.value),
-        ])]);
-        frame.render_widget(header, split[0]);
-
-        render_lane_view(
-            &self.theme,
-            frame,
-            split[1],
-            &frame_view,
-            LaneRenderOptions::standard(1.0),
-        );
-    }
-
-    fn player_live_view(
-        &self,
-        player: &RoomPlayerSnapshot,
-    ) -> Option<(rhythm_mode_taiko::TaikoFrameView, TaikoScoreState)> {
-        if self.role == Some(RoomRole::Player)
-            && self.actor_id.as_deref() == Some(player.player_id.as_str())
-        {
-            if let Some(runtime) = &self.local_player {
-                return Some((
-                    runtime.last_output.frame_view.clone(),
-                    runtime.last_output.score.clone(),
-                ));
-            }
-        }
-
-        let state = self
-            .live_states
-            .get(&player.player_id)
-            .or(player.last_state.as_ref())?;
-        Some((state.frame_view.clone(), state.score.clone()))
-    }
-
-    fn render_ranking(&self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return;
-        };
-
-        let mut rows = snapshot
-            .players
-            .iter()
-            .map(|player| {
-                let state = self
-                    .live_states
-                    .get(&player.player_id)
-                    .or(player.last_state.as_ref());
-                let result = self
-                    .final_results
-                    .get(&player.player_id)
-                    .or(player.final_result.as_ref());
-                let score = result
-                    .map(|result| result.result.score)
-                    .or_else(|| state.map(|state| state.score.score))
-                    .unwrap_or_default();
-                let max_combo = result
-                    .map(|result| result.result.max_combo)
-                    .or_else(|| state.map(|state| state.score.max_combo))
-                    .unwrap_or_default();
-                let finish_tick = result.map(|result| result.finish_tick).unwrap_or(i64::MAX);
-                (
-                    player.player_id.clone(),
-                    player.name.clone(),
-                    player.dnf,
-                    score,
-                    max_combo,
-                    finish_tick,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        rows.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| b.3.cmp(&a.3))
-                .then_with(|| b.4.cmp(&a.4))
-                .then_with(|| a.5.cmp(&b.5))
-        });
-
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![Span::styled(
-            "Ranking (score > combo > finish_tick, DNF bottom)",
-            self.theme.label,
-        )]));
-        for (rank, (_player_id, name, dnf, score, max_combo, finish_tick)) in
-            rows.iter().enumerate()
-        {
-            let finish = if *finish_tick == i64::MAX {
-                "-".to_owned()
-            } else {
-                format!("{:.3}s", *finish_tick as f64 / 1_000_000.0)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("#{} ", rank + 1), self.theme.label),
-                Span::styled(name, self.theme.value),
-                Span::styled(
-                    format!(
-                        " | score={} combo={} finish={}{}",
-                        score,
-                        max_combo,
-                        finish,
-                        if *dnf { " | DNF" } else { "" }
-                    ),
-                    if *dnf {
-                        self.theme.error
-                    } else {
-                        self.theme.metadata
-                    },
-                ),
-            ]));
-        }
-
-        if let Some(error) = &self.error_message {
-            lines.push(Line::from(Span::styled(
-                format!("Error: {error}"),
-                self.theme.error,
-            )));
-        }
-
-        let widget = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.border)
-                    .title("Match")
-                    .title_style(self.theme.title),
-            )
-            .wrap(Wrap { trim: true });
-        frame.render_widget(widget, area);
-    }
 }
 
 pub(crate) fn collect_due_inputs(
     pending_inputs: &mut Vec<TimedInput<TaikoAction>>,
     now_tick: Tick,
 ) -> Vec<TimedInput<TaikoAction>> {
-    if pending_inputs.is_empty() {
-        return Vec::new();
-    }
-
-    let split = pending_inputs.partition_point(|input| input.tick <= now_tick);
-    pending_inputs.drain(..split).collect()
+    let split_at = pending_inputs.partition_point(|input| input.tick <= now_tick);
+    pending_inputs.drain(..split_at).collect()
 }
 
-fn push_window<T>(window: &mut VecDeque<T>, value: T, max_len: usize) {
-    window.push_back(value);
-    if window.len() > max_len {
-        let _ = window.pop_front();
-    }
-}
-
-fn median_i64(values: impl IntoIterator<Item = i64>) -> Option<i64> {
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_unstable();
-    Some(values[values.len() / 2])
-}
-
-fn median_f64(values: impl IntoIterator<Item = f64>) -> Option<f64> {
-    percentile_f64(values, 0.5)
-}
-
-fn percentile_f64(values: impl IntoIterator<Item = f64>, percentile: f64) -> Option<f64> {
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(|a, b| a.total_cmp(b));
-    let percentile = percentile.clamp(0.0, 1.0);
-    let idx = ((values.len() - 1) as f64 * percentile).round() as usize;
-    values.get(idx).copied()
-}
-
-fn median_absolute_deviation_f64(
-    values: impl IntoIterator<Item = f64>,
-    median: f64,
-) -> Option<f64> {
-    let deviations = values
-        .into_iter()
-        .map(|value| (value - median).abs())
-        .collect::<Vec<_>>();
-    median_f64(deviations)
-}
-
-pub(crate) fn remote_locator_id(locator: &ResourceLocator) -> Option<&str> {
-    match locator {
-        ResourceLocator::RemoteId(id) => Some(id.as_str()),
-        ResourceLocator::LocalPath(_) => None,
-    }
+pub(crate) const fn to_drum_action(action: TaikoAction) -> DrumAction {
+    DrumAction::new(
+        match action.side {
+            TaikoSide::Left => DrumSide::Left,
+            TaikoSide::Right => DrumSide::Right,
+        },
+        match action.zone {
+            TaikoZone::Don => DrumZone::Don,
+            TaikoZone::Kat => DrumZone::Kat,
+        },
+    )
 }
 
 pub(crate) fn resource_http_endpoint(server: &str) -> Result<String> {
-    let mut url = Url::parse(server).with_context(|| format!("invalid --server URL: {server}"))?;
+    let mut url = Url::parse(server).with_context(|| format!("invalid server URL: {server}"))?;
     match url.scheme() {
         "http" | "https" => {}
         "ws" => {
             url.set_scheme("http")
-                .map_err(|_| anyhow!("failed to normalize ws URL to http"))?;
+                .map_err(|_| anyhow!("failed to map ws URL to http"))?;
         }
         "wss" => {
             url.set_scheme("https")
-                .map_err(|_| anyhow!("failed to normalize wss URL to https"))?;
+                .map_err(|_| anyhow!("failed to map wss URL to https"))?;
         }
-        scheme => bail!("unsupported URL scheme `{scheme}` for --server"),
+        scheme => bail!("unsupported server URL scheme: {scheme}"),
     }
-
-    if !url.path().ends_with('/') {
-        let mut path = url.path().to_owned();
-        path.push('/');
-        url.set_path(&path);
-    }
-    Ok(url.to_string())
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
 fn multiplayer_ws_url(server: &str) -> Result<Url> {
-    let mut base = Url::parse(server).with_context(|| format!("invalid --server URL: {server}"))?;
+    let mut base = Url::parse(server).with_context(|| format!("invalid server URL: {server}"))?;
     match base.scheme() {
         "http" => {
             base.set_scheme("ws")
-                .map_err(|_| anyhow!("failed to convert http scheme to ws"))?;
+                .map_err(|_| anyhow!("failed to map http URL to ws"))?;
         }
         "https" => {
             base.set_scheme("wss")
-                .map_err(|_| anyhow!("failed to convert https scheme to wss"))?;
+                .map_err(|_| anyhow!("failed to map https URL to wss"))?;
         }
         "ws" | "wss" => {}
-        scheme => bail!("unsupported URL scheme `{scheme}` for --server"),
+        scheme => bail!("unsupported server URL scheme: {scheme}"),
     }
-
+    base.set_query(None);
+    base.set_fragment(None);
     if !base.path().ends_with('/') {
-        let mut path = base.path().to_owned();
-        path.push('/');
+        let path = format!("{}/", base.path());
         base.set_path(&path);
     }
-
-    base.join("v1/multiplayer/ws")
-        .context("failed to build multiplayer websocket URL")
+    base.join("v2/multiplayer/ws")
+        .context("failed to construct multiplayer WebSocket URL")
 }
 
-pub(crate) fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+#[cfg(test)]
+enum HeadlessResources {
+    Player {
+        backend: Arc<ResourceBackend>,
+        songs: Vec<SongEntry>,
+    },
+    Spectator,
+}
+
+#[cfg(test)]
+impl HeadlessResources {
+    fn songs(&self) -> &[SongEntry] {
+        match self {
+            Self::Player { songs, .. } => songs,
+            Self::Spectator => &[],
+        }
+    }
+
+    fn player_backend(&self) -> Option<&Arc<ResourceBackend>> {
+        match self {
+            Self::Player { backend, .. } => Some(backend),
+            Self::Spectator => None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn load_headless_resources(
+    config: &OnlineClientConfig,
+    memory_only_cache: bool,
+) -> Result<HeadlessResources> {
+    if !config.requires_authoritative_resources() {
+        return Ok(HeadlessResources::Spectator);
+    }
+
+    let endpoint = resource_http_endpoint(config.server_url.as_str())?;
+    let backend = Arc::new(ResourceBackend::remote(&endpoint, memory_only_cache)?);
+    let library = backend
+        .load_song_library()
+        .context("failed to load the authoritative remote song library")?;
+    if library.songs.is_empty() {
+        bail!("the authoritative server has no playable songs");
+    }
+    for warning in library.warnings {
+        eprintln!("Resource warning: {warning}");
+    }
+    Ok(HeadlessResources::Player {
+        backend,
+        songs: library.songs,
+    })
+}
+
+#[cfg(test)]
+struct HeadlessOnlineClient {
+    domain: crate::online_session::OnlineDomain,
+    resources: HeadlessResources,
+    song_index: usize,
+    course_index: usize,
+    preparation: OnlinePreparationTask,
+    session_generation: u64,
+}
+
+#[cfg(test)]
+impl HeadlessOnlineClient {
+    fn connect(config: OnlineClientConfig, memory_only_cache: bool) -> Result<Self> {
+        let resources = load_headless_resources(&config, memory_only_cache)?;
+        let domain = crate::online_session::OnlineDomain::connect(config)?;
+        Ok(Self {
+            domain,
+            resources,
+            song_index: 0,
+            course_index: 0,
+            preparation: OnlinePreparationTask::default(),
+            session_generation: 1,
+        })
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        self.domain.tick_network()?;
+        self.process_domain_actions()?;
+        self.poll_preparation()?;
+        self.ensure_preparation()
+    }
+
+    fn process_domain_actions(&mut self) -> Result<()> {
+        for action in std::mem::take(&mut self.domain.pending_actions) {
+            if let crate::online_session::DomainAction::SongChanged { song } = action {
+                if matches!(self.resources, HeadlessResources::Spectator) {
+                    continue;
+                }
+                self.song_index = self
+                    .resources
+                    .songs()
+                    .iter()
+                    .position(|entry| entry.song_id() == Some(song.song_id.as_str()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "authoritative song {} is absent from the remote library",
+                            song.song_id
+                        )
+                    })?;
+                self.course_index = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn preparation_identity(&self) -> Option<PreparationIdentity> {
+        if self.domain.role() != Some(RoomRole::Player) {
+            return None;
+        }
+        Some(PreparationIdentity {
+            session_generation: self.session_generation,
+            match_id: self.domain.current_match_id()?,
+            selection: self.domain.local_selection()?,
+        })
+    }
+
+    fn ensure_preparation(&mut self) -> Result<()> {
+        let Some(identity) = self.preparation_identity() else {
+            self.preparation.cancel();
+            return Ok(());
+        };
+
+        if let Some(prepared) = self.domain.prepared_match.as_ref().filter(|prepared| {
+            prepared.match_id == identity.match_id && prepared.selection == identity.selection
+        }) {
+            if self.domain.should_auto_ready() {
+                let proof = self.domain.preparation_proof(prepared)?;
+                self.domain.set_ready(true, Some(proof))?;
+            }
+            return Ok(());
+        }
+        if self.preparation.failure_reason(identity).is_some() {
+            return Ok(());
+        }
+
+        if let Some(running) = self.preparation.identity() {
+            if running != identity {
+                self.preparation.cancel();
+            }
+            return Ok(());
+        }
+
+        let song_manifest = self
+            .domain
+            .current_song()
+            .cloned()
+            .ok_or_else(|| anyhow!("online match has no authoritative song manifest"))?;
+        let song_index = self
+            .resources
+            .songs()
+            .iter()
+            .position(|song| song.song_id() == Some(song_manifest.song_id.as_str()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "authoritative song {} is absent from the remote library",
+                    song_manifest.song_id
+                )
+            })?;
+        let course_index = usize::try_from(identity.selection.course_id.0)
+            .context("course id cannot be represented by this client")?;
+        let song = self.resources.songs()[song_index].clone();
+        let course = song
+            .courses
+            .iter()
+            .find(|course| course.index == course_index)
+            .cloned()
+            .ok_or_else(|| anyhow!("authoritative course {course_index} is unavailable"))?;
+        let course_manifest = song_manifest
+            .courses
+            .iter()
+            .find(|course| course.course_id == identity.selection.course_id)
+            .ok_or_else(|| anyhow!("course is absent from the authoritative manifest"))?;
+        validate_authoritative_song_identity(&song, &song_manifest)?;
+        if course.canonical_chart_hash != course_manifest.canonical_chart_hash.as_str() {
+            bail!("downloaded multiplayer content does not match the authoritative manifest");
+        }
+
+        let backend = self
+            .resources
+            .player_backend()
+            .ok_or_else(|| anyhow!("player session has no authoritative resource backend"))?;
+        if !self.preparation.start(PreparationRequest {
+            identity,
+            backend: Arc::clone(backend),
+            song,
+            course_index,
+            branch_decisions: course.branch_decisions,
+        })? {
+            bail!("online preparation task violated its single-worker invariant");
+        }
+        Ok(())
+    }
+
+    fn poll_preparation(&mut self) -> Result<()> {
+        for event in self.preparation.poll() {
+            let identity = event.identity();
+            if self.preparation_identity() != Some(identity) {
+                continue;
+            }
+            match event {
+                PreparationEvent::Progress { progress, .. } => {
+                    self.domain.report_preparation(progress)?;
+                }
+                PreparationEvent::Finished { completion, .. } => match completion {
+                    PreparationCompletion::Prepared(prepared) => {
+                        let prepared = *prepared;
+                        if prepared.prepared_match.match_id != identity.match_id
+                            || prepared.prepared_match.selection != identity.selection
+                            || prepared.runtime.match_id != identity.match_id
+                        {
+                            bail!("online preparation returned a mismatched match identity");
+                        }
+                        self.domain.prepared_match = Some(prepared.prepared_match);
+                        self.domain.local_player = Some(prepared.runtime);
+                    }
+                    PreparationCompletion::Cancelled => {}
+                    PreparationCompletion::Failed(error) => {
+                        drop(error);
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(false);
+        }
+        if !self.domain.room_controls_enabled() {
+            return Ok(!matches!(key.code, KeyCode::Esc));
+        }
+        if self.domain.phase() == crate::online_session::OnlinePhase::Playing {
+            if let Some(action) = crate::input::map_bound_game_hit(
+                key,
+                crate::preferences::DrumBindings::player_one_default(),
+            ) {
+                let tick = self.domain.estimated_server_tick().max(0);
+                self.domain.submit_input(tick, to_drum_action(action))?;
+                return Ok(true);
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc
+                if self.domain.phase() == crate::online_session::OnlinePhase::Results
+                    && self.domain.is_local_leader() =>
+            {
+                self.domain.return_to_lobby()?;
+            }
+            KeyCode::Esc => return Ok(false),
+            KeyCode::Up | KeyCode::Left => self.move_selection(-1)?,
+            KeyCode::Down | KeyCode::Right => self.move_selection(1)?,
+            KeyCode::Enter => self.confirm_selection()?,
+            KeyCode::Char('r' | 'R') => self.toggle_ready()?,
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn move_selection(&mut self, delta: isize) -> Result<()> {
+        use crate::online_session::OnlinePhase;
+        match self.domain.phase() {
+            OnlinePhase::Lobby => {
+                self.song_index =
+                    wrapped_index(self.song_index, self.resources.songs().len(), delta);
+                self.course_index = 0;
+            }
+            OnlinePhase::SelectingCourse
+            | OnlinePhase::Downloading
+            | OnlinePhase::Verifying
+            | OnlinePhase::Loading
+            | OnlinePhase::Prepared
+            | OnlinePhase::Ready => {
+                let course_count = self.authoritative_song_entry()?.courses.len();
+                self.course_index = wrapped_index(self.course_index, course_count, delta);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn confirm_selection(&mut self) -> Result<()> {
+        use crate::online_session::OnlinePhase;
+        let phase = self.domain.phase();
+        match phase {
+            OnlinePhase::Lobby if self.domain.is_local_leader() => {
+                let song_id = self.resources.songs()[self.song_index]
+                    .song_id()
+                    .ok_or_else(|| anyhow!("remote song is missing its validated song id"))?;
+                self.domain.select_song(song_id)?;
+            }
+            OnlinePhase::SelectingCourse
+            | OnlinePhase::Downloading
+            | OnlinePhase::Verifying
+            | OnlinePhase::Loading
+            | OnlinePhase::Prepared
+            | OnlinePhase::Ready => {
+                if self.domain.role() != Some(RoomRole::Player) {
+                    return Ok(());
+                }
+                let highlighted = self.highlighted_course_selection()?;
+                let retry_identity = self.preparation_identity().filter(|identity| {
+                    identity.selection == highlighted
+                        && self.preparation.failure_reason(*identity).is_some()
+                });
+                let action = headless_course_confirm_action(
+                    phase,
+                    self.domain.role(),
+                    highlighted,
+                    self.domain.local_selection(),
+                    self.domain.can_start_match(),
+                    retry_identity.is_some(),
+                );
+                match action {
+                    HeadlessCourseConfirmAction::SelectCourse => {
+                        if let Some(identity) = retry_identity {
+                            self.preparation.retry(identity);
+                        }
+                        self.domain.select_course(highlighted)?;
+                    }
+                    HeadlessCourseConfirmAction::StartMatch => {
+                        self.domain.start_match()?;
+                    }
+                    HeadlessCourseConfirmAction::None => {}
+                }
+            }
+            OnlinePhase::Results if self.domain.is_local_leader() => {
+                self.domain.rematch()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn highlighted_course_selection(&self) -> Result<PlayerSelection> {
+        let song = self.authoritative_song_entry()?;
+        let course = song
+            .courses
+            .get(self.course_index)
+            .ok_or_else(|| anyhow!("selected course index is out of range"))?;
+        let course_id =
+            u32::try_from(course.index).context("course index exceeds the multiplayer protocol")?;
+        Ok(PlayerSelection {
+            course_id: CourseId(course_id),
+        })
+    }
+
+    fn toggle_ready(&mut self) -> Result<()> {
+        let retry_identity = self
+            .preparation_identity()
+            .filter(|identity| self.preparation.failure_reason(*identity).is_some());
+        match headless_ready_action(
+            self.domain.role(),
+            retry_identity.is_some(),
+            self.domain.is_local_ready(),
+            self.domain.is_ready_command_pending(),
+            self.domain.prepared_match.is_some(),
+        ) {
+            HeadlessReadyAction::RetryPreparation => {
+                let identity = retry_identity
+                    .expect("retry action requires a matching failed preparation identity");
+                if !self.preparation.retry(identity) {
+                    bail!("failed preparation could not enter its explicit retry state");
+                }
+                self.domain.select_course(identity.selection)?;
+            }
+            HeadlessReadyAction::SetUnready => {
+                self.domain.set_ready(false, None)?;
+            }
+            HeadlessReadyAction::SetReady => {
+                let prepared = self
+                    .domain
+                    .prepared_match
+                    .as_ref()
+                    .expect("ready action requires prepared content");
+                let proof = self.domain.preparation_proof(prepared)?;
+                self.domain.set_ready(true, Some(proof))?;
+            }
+            HeadlessReadyAction::None => {}
+        }
+        Ok(())
+    }
+
+    fn authoritative_song_entry(&self) -> Result<&SongEntry> {
+        let Some(manifest) = self.domain.current_song() else {
+            return self
+                .resources
+                .songs()
+                .get(self.song_index)
+                .ok_or_else(|| anyhow!("selected song index is out of range"));
+        };
+        self.resources
+            .songs()
+            .iter()
+            .find(|song| song.song_id() == Some(manifest.song_id.as_str()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "authoritative song {} is absent from the remote library",
+                    manifest.song_id
+                )
+            })
+    }
+
+    fn summary_lines(&self) -> Vec<String> {
+        let mut lines = self.domain.summary_lines();
+        lines.retain(|line| !line.starts_with("Esc / Ctrl-C:"));
+        lines.extend(headless_score_lines(
+            self.domain.snapshot.as_ref(),
+            self.domain.latest_live_epoch(),
+            &self.domain.live_states,
+            &self.domain.final_results,
+        ));
+        if let Some(song) = self
+            .domain
+            .current_song()
+            .and_then(|manifest| {
+                self.resources
+                    .songs()
+                    .iter()
+                    .find(|song| song.song_id() == Some(manifest.song_id.as_str()))
+            })
+            .or_else(|| self.resources.songs().get(self.song_index))
+        {
+            lines.push(format!(
+                "Song: {} ({}/{})",
+                song.title,
+                self.song_index.saturating_add(1),
+                self.resources.songs().len()
+            ));
+            if let Some(course) = song.courses.get(self.course_index) {
+                lines.push(format!(
+                    "Course: {} ({}/{})",
+                    course.name,
+                    self.course_index.saturating_add(1),
+                    song.courses.len()
+                ));
+            }
+        }
+        if let Some(identity) = self.preparation_identity() {
+            if let Some(reason) = self.preparation.failure_reason(identity) {
+                lines.push(format!("Local preparation failed: {reason}"));
+                lines.push("Press Enter or R on this course to retry.".to_owned());
+            }
+        }
+        lines.push(self.command_help());
+        lines
+    }
+
+    fn command_help(&self) -> String {
+        use crate::online_session::OnlinePhase;
+        let phase = self.domain.phase();
+        let highlighted_selection = self.highlighted_course_selection().ok();
+        let selection_changed = highlighted_selection
+            .is_some_and(|selection| self.domain.local_selection() != Some(selection));
+        let preparation_failed = highlighted_selection.is_some_and(|selection| {
+            self.preparation_identity().is_some_and(|identity| {
+                identity.selection == selection
+                    && self.preparation.failure_reason(identity).is_some()
+            })
+        });
+        let confirm_action =
+            highlighted_selection.map_or(HeadlessCourseConfirmAction::None, |selection| {
+                headless_course_confirm_action(
+                    phase,
+                    self.domain.role(),
+                    selection,
+                    self.domain.local_selection(),
+                    self.domain.can_start_match(),
+                    preparation_failed,
+                )
+            });
+        let contextual = match self.domain.phase() {
+            OnlinePhase::Lobby if self.domain.is_local_leader() => "up/down: song, enter: select",
+            OnlinePhase::SelectingCourse
+            | OnlinePhase::Downloading
+            | OnlinePhase::Verifying
+            | OnlinePhase::Loading
+            | OnlinePhase::Prepared
+            | OnlinePhase::Ready
+                if self.domain.role() == Some(RoomRole::Player) && preparation_failed =>
+            {
+                "up/down: course, enter/r: retry preparation"
+            }
+            OnlinePhase::SelectingCourse
+            | OnlinePhase::Downloading
+            | OnlinePhase::Verifying
+            | OnlinePhase::Loading
+            | OnlinePhase::Prepared
+            | OnlinePhase::Ready
+                if self.domain.role() == Some(RoomRole::Player) && selection_changed =>
+            {
+                "up/down: course, enter: apply changed selection"
+            }
+            OnlinePhase::Prepared | OnlinePhase::Ready
+                if confirm_action == HeadlessCourseConfirmAction::StartMatch =>
+            {
+                "r: ready/unready, enter: start"
+            }
+            OnlinePhase::Prepared | OnlinePhase::Ready => {
+                "up/down: course, enter: apply change; r: ready/unready"
+            }
+            OnlinePhase::SelectingCourse
+            | OnlinePhase::Downloading
+            | OnlinePhase::Verifying
+            | OnlinePhase::Loading
+                if self.domain.role() == Some(RoomRole::Player) =>
+            {
+                "up/down: course, enter: apply selection"
+            }
+            OnlinePhase::Playing if self.domain.role() == Some(RoomRole::Player) => {
+                "key f/j: Don, key d/k: Kat"
+            }
+            OnlinePhase::Results if self.domain.is_local_leader() => "enter: rematch, esc: lobby",
+            _ => "wait for the authoritative room state",
+        };
+        format!("Commands: {contextual}; q / Ctrl-C: disconnect")
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.preparation.cancel();
+        self.domain.shutdown_gracefully()
+    }
+}
+
+#[cfg(test)]
+fn headless_score_lines(
+    snapshot: Option<&RoomSnapshot>,
+    latest_live_epoch: Option<(MatchId, StateSeq)>,
+    live_states: &HashMap<PlayerId, PlayerLiveState>,
+    final_results: &HashMap<PlayerId, FinalResult>,
+) -> Vec<String> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+    if final_results.is_empty() {
+        if let Some((match_id, state_seq)) = latest_live_epoch {
+            lines.push(format!(
+                "Live state: match={} sequence={}",
+                match_id.0, state_seq.0
+            ));
+        }
+        for player in &snapshot.players {
+            let Some(live) = live_states.get(&player.player_id) else {
+                continue;
+            };
+            let status = if live.dnf {
+                "dnf"
+            } else if live.finished {
+                "finished"
+            } else {
+                "playing"
+            };
+            lines.push(format!(
+                "Live {} (P{}): score={} combo={} max_combo={} gauge_ppm={} \
+                 pass_threshold_ppm={} great={} ok={} miss={} roll_hits={} status={status}",
+                player.name,
+                player.player_id.0,
+                live.score.score,
+                live.score.combo,
+                live.score.max_combo,
+                live.score.gauge_ppm,
+                live.score.pass_threshold_ppm,
+                live.score.great,
+                live.score.ok,
+                live.score.miss,
+                live.score.roll_hits,
+            ));
+        }
+        return lines;
+    }
+
+    for player in &snapshot.players {
+        let Some(result) = final_results.get(&player.player_id) else {
+            continue;
+        };
+        let outcome = if result.dnf {
+            "DNF"
+        } else if result.passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        lines.push(format!(
+            "Result {} (P{}): {outcome} course={} score={} combo={} max_combo={} \
+             gauge_ppm={} pass_threshold_ppm={} great={} ok={} miss={} roll_hits={} \
+             finish_tick={} replay={}",
+            player.name,
+            player.player_id.0,
+            result.course_id.0,
+            result.score.score,
+            result.score.combo,
+            result.score.max_combo,
+            result.score.gauge_ppm,
+            result.score.pass_threshold_ppm,
+            result.score.great,
+            result.score.ok,
+            result.score.miss,
+            result.score.roll_hits,
+            result.finish_tick,
+            result.replay_digest,
+        ));
+    }
+    lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum HeadlessCourseConfirmAction {
+    None,
+    SelectCourse,
+    StartMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum HeadlessReadyAction {
+    None,
+    RetryPreparation,
+    SetUnready,
+    SetReady,
+}
+
+#[cfg(test)]
+fn headless_ready_action(
+    role: Option<RoomRole>,
+    preparation_failed: bool,
+    is_local_ready: bool,
+    ready_command_pending: bool,
+    has_prepared_content: bool,
+) -> HeadlessReadyAction {
+    if role != Some(RoomRole::Player) {
+        return HeadlessReadyAction::None;
+    }
+    if preparation_failed {
+        return HeadlessReadyAction::RetryPreparation;
+    }
+    if is_local_ready || ready_command_pending {
+        return HeadlessReadyAction::SetUnready;
+    }
+    if has_prepared_content {
+        return HeadlessReadyAction::SetReady;
+    }
+    HeadlessReadyAction::None
+}
+
+#[cfg(test)]
+fn headless_course_confirm_action(
+    phase: crate::online_session::OnlinePhase,
+    role: Option<RoomRole>,
+    highlighted: PlayerSelection,
+    authoritative: Option<PlayerSelection>,
+    can_start_match: bool,
+    preparation_failed: bool,
+) -> HeadlessCourseConfirmAction {
+    use crate::online_session::OnlinePhase;
+    if role != Some(RoomRole::Player)
+        || !matches!(
+            phase,
+            OnlinePhase::SelectingCourse
+                | OnlinePhase::Downloading
+                | OnlinePhase::Verifying
+                | OnlinePhase::Loading
+                | OnlinePhase::Prepared
+                | OnlinePhase::Ready
+        )
+    {
+        return HeadlessCourseConfirmAction::None;
+    }
+    if preparation_failed || authoritative != Some(highlighted) {
+        return HeadlessCourseConfirmAction::SelectCourse;
+    }
+    if matches!(phase, OnlinePhase::Prepared | OnlinePhase::Ready) && can_start_match {
+        return HeadlessCourseConfirmAction::StartMatch;
+    }
+    HeadlessCourseConfirmAction::None
+}
+
+#[cfg(test)]
+fn wrapped_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if delta.is_negative() {
+        current.checked_sub(delta.unsigned_abs()).unwrap_or(len - 1) % len
+    } else {
+        current.saturating_add(delta as usize) % len
+    }
+}
+
+pub(crate) struct EmbeddedServer {
+    shutdown: Option<taiko_resource_server::ServerShutdown>,
+    thread: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl EmbeddedServer {
+    pub(crate) fn start_local(songdir: PathBuf) -> Result<(Self, Url)> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let server_args = taiko_resource_server::ServerArgs {
+            songdir,
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+        };
+        let thread = std::thread::Builder::new()
+            .name("taiko-embedded-server".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to initialize embedded server runtime")?;
+                let started = runtime.block_on(
+                    taiko_resource_server::start_server_background_controlled(server_args),
+                );
+                let (address, handle, shutdown) = match started {
+                    Ok(started) => started,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("{error:#}")));
+                        return Err(error);
+                    }
+                };
+                if ready_tx.send(Ok((address, shutdown))).is_err() {
+                    handle.abort();
+                    return Err(anyhow!("embedded server starter was dropped"));
+                }
+                runtime
+                    .block_on(handle)
+                    .context("embedded server task panicked")?
+            })
+            .context("failed to spawn embedded server thread")?;
+
+        let (address, shutdown) = ready_rx
+            .recv()
+            .context("embedded server stopped before reporting its address")?
+            .map_err(anyhow::Error::msg)?;
+        let advertised = match MultiplayerInvite::normalize_server(&format!("http://{address}")) {
+            Ok(advertised) => advertised,
+            Err(error) => {
+                shutdown.shutdown();
+                let shutdown_result = thread
+                    .join()
+                    .map_err(|_| anyhow!("embedded server thread panicked"))
+                    .and_then(|result| result.context("embedded server stopped with an error"));
+                return match shutdown_result {
+                    Ok(()) => Err(error),
+                    Err(shutdown_error) => Err(anyhow!(
+                        "{error}; embedded server shutdown failed: {shutdown_error}"
+                    )),
+                };
+            }
+        };
+
+        Ok((
+            Self {
+                shutdown: Some(shutdown),
+                thread: Some(thread),
+            },
+            advertised,
+        ))
+    }
+
+    pub(crate) fn shutdown_and_join(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.shutdown();
+        }
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| anyhow!("embedded server thread panicked"))?
+            .context("embedded server stopped with an error")
+    }
+}
+
+impl Drop for EmbeddedServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.shutdown();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LobbySongBrowser;
-    use crate::loader::{CourseEntry, ResourceLocator, SongEntry};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Instant;
 
-    fn test_song(title: &str) -> SongEntry {
-        SongEntry {
-            source_locator: ResourceLocator::LocalPath(PathBuf::from(format!("{title}.tja"))),
-            audio_locator: ResourceLocator::LocalPath(PathBuf::from(format!("{title}.ogg"))),
-            chart_content_hash: None,
-            audio_content_hash: None,
-            source_path: PathBuf::from(format!("{title}.tja")),
-            audio_path: PathBuf::from(format!("{title}.ogg")),
-            title: title.to_owned(),
-            subtitle: String::new(),
-            artist: "tester".to_owned(),
-            demo_start_seconds: 0.0,
-            courses: vec![CourseEntry {
-                index: 0,
-                name: "Oni".to_owned(),
-                level: Some(8),
-                object_count: 100,
-                branch_segment_count: 0,
-                base_bpm: Some(180.0),
-                branch_decisions: vec![],
-            }],
+    use super::*;
+    use crate::online_test_proxy::AckLossProxy;
+
+    const HEADLESS_E2E_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+    const HEADLESS_E2E_MATCH_TIMEOUT: Duration = Duration::from_secs(15);
+    const HEADLESS_E2E_NOTE_TICK: Tick = 1_000_000;
+    const HEADLESS_E2E_INPUT_LEAD_TICKS: Tick = 20_000;
+    static NEXT_HEADLESS_E2E_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct HeadlessE2eSongFixture {
+        path: PathBuf,
+    }
+
+    impl HeadlessE2eSongFixture {
+        fn create() -> Result<Self> {
+            Self::create_with_tja(concat!(
+                "TITLE:Production Loopback\n",
+                "BPM:600\n",
+                "WAVE:don.wav\n",
+                "COURSE:Easy\n",
+                "LEVEL:1\n",
+                "#START\n",
+                "0,\n",
+                "0,\n",
+                "0010,\n",
+                "#END\n",
+                "COURSE:Oni\n",
+                "LEVEL:1\n",
+                "#START\n",
+                "0,\n",
+                "0,\n",
+                "0020,\n",
+                "#END\n",
+            ))
         }
-    }
 
-    #[test]
-    fn lobby_song_browser_preserves_selection_when_filter_keeps_song() {
-        let songs = vec![test_song("Alpha"), test_song("Bravo"), test_song("Charlie")];
-        let mut browser = LobbySongBrowser::new(songs.len());
-        assert!(browser.sync_to_song_index(1));
+        fn create_ack_loss() -> Result<Self> {
+            Self::create_with_tja(concat!(
+                "TITLE:Production ACK Loss\n",
+                "BPM:600\n",
+                "WAVE:don.wav\n",
+                "COURSE:Easy\n",
+                "LEVEL:1\n",
+                "#START\n",
+                "0,\n",
+                "0,\n",
+                "0010,\n",
+                "5000,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0008,\n",
+                "#END\n",
+                "COURSE:Oni\n",
+                "LEVEL:1\n",
+                "#START\n",
+                "0,\n",
+                "0,\n",
+                "0020,\n",
+                "5000,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0,\n",
+                "0008,\n",
+                "#END\n",
+            ))
+        }
 
-        browser.query = "bravo".to_owned();
-        browser.rebuild_filter(&songs);
-
-        assert_eq!(browser.filtered_song_indices, vec![1]);
-        assert_eq!(browser.selected_song_index(), Some(1));
-        assert!(browser.filter_error.is_none());
-    }
-
-    #[test]
-    fn lobby_song_browser_invalid_filter_clears_results() {
-        let songs = vec![test_song("Alpha"), test_song("Bravo")];
-        let mut browser = LobbySongBrowser::new(songs.len());
-
-        browser.query = "oni=11".to_owned();
-        browser.rebuild_filter(&songs);
-
-        assert!(browser.filtered_song_indices.is_empty());
-        assert_eq!(browser.selected_song_index(), None);
-        assert!(browser.filter_error.is_some());
-    }
-
-    // ── Integration test infrastructure ──────────────────────────────
-
-    use super::{OnlineApp, OnlineEvent};
-    use crate::cli::{
-        OnlineAction, OnlineCommandArgs, OnlineCreateArgs, OnlineJoinArgs, OnlineSpectateArgs,
-    };
-    use crate::headless::HeadlessCommand;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use std::fs;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-    use taiko_multiplayer_protocol::RoomPhase;
-
-    static TEST_SONGDIR_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    const TEST_SONG_TJA: &str = r#"TITLE:Fixture Song
-WAVE:fixture.wav
-BPM:120
-COURSE:Oni
-LEVEL:1
-#START
-1000,
-0000,
-0000,
-0000,
-#END
-"#;
-
-    struct TestSongDir {
-        root: PathBuf,
-    }
-
-    impl TestSongDir {
-        fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "taiko-online-test-{}-{}",
+        fn create_with_tja(tja: &str) -> Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "taiko-headless-e2e-{}-{}",
                 std::process::id(),
-                TEST_SONGDIR_SEQ.fetch_add(1, Ordering::Relaxed)
+                NEXT_HEADLESS_E2E_FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
-
-            if root.exists() {
-                fs::remove_dir_all(&root).expect("failed to clear stale test song directory");
-            }
-
-            fs::create_dir_all(&root).expect("failed to create test song directory");
-            fs::write(root.join("fixture.tja"), TEST_SONG_TJA)
-                .expect("failed to write test chart fixture");
-            fs::write(
-                root.join("fixture.wav"),
-                include_bytes!("../assets/don.wav"),
-            )
-            .expect("failed to write test audio fixture");
-
-            Self { root }
-        }
-
-        fn path(&self) -> &Path {
-            &self.root
+            std::fs::create_dir(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            std::fs::write(path.join("don.wav"), include_bytes!("../assets/don.wav"))
+                .context("failed to write the end-to-end WAV fixture")?;
+            std::fs::write(path.join("loopback.tja"), tja)
+                .context("failed to write the end-to-end TJA fixture")?;
+            Ok(Self { path })
         }
     }
 
-    impl Drop for TestSongDir {
+    impl Drop for HeadlessE2eSongFixture {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
-    struct TestHarness {
-        server_addr: std::net::SocketAddr,
-        _runtime: tokio::runtime::Runtime,
-        _songdir: TestSongDir,
+    struct HeadlessE2eServer {
+        base_url: Url,
+        shutdown: Option<taiko_resource_server::ServerShutdown>,
+        finished: std_mpsc::Receiver<std::result::Result<(), String>>,
+        thread: Option<thread::JoinHandle<()>>,
     }
 
-    impl TestHarness {
-        fn new() -> Self {
-            let songdir = TestSongDir::new();
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create tokio runtime for test");
-            let server_args = taiko_resource_server::ServerArgs {
-                songdir: songdir.path().to_path_buf(),
-                host: "127.0.0.1".to_owned(),
-                port: 0,
-            };
-            let (addr, _handle) = runtime
-                .block_on(taiko_resource_server::start_server_background(server_args))
-                .expect("failed to start test server");
-            Self {
-                server_addr: addr,
-                _runtime: runtime,
-                _songdir: songdir,
-            }
+    impl HeadlessE2eServer {
+        fn start(songdir: PathBuf) -> Result<Self> {
+            let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+            let (finished_tx, finished_rx) = std_mpsc::sync_channel(1);
+            let thread = thread::Builder::new()
+                .name("taiko-headless-e2e-server".to_owned())
+                .spawn(move || {
+                    let setup = (|| -> Result<_> {
+                        let runtime = Builder::new_multi_thread()
+                            .enable_all()
+                            .build()
+                            .context("failed to initialize the end-to-end server runtime")?;
+                        let started = runtime.block_on(
+                            taiko_resource_server::start_server_background_controlled(
+                                taiko_resource_server::ServerArgs {
+                                    songdir,
+                                    host: "127.0.0.1".to_owned(),
+                                    port: 0,
+                                },
+                            ),
+                        )?;
+                        Ok((runtime, started))
+                    })();
+                    let (runtime, (address, handle, shutdown)) = match setup {
+                        Ok(started) => started,
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            let _ = ready_tx.send(Err(message.clone()));
+                            let _ = finished_tx.send(Err(message));
+                            return;
+                        }
+                    };
+                    if ready_tx.send(Ok((address, shutdown))).is_err() {
+                        handle.abort();
+                        let _ = finished_tx.send(Err(
+                            "end-to-end test dropped the server startup result".to_owned(),
+                        ));
+                        return;
+                    }
+                    let result = runtime
+                        .block_on(handle)
+                        .map_err(|error| format!("end-to-end server task panicked: {error}"))
+                        .and_then(|result| {
+                            result.map_err(|error| format!("end-to-end server failed: {error:#}"))
+                        });
+                    let _ = finished_tx.send(result);
+                })
+                .context("failed to spawn the end-to-end server thread")?;
+
+            let (address, shutdown) = ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("end-to-end server startup timed out")?
+                .map_err(anyhow::Error::msg)?;
+            Ok(Self {
+                base_url: Url::parse(&format!("http://{address}/"))
+                    .context("failed to construct the end-to-end server URL")?,
+                shutdown: Some(shutdown),
+                finished: finished_rx,
+                thread: Some(thread),
+            })
         }
 
-        fn server_url(&self) -> String {
-            format!("http://{}", self.server_addr)
+        fn shutdown_and_wait(mut self) -> Result<()> {
+            self.shutdown
+                .take()
+                .expect("running fixture owns its shutdown sender")
+                .shutdown();
+            let result = self
+                .finished
+                .recv_timeout(Duration::from_secs(5))
+                .context("end-to-end server shutdown timed out")?;
+            if let Some(thread) = self.thread.take() {
+                thread
+                    .join()
+                    .map_err(|_| anyhow!("end-to-end server thread panicked"))?;
+            }
+            result.map_err(anyhow::Error::msg)
         }
     }
 
-    struct TestClient {
-        cmd_tx: mpsc::Sender<HeadlessCommand>,
-        event_rx: mpsc::Receiver<OnlineEvent>,
-        room_code_rx: Option<mpsc::Receiver<String>>,
-        thread: Option<thread::JoinHandle<anyhow::Result<()>>>,
+    impl Drop for HeadlessE2eServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                shutdown.shutdown();
+            }
+        }
     }
 
-    impl TestClient {
-        fn spawn_host(harness: &TestHarness, name: &str) -> Self {
-            let (cmd_tx, cmd_rx) = mpsc::channel();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (rc_tx, rc_rx) = mpsc::sync_channel(1);
-            let args = make_create_args(&harness.server_url(), name);
-            let label = name.to_owned();
-            let handle = thread::spawn(move || {
-                OnlineApp::run_headless(args, label, Some(rc_tx), Some(event_tx), cmd_rx)
-            });
-            Self {
-                cmd_tx,
-                event_rx,
-                room_code_rx: Some(rc_rx),
-                thread: Some(handle),
+    fn ensure_headless_client_healthy(
+        client: &HeadlessOnlineClient,
+        label: &'static str,
+    ) -> Result<()> {
+        if client.domain.is_terminal() {
+            bail!("{label} failed: {}", client.domain.status_message());
+        }
+        if let Some(identity) = client.preparation_identity() {
+            if let Some(reason) = client.preparation.failure_reason(identity) {
+                bail!("{label} preparation failed: {reason}");
             }
         }
+        Ok(())
+    }
 
-        fn spawn_join(harness: &TestHarness, name: &str, room_code: &str) -> Self {
-            let (cmd_tx, cmd_rx) = mpsc::channel();
-            let (event_tx, event_rx) = mpsc::channel();
-            let args = make_join_args(&harness.server_url(), name, room_code);
-            let label = name.to_owned();
-            let handle = thread::spawn(move || {
-                OnlineApp::run_headless(args, label, None, Some(event_tx), cmd_rx)
-            });
-            Self {
-                cmd_tx,
-                event_rx,
-                room_code_rx: None,
-                thread: Some(handle),
+    fn wait_for_headless_client(
+        client: &mut HeadlessOnlineClient,
+        label: &'static str,
+        timeout: Duration,
+        mut predicate: impl FnMut(&HeadlessOnlineClient) -> bool,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            client
+                .tick()
+                .with_context(|| format!("{label} tick failed"))?;
+            ensure_headless_client_healthy(client, label)?;
+            if predicate(client) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "{label} timed out after {} ms; {}",
+                    timeout.as_millis(),
+                    client.summary_lines().join(" | "),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_headless_pair(
+        host: &mut HeadlessOnlineClient,
+        guest: &mut HeadlessOnlineClient,
+        label: &'static str,
+        timeout: Duration,
+        mut predicate: impl FnMut(&HeadlessOnlineClient, &HeadlessOnlineClient) -> bool,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            host.tick()
+                .with_context(|| format!("{label}: host tick failed"))?;
+            guest
+                .tick()
+                .with_context(|| format!("{label}: guest tick failed"))?;
+            ensure_headless_client_healthy(host, "host")?;
+            ensure_headless_client_healthy(guest, "guest")?;
+            if predicate(host, guest) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "{label} timed out after {} ms; host [{}]; guest [{}]",
+                    timeout.as_millis(),
+                    host.summary_lines().join(" | "),
+                    guest.summary_lines().join(" | "),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn drive_headless_pair_inputs_to_results(
+        host: &mut HeadlessOnlineClient,
+        guest: &mut HeadlessOnlineClient,
+    ) -> Result<()> {
+        use crate::online_session::OnlinePhase;
+
+        let deadline = Instant::now() + HEADLESS_E2E_MATCH_TIMEOUT;
+        let send_at = HEADLESS_E2E_NOTE_TICK.saturating_sub(HEADLESS_E2E_INPUT_LEAD_TICKS);
+        let mut host_submitted = false;
+        let mut guest_submitted = false;
+        loop {
+            host.tick()
+                .context("authoritative input/result drive: host tick failed")?;
+            guest
+                .tick()
+                .context("authoritative input/result drive: guest tick failed")?;
+            ensure_headless_client_healthy(host, "host")?;
+            ensure_headless_client_healthy(guest, "guest")?;
+
+            if !host_submitted && host.domain.phase() == OnlinePhase::Playing {
+                let tick = host.domain.estimated_server_tick();
+                if tick >= send_at {
+                    if tick >= HEADLESS_E2E_NOTE_TICK + rhythm_mode_taiko::OK_WINDOW_TICKS {
+                        bail!(
+                            "host reached tick {tick} before its production Don input was submitted"
+                        );
+                    }
+                    if !host.handle_key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('s'),
+                        KeyModifiers::NONE,
+                    ))? {
+                        bail!("host production Don key unexpectedly stopped the client");
+                    }
+                    host_submitted = true;
+                }
+            }
+            if !guest_submitted && guest.domain.phase() == OnlinePhase::Playing {
+                let tick = guest.domain.estimated_server_tick();
+                if tick >= send_at {
+                    if tick >= HEADLESS_E2E_NOTE_TICK + rhythm_mode_taiko::OK_WINDOW_TICKS {
+                        bail!(
+                            "guest reached tick {tick} before its production Kat input was submitted"
+                        );
+                    }
+                    if !guest.handle_key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('a'),
+                        KeyModifiers::NONE,
+                    ))? {
+                        bail!("guest production Kat key unexpectedly stopped the client");
+                    }
+                    guest_submitted = true;
+                }
+            }
+
+            if host.domain.phase() == OnlinePhase::Results
+                && guest.domain.phase() == OnlinePhase::Results
+            {
+                if !host_submitted || !guest_submitted {
+                    bail!(
+                        "match finished before both production inputs were submitted \
+                         (host={host_submitted}, guest={guest_submitted})"
+                    );
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "authoritative input/result drive timed out after {} ms \
+                     (host_submitted={host_submitted}, guest_submitted={guest_submitted}); \
+                     host [{}]; guest [{}]",
+                    HEADLESS_E2E_MATCH_TIMEOUT.as_millis(),
+                    host.summary_lines().join(" | "),
+                    guest.summary_lines().join(" | "),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn command_message(
+        seq: u64,
+        command: taiko_multiplayer_protocol::ClientCommand,
+    ) -> ClientMessage {
+        ClientMessage::Command(taiko_multiplayer_protocol::CommandEnvelope {
+            seq: taiko_multiplayer_protocol::CommandSeq(seq),
+            expected_room_revision: None,
+            command,
+        })
+    }
+
+    fn test_welcome() -> ServerMessage {
+        ServerMessage::Welcome(taiko_multiplayer_protocol::ServerWelcome {
+            protocol_version: PROTOCOL_VERSION,
+            wire_schema_sha256: ContentHash::parse(WIRE_SCHEMA_SHA256).expect("wire schema hash"),
+            heartbeat_interval_ms: 1_000,
+            reconnect_grace_ms: 15_000,
+            resumed: false,
+            next_expected_command_seq: taiko_multiplayer_protocol::FIRST_COMMAND_SEQ,
+        })
+    }
+
+    fn test_membership() -> ServerMessage {
+        ServerMessage::MembershipGranted(taiko_multiplayer_protocol::MembershipGranted {
+            room_code: RoomCode::parse("ABCD").expect("room code"),
+            actor_id: taiko_multiplayer_protocol::ActorId::Player(
+                taiko_multiplayer_protocol::PlayerId(1),
+            ),
+            resume_token: taiko_multiplayer_protocol::ResumeToken::parse("a".repeat(64))
+                .expect("resume token"),
+            invitation_token: InvitationToken::parse("b".repeat(64)).expect("invitation token"),
+        })
+    }
+
+    async fn send_test_server_message(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        message: ServerMessage,
+    ) -> Result<()> {
+        let raw = serde_json::to_string(&message)?;
+        socket.send(WsMessage::Text(raw.into())).await?;
+        Ok(())
+    }
+
+    async fn receive_test_client_message(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> Result<ClientMessage> {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("client closed before sending a message"))??;
+            match frame {
+                WsMessage::Text(raw) => return Ok(serde_json::from_str(&raw)?),
+                WsMessage::Ping(payload) => {
+                    socket.send(WsMessage::Pong(payload)).await?;
+                }
+                WsMessage::Pong(_) => {}
+                WsMessage::Close(_) => bail!("client closed before sending a message"),
+                other => bail!("unexpected client frame: {other:?}"),
             }
         }
+    }
 
-        fn spawn_spectate(harness: &TestHarness, name: &str, room_code: &str) -> Self {
-            let (cmd_tx, cmd_rx) = mpsc::channel();
-            let (event_tx, event_rx) = mpsc::channel();
-            let args = make_spectate_args(&harness.server_url(), name, room_code);
-            let label = name.to_owned();
-            let handle = thread::spawn(move || {
-                OnlineApp::run_headless(args, label, None, Some(event_tx), cmd_rx)
-            });
-            Self {
-                cmd_tx,
-                event_rx,
-                room_code_rx: None,
-                thread: Some(handle),
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        let policy = ReconnectPolicy::default();
+        assert_eq!(policy.delay_for_attempt(1), Duration::ZERO);
+        assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(250));
+        assert_eq!(policy.delay_for_attempt(3), Duration::from_millis(500));
+        assert_eq!(policy.delay_for_attempt(4), Duration::from_secs(1));
+        assert_eq!(policy.delay_for_attempt(20), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn unhealthy_welcome_flapping_consumes_attempts_and_increases_backoff() {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_millis(25),
+            maximum_delay: Duration::from_secs(1),
+            maximum_attempts: 3,
+        };
+        let mut budget = ReconnectBudget::new(&policy);
+
+        for ordinal in 1..=3 {
+            let attempt = budget.begin_attempt().expect("attempt remains");
+            assert_eq!(attempt.ordinal, ordinal);
+            if ordinal == 1 {
+                assert_eq!(attempt.delay, Duration::ZERO);
+            } else {
+                assert_eq!(
+                    attempt.delay,
+                    policy.delay_for_attempt(ordinal),
+                    "an unhealthy Welcome must not reset backoff"
+                );
             }
+            let next = budget.record_failure(false);
+            assert_eq!(next.is_some(), ordinal < 3);
+        }
+        assert!(budget.begin_attempt().is_none());
+        assert_eq!(budget.attempts_started(), 3);
+    }
+
+    #[test]
+    fn only_stable_heartbeat_evidence_resets_attempts_and_backoff() {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_millis(25),
+            maximum_delay: Duration::from_secs(1),
+            maximum_attempts: 3,
+        };
+        let base = tokio::time::Instant::now();
+        let heartbeat =
+            ServerMessage::HeartbeatAck(taiko_multiplayer_protocol::HeartbeatAck { nonce: 1 });
+        let mut health = ConnectionHealthTracker::new();
+        health.observe(&heartbeat, base + STABLE_CONNECTION_WINDOW);
+        assert!(
+            !health.is_stable(),
+            "Welcome and heartbeat traffic without affiliation is not stable"
+        );
+        health.observe(&test_membership(), base);
+        health.observe(
+            &heartbeat,
+            base + STABLE_CONNECTION_WINDOW - Duration::from_millis(1),
+        );
+        assert!(
+            !health.is_stable(),
+            "a short Welcome session must not reset retry state"
+        );
+
+        let mut budget = ReconnectBudget::new(&policy);
+        assert_eq!(budget.begin_attempt().expect("first").ordinal, 1);
+        assert_eq!(
+            budget
+                .record_failure(health.is_stable())
+                .expect("second")
+                .ordinal,
+            2
+        );
+        assert_eq!(budget.begin_attempt().expect("second").ordinal, 2);
+
+        health.observe(&heartbeat, base + STABLE_CONNECTION_WINDOW);
+        assert!(health.is_stable());
+        let reset = budget
+            .record_failure(health.is_stable())
+            .expect("reset attempt");
+        assert_eq!(reset.ordinal, 1);
+        assert_eq!(reset.delay, Duration::ZERO);
+        assert_eq!(budget.begin_attempt().expect("new first").ordinal, 1);
+    }
+
+    #[test]
+    fn endpoint_mapping_is_strict() {
+        assert_eq!(
+            multiplayer_ws_url("https://example.test/base")
+                .expect("valid URL")
+                .as_str(),
+            "wss://example.test/base/v2/multiplayer/ws"
+        );
+        assert_eq!(
+            resource_http_endpoint("wss://example.test/base?x=1").expect("valid URL"),
+            "https://example.test/base"
+        );
+        assert!(multiplayer_ws_url("ftp://example.test").is_err());
+    }
+
+    #[test]
+    fn spectator_headless_resources_do_not_contact_http_authority() {
+        let config = OnlineClientConfig::join(
+            "http://127.0.0.1:1",
+            "viewer",
+            "ABCD",
+            &"a".repeat(64),
+            JoinRole::Spectator,
+        )
+        .expect("spectator config");
+
+        let resources = load_headless_resources(&config, true).expect("resource-free spectator");
+
+        assert!(!config.requires_authoritative_resources());
+        assert!(matches!(resources, HeadlessResources::Spectator));
+    }
+
+    #[test]
+    fn player_and_creator_configs_require_authoritative_resources() {
+        let create =
+            OnlineClientConfig::create("https://example.test", "host").expect("create config");
+        let join = OnlineClientConfig::join(
+            "https://example.test",
+            "player",
+            "ABCD",
+            &"a".repeat(64),
+            JoinRole::Player,
+        )
+        .expect("join config");
+
+        assert!(create.requires_authoritative_resources());
+        assert!(join.requires_authoritative_resources());
+    }
+
+    #[test]
+    fn complete_invite_builds_player_connection_config() {
+        let invite = MultiplayerInvite::parse(&format!(
+            "taiko://join?server=https%3A%2F%2Fexample.test&room=ABCD&token={}",
+            "a".repeat(64)
+        ))
+        .expect("parse complete invite");
+        let config = OnlineClientConfig::join(
+            invite.server().as_str(),
+            "alice",
+            invite.room_code().as_str(),
+            invite.invitation_token().expose(),
+            JoinRole::Player,
+        )
+        .expect("build player config");
+        assert!(matches!(
+            config.room_intent,
+            RoomIntent::Join {
+                role: JoinRole::Player,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn embedded_ui_server_uses_loopback_and_an_ephemeral_port() -> Result<()> {
+        let fixture = HeadlessE2eSongFixture::create()?;
+        let (server, endpoint) = EmbeddedServer::start_local(fixture.path.clone())?;
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        assert_ne!(endpoint.port_or_known_default(), Some(0));
+        server.shutdown_and_join()
+    }
+
+    #[test]
+    fn due_input_collection_preserves_future_events() {
+        let mut inputs = vec![
+            TimedInput {
+                tick: 10,
+                action: TaikoAction::LEFT_DON,
+            },
+            TimedInput {
+                tick: 20,
+                action: TaikoAction::RIGHT_KAT,
+            },
+        ];
+        let due = collect_due_inputs(&mut inputs, 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].tick, 20);
+    }
+
+    #[test]
+    fn gameplay_to_wire_conversion_preserves_all_four_actions() {
+        for (gameplay, wire) in [
+            (TaikoAction::LEFT_DON, DrumAction::LEFT_DON),
+            (TaikoAction::RIGHT_DON, DrumAction::RIGHT_DON),
+            (TaikoAction::LEFT_KAT, DrumAction::LEFT_KAT),
+            (TaikoAction::RIGHT_KAT, DrumAction::RIGHT_KAT),
+        ] {
+            assert_eq!(to_drum_action(gameplay), wire);
+        }
+    }
+
+    #[test]
+    fn writer_queue_is_bounded() {
+        let (client, _peer) = NetworkClient::test_pair();
+        for nonce in 0..OUTBOUND_CAPACITY {
+            client
+                .try_send(ClientMessage::Heartbeat(
+                    taiko_multiplayer_protocol::Heartbeat {
+                        nonce: nonce as u64,
+                    },
+                ))
+                .expect("queue has declared capacity");
+        }
+        assert!(
+            client
+                .try_send(ClientMessage::Heartbeat(
+                    taiko_multiplayer_protocol::Heartbeat {
+                        nonce: OUTBOUND_CAPACITY as u64,
+                    },
+                ))
+                .is_err(),
+            "the writer must apply backpressure instead of growing"
+        );
+    }
+
+    #[test]
+    fn graceful_batch_requires_one_final_leave_command() {
+        let heartbeat =
+            ClientMessage::Heartbeat(taiko_multiplayer_protocol::Heartbeat { nonce: 1 });
+        assert_eq!(
+            validate_graceful_messages(std::slice::from_ref(&heartbeat)),
+            Err(GracefulShutdownError::MissingLeave)
+        );
+        let leave = command_message(1, taiko_multiplayer_protocol::ClientCommand::LeaveRoom);
+        assert_eq!(
+            validate_graceful_messages(&[leave.clone(), heartbeat]),
+            Err(GracefulShutdownError::LeaveNotLast)
+        );
+        assert_eq!(
+            validate_graceful_messages(&[leave.clone(), leave]),
+            Err(GracefulShutdownError::LeaveNotLast)
+        );
+    }
+
+    #[test]
+    fn test_pair_simulates_graceful_transport_completion() {
+        let (client, mut peer) = NetworkClient::test_pair();
+        let messages = vec![command_message(
+            1,
+            taiko_multiplayer_protocol::ClientCommand::LeaveRoom,
+        )];
+
+        client
+            .shutdown_gracefully(messages.clone())
+            .expect("simulated transport completion");
+        assert_eq!(peer.take_graceful_shutdown_messages(), Some(messages));
+    }
+
+    #[test]
+    fn graceful_shutdown_returns_only_after_real_server_acknowledges_leave() {
+        let (address_tx, address_rx) = std_mpsc::sync_channel(1);
+        let (leave_tx, leave_rx) = std_mpsc::sync_channel(1);
+        let (release_ack_tx, release_ack_rx) = std_mpsc::sync_channel(0);
+        let server = thread::spawn(move || -> Result<()> {
+            let runtime = Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                address_tx.send(listener.local_addr()?)?;
+                let (stream, _) = listener.accept().await?;
+                let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                assert!(matches!(
+                    receive_test_client_message(&mut socket).await?,
+                    ClientMessage::Hello(_)
+                ));
+                send_test_server_message(&mut socket, test_welcome()).await?;
+
+                loop {
+                    let frame = socket
+                        .next()
+                        .await
+                        .ok_or_else(|| anyhow!("client closed without a Close frame"))??;
+                    match frame {
+                        WsMessage::Text(raw) => {
+                            let message: ClientMessage = serde_json::from_str(&raw)?;
+                            let ClientMessage::Command(envelope) = message else {
+                                continue;
+                            };
+                            if matches!(
+                                envelope.command,
+                                taiko_multiplayer_protocol::ClientCommand::LeaveRoom
+                            ) {
+                                leave_tx.send(envelope.seq)?;
+                                release_ack_rx
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .context(
+                                        "test did not release the LeaveRoom acknowledgement",
+                                    )?;
+                            }
+                            send_test_server_message(
+                                &mut socket,
+                                ServerMessage::CommandAck(taiko_multiplayer_protocol::CommandAck {
+                                    seq: envelope.seq,
+                                    next_expected_seq: taiko_multiplayer_protocol::CommandSeq(
+                                        envelope.seq.0 + 1,
+                                    ),
+                                    outcome: taiko_multiplayer_protocol::CommandOutcome::Applied {
+                                        room_revision: None,
+                                    },
+                                }),
+                            )
+                            .await?;
+                        }
+                        WsMessage::Close(_) => break,
+                        WsMessage::Ping(payload) => {
+                            socket.send(WsMessage::Pong(payload)).await?;
+                        }
+                        WsMessage::Pong(_) => {}
+                        other => bail!("unexpected client frame: {other:?}"),
+                    }
+                }
+                Ok(())
+            })
+        });
+
+        let address = address_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server address");
+        let mut config =
+            OnlineClientConfig::create(&format!("http://{address}"), "alice").expect("config");
+        config.reconnect.maximum_attempts = 1;
+        let client = NetworkClient::connect(&config).expect("network client");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match client.try_recv() {
+                Ok(Some(NetworkEvent::Server(message)))
+                    if matches!(*message, ServerMessage::Welcome(_)) =>
+                {
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("transport failed before welcome: {error}"),
+            }
+            assert!(Instant::now() < deadline, "welcome timed out");
+            thread::yield_now();
         }
 
-        fn wait_room_code(&self, timeout: Duration) -> String {
-            self.room_code_rx
+        let messages = vec![
+            command_message(1, taiko_multiplayer_protocol::ClientCommand::CreateRoom),
+            command_message(2, taiko_multiplayer_protocol::ClientCommand::LeaveRoom),
+        ];
+        let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            let result = client
+                .shutdown_gracefully(messages)
+                .map_err(|error| format!("{error:#}"));
+            let _ = shutdown_tx.send(result);
+        });
+        assert_eq!(
+            leave_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(taiko_multiplayer_protocol::CommandSeq(2)),
+            "server must observe the final LeaveRoom command"
+        );
+        assert!(
+            matches!(
+                shutdown_rx.recv_timeout(Duration::from_millis(150)),
+                Err(std_mpsc::RecvTimeoutError::Timeout)
+            ),
+            "graceful shutdown returned before LeaveRoom was acknowledged"
+        );
+        release_ack_tx
+            .send(())
+            .expect("release LeaveRoom acknowledgement");
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("graceful shutdown did not complete after LeaveRoom acknowledgement")
+            .map_err(anyhow::Error::msg)
+            .expect("graceful shutdown");
+        shutdown.join().expect("shutdown caller thread");
+        server
+            .join()
+            .expect("server thread")
+            .expect("server completed");
+    }
+
+    #[test]
+    fn graceful_shutdown_retries_leave_until_acknowledged() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let address = listener.local_addr()?;
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await?;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    let first = receive_test_client_message(&mut socket).await?;
+                    let second = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        receive_test_client_message(&mut socket),
+                    )
+                    .await
+                    .context(
+                        "client did not retry LeaveRoom after its acknowledgement was lost",
+                    )??;
+                    assert_eq!(second, first, "LeaveRoom retry must be byte-equivalent");
+
+                    let ClientMessage::Command(envelope) = first else {
+                        bail!("expected LeaveRoom command");
+                    };
+                    assert!(matches!(
+                        envelope.command,
+                        taiko_multiplayer_protocol::ClientCommand::LeaveRoom
+                    ));
+                    send_test_server_message(
+                        &mut socket,
+                        ServerMessage::CommandAck(taiko_multiplayer_protocol::CommandAck {
+                            seq: envelope.seq,
+                            next_expected_seq: taiko_multiplayer_protocol::CommandSeq(
+                                envelope.seq.0 + 1,
+                            ),
+                            outcome: taiko_multiplayer_protocol::CommandOutcome::Applied {
+                                room_revision: None,
+                            },
+                        }),
+                    )
+                    .await?;
+
+                    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                        .await
+                        .context(
+                            "client did not close after the retried LeaveRoom was acknowledged",
+                        )?
+                        .ok_or_else(|| anyhow!("client disconnected without a Close frame"))??;
+                    assert!(matches!(frame, WsMessage::Close(_)));
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                let (socket, _) =
+                    connect_async_with_config(format!("ws://{address}/multiplayer"), None, true)
+                        .await?;
+                let (mut write, mut read) = socket.split();
+                let leave =
+                    command_message(1, taiko_multiplayer_protocol::ClientCommand::LeaveRoom);
+                flush_graceful_shutdown(&mut write, &mut read, &[leave])
+                    .await
+                    .map_err(|error| anyhow!("graceful shutdown failed: {error}"))?;
+                server.await.context("test server task panicked")??;
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("graceful LeaveRoom retry");
+    }
+
+    #[test]
+    fn real_welcome_flapping_stops_exactly_at_total_attempt_limit() {
+        const MAX_ATTEMPTS: u32 = 3;
+        let (address_tx, address_rx) = std_mpsc::sync_channel(1);
+        let (attempts_tx, attempts_rx) = std_mpsc::sync_channel(1);
+        let server = thread::spawn(move || -> Result<()> {
+            let runtime = Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                address_tx.send(listener.local_addr()?)?;
+                let mut accepted = 0_u32;
+                while accepted < MAX_ATTEMPTS {
+                    let (stream, _) = listener.accept().await?;
+                    accepted += 1;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    assert!(matches!(
+                        receive_test_client_message(&mut socket).await?,
+                        ClientMessage::Hello(_)
+                    ));
+                    send_test_server_message(&mut socket, test_welcome()).await?;
+                    socket.send(WsMessage::Close(None)).await?;
+                }
+                if tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_ok()
+                {
+                    accepted += 1;
+                }
+                attempts_tx.send(accepted)?;
+                Ok(())
+            })
+        });
+
+        let address = address_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server address");
+        let mut config =
+            OnlineClientConfig::create(&format!("http://{address}"), "alice").expect("config");
+        config.reconnect = ReconnectPolicy {
+            initial_delay: Duration::ZERO,
+            maximum_delay: Duration::ZERO,
+            maximum_attempts: MAX_ATTEMPTS,
+        };
+        let client = NetworkClient::connect(&config).expect("network client");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let terminal = loop {
+            if let Err(error) = client.try_recv() {
+                break error;
+            }
+            assert!(Instant::now() < deadline, "terminal fault timed out");
+            thread::yield_now();
+        };
+        assert!(
+            terminal
+                .to_string()
+                .contains("budget exhausted after 3 attempts"),
+            "unexpected terminal fault: {terminal}"
+        );
+        assert_eq!(
+            attempts_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("attempt count"),
+            MAX_ATTEMPTS
+        );
+        server
+            .join()
+            .expect("server thread")
+            .expect("server completed");
+    }
+
+    #[test]
+    fn two_headless_players_complete_a_real_production_loopback_match() -> Result<()> {
+        use crate::online_session::OnlinePhase;
+
+        let fixture = HeadlessE2eSongFixture::create()?;
+        let server = HeadlessE2eServer::start(fixture.path.clone())?;
+        let mut host = HeadlessOnlineClient::connect(
+            OnlineClientConfig::create(server.base_url.as_str(), "host")?,
+            true,
+        )?;
+        assert!(matches!(
+            host.resources.player_backend().map(Arc::as_ref),
+            Some(ResourceBackend::Remote(_))
+        ));
+        assert_eq!(
+            host.resources.songs().len(),
+            1,
+            "fixture exposes exactly one song"
+        );
+        assert_eq!(
+            host.resources.songs()[0].courses.len(),
+            2,
+            "fixture exposes two independently selectable courses"
+        );
+        wait_for_headless_client(
+            &mut host,
+            "host room creation",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |client| {
+                client.domain.phase() == OnlinePhase::Lobby
+                    && client
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 1)
+            },
+        )?;
+
+        let invite = host
+            .domain
+            .invite()
+            .context("host did not receive a production invite")?;
+        let copied_invite = invite.to_string();
+        let invite = MultiplayerInvite::parse(&copied_invite)
+            .context("production invite did not survive copy/paste parsing")?;
+        let guest_config = OnlineClientConfig::join(
+            invite.server().as_str(),
+            "guest",
+            invite.room_code().as_str(),
+            invite.invitation_token().expose(),
+            JoinRole::Player,
+        )?;
+        let mut guest = HeadlessOnlineClient::connect(guest_config, true)?;
+        assert!(matches!(
+            guest.resources.player_backend().map(Arc::as_ref),
+            Some(ResourceBackend::Remote(_))
+        ));
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "two-player room convergence",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::Lobby
+                    && guest.domain.phase() == OnlinePhase::Lobby
+                    && host
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 2)
+                    && guest
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 2)
+            },
+        )?;
+        assert!(host.domain.is_local_leader());
+        assert!(!guest.domain.is_local_leader());
+
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "authoritative song selection",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::SelectingCourse
+                    && guest.domain.phase() == OnlinePhase::SelectingCourse
+                    && host.domain.current_match_id().is_some()
+                    && host.domain.current_match_id() == guest.domain.current_match_id()
+            },
+        )?;
+
+        host.course_index = 0;
+        guest.course_index = 1;
+        let host_selection = host.highlighted_course_selection()?;
+        let guest_selection = guest.highlighted_course_selection()?;
+        assert_ne!(
+            host_selection.course_id, guest_selection.course_id,
+            "the two production clients must exercise independent course assignment"
+        );
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        assert!(guest.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "verified chart/audio preparation and clock readiness",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.is_local_ready()
+                    && guest.domain.is_local_ready()
+                    && host.domain.clock_is_ready()
+                    && guest.domain.clock_is_ready()
+                    && host.domain.prepared_match.is_some()
+                    && guest.domain.prepared_match.is_some()
+                    && host.domain.local_player.is_some()
+                    && guest.domain.local_player.is_some()
+            },
+        )?;
+
+        let match_id = host
+            .domain
+            .current_match_id()
+            .context("prepared room lost its match id")?;
+        for (label, client, selection) in [
+            ("host", &host, host_selection),
+            ("guest", &guest, guest_selection),
+        ] {
+            let prepared = client
+                .domain
+                .prepared_match
                 .as_ref()
-                .expect("no room_code_rx on this client")
-                .recv_timeout(timeout)
-                .expect("timed out waiting for room code")
+                .with_context(|| format!("{label} never decoded production audio"))?;
+            assert_eq!(prepared.match_id, match_id);
+            assert_eq!(prepared.selection, selection);
+            let runtime = client
+                .domain
+                .local_player
+                .as_ref()
+                .with_context(|| format!("{label} never built the production chart runtime"))?;
+            assert_eq!(runtime.match_id, match_id);
         }
+        let ready_snapshot = host
+            .domain
+            .snapshot
+            .as_ref()
+            .context("host is missing the authoritative ready snapshot")?;
+        assert!(matches!(
+            ready_snapshot.stage,
+            taiko_multiplayer_protocol::RoomStage::Preparing { .. }
+        ));
+        assert!(ready_snapshot.players.iter().all(|player| matches!(
+            player.preparation,
+            taiko_multiplayer_protocol::PlayerPreparation::Ready { .. }
+        )));
+        assert!(host.domain.can_start_match());
+        assert!(!guest.domain.can_start_match());
 
-        fn wait_for<F: Fn(&OnlineEvent) -> bool>(&self, timeout: Duration, pred: F) -> OnlineEvent {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    panic!("timed out waiting for matching event");
-                }
-                match self.event_rx.recv_timeout(remaining) {
-                    Ok(event) if pred(&event) => return event,
-                    Ok(_) => continue,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        panic!("timed out waiting for matching event");
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        panic!("event channel disconnected while waiting for event");
-                    }
-                }
-            }
-        }
-
-        fn has_event<F: Fn(&OnlineEvent) -> bool>(&self, timeout: Duration, pred: F) -> bool {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return false;
-                }
-                match self.event_rx.recv_timeout(remaining) {
-                    Ok(event) if pred(&event) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
-                }
-            }
-        }
-
-        fn send_key(&self, code: KeyCode) {
-            let key = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
-            let _ = self.cmd_tx.send(HeadlessCommand::Key(key));
-        }
-
-        fn send_char(&self, c: char) {
-            self.send_key(KeyCode::Char(c));
-        }
-    }
-
-    impl Drop for TestClient {
-        fn drop(&mut self) {
-            let _ = self.cmd_tx.send(HeadlessCommand::Quit);
-            if let Some(handle) = self.thread.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn make_create_args(url: &str, name: &str) -> OnlineCommandArgs {
-        OnlineCommandArgs {
-            headless: true,
-            action: OnlineAction::Create(OnlineCreateArgs {
-                server: url.to_owned(),
-                name: name.to_owned(),
-            }),
-        }
-    }
-
-    fn make_join_args(url: &str, name: &str, room: &str) -> OnlineCommandArgs {
-        OnlineCommandArgs {
-            headless: true,
-            action: OnlineAction::Join(OnlineJoinArgs {
-                server: url.to_owned(),
-                room: room.to_owned(),
-                name: name.to_owned(),
-            }),
-        }
-    }
-
-    fn make_spectate_args(url: &str, name: &str, room: &str) -> OnlineCommandArgs {
-        OnlineCommandArgs {
-            headless: true,
-            action: OnlineAction::Spectate(OnlineSpectateArgs {
-                server: url.to_owned(),
-                room: room.to_owned(),
-                name: name.to_owned(),
-            }),
-        }
-    }
-
-    const T: Duration = Duration::from_secs(5);
-
-    // ── Group 1: Connection & Room ───────────────────────────────────
-
-    #[test]
-    fn host_creates_room_and_receives_code() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        assert!(!code.is_empty(), "room code should be non-empty");
-        assert_eq!(code.len(), 4, "room code should be 4 characters: {code}");
-        assert!(
-            code.chars().all(|c| c.is_ascii_alphanumeric()),
-            "room code should be alphanumeric: {code}"
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "both production clients entering Playing",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::Playing
+                    && guest.domain.phase() == OnlinePhase::Playing
+            },
+        )?;
+        drive_headless_pair_inputs_to_results(&mut host, &mut guest)?;
+        assert_eq!(
+            host.domain.final_results, guest.domain.final_results,
+            "both production replicas must converge on identical final results"
         );
-        host.wait_for(T, |e| matches!(e, OnlineEvent::Connected { .. }));
+        assert_eq!(host.domain.final_results.len(), 2);
+        let mut result_courses = host
+            .domain
+            .final_results
+            .values()
+            .map(|result| result.course_id)
+            .collect::<Vec<_>>();
+        result_courses.sort_unstable();
+        let mut selected_courses = vec![host_selection.course_id, guest_selection.course_id];
+        selected_courses.sort_unstable();
+        assert_eq!(result_courses, selected_courses);
+        for result in host.domain.final_results.values() {
+            assert!(!result.dnf, "the production runtime must finish naturally");
+            assert_eq!(
+                result.score.great + result.score.ok,
+                1,
+                "each production WebSocket input must produce one authoritative hit"
+            );
+            assert_eq!(
+                result.score.miss, 0,
+                "the correctly typed production input must prevent the natural miss"
+            );
+            assert!(result.finish_tick > 0);
+        }
+
+        guest
+            .shutdown()
+            .context("guest graceful LeaveRoom failed")?;
+        host.shutdown().context("host graceful LeaveRoom failed")?;
+        server.shutdown_and_wait()
     }
 
     #[test]
-    fn joiner_joins_room_successfully() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
+    fn production_ack_loss_resume_is_exactly_once_and_fences_old_transports() -> Result<()> {
+        use crate::online_session::OnlinePhase;
 
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-        let event = joiner.wait_for(T, |e| matches!(e, OnlineEvent::RoomJoined { .. }));
-        match event {
-            OnlineEvent::RoomJoined { room_code, role } => {
-                assert_eq!(room_code, code);
-                assert_eq!(role, taiko_multiplayer_protocol::RoomRole::Player);
+        const ROLL_INPUT_TICK: Tick = 1_400_000;
+        const ROLL_END_TICK: Tick = 7_900_000;
+
+        let fixture = HeadlessE2eSongFixture::create_ack_loss()?;
+        let server = HeadlessE2eServer::start(fixture.path.clone())?;
+        let proxy = AckLossProxy::start(server.base_url.as_str())?;
+        let mut host = HeadlessOnlineClient::connect(
+            OnlineClientConfig::create(proxy.base_url(), "host")?,
+            true,
+        )?;
+        wait_for_headless_client(
+            &mut host,
+            "ACK-loss host room creation",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |client| {
+                client.domain.phase() == OnlinePhase::Lobby
+                    && client
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 1)
+            },
+        )?;
+
+        let invite = host
+            .domain
+            .invite()
+            .context("ACK-loss host did not receive an invite")?;
+        let copied_invite = invite.to_string();
+        let invite = MultiplayerInvite::parse(&copied_invite)
+            .context("ACK-loss invite did not survive copy/paste parsing")?;
+        let guest_config = OnlineClientConfig::join(
+            invite.server().as_str(),
+            "guest",
+            invite.room_code().as_str(),
+            invite.invitation_token().expose(),
+            JoinRole::Player,
+        )?;
+        let mut guest = HeadlessOnlineClient::connect(guest_config, true)?;
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "ACK-loss two-player room and clock convergence",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::Lobby
+                    && guest.domain.phase() == OnlinePhase::Lobby
+                    && host.domain.clock_is_ready()
+                    && guest.domain.clock_is_ready()
+                    && host
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 2)
+                    && guest
+                        .domain
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.players.len() == 2)
+            },
+        )?;
+
+        let host_actor = host
+            .domain
+            .actor_id()
+            .cloned()
+            .context("ACK-loss host has no production actor identity")?;
+        let revision_before = host
+            .domain
+            .snapshot
+            .as_ref()
+            .context("ACK-loss host has no lobby snapshot")?
+            .revision;
+        assert_eq!(host.domain.pending_command_count(), 0);
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+
+        let deadline = Instant::now() + HEADLESS_E2E_STEP_TIMEOUT;
+        let mut saw_reconnecting_with_reset_clock = false;
+        loop {
+            host.tick().context("ACK-loss host tick failed")?;
+            guest.tick().context("ACK-loss guest tick failed")?;
+            ensure_headless_client_healthy(&host, "ACK-loss host")?;
+            ensure_headless_client_healthy(&guest, "ACK-loss guest")?;
+            let evidence = proxy.evidence()?;
+            if evidence.command_ack_dropped && host.domain.phase() == OnlinePhase::Reconnecting {
+                assert!(
+                    !host.domain.clock_is_ready(),
+                    "the resumed transport must not inherit clock evidence"
+                );
+                saw_reconnecting_with_reset_clock = true;
             }
-            _ => unreachable!(),
+            if host.domain.phase() == OnlinePhase::SelectingCourse
+                && guest.domain.phase() == OnlinePhase::SelectingCourse
+                && evidence.command_ack_dropped
+                && evidence.command_resume_observed
+                && evidence.command_old_transport_fenced
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "production command ACK-loss resume timed out; evidence={evidence:?}; \
+                     host [{}]; guest [{}]",
+                    host.summary_lines().join(" | "),
+                    guest.summary_lines().join(" | "),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            saw_reconnecting_with_reset_clock,
+            "the production client never exposed reconnecting state with reset clock evidence"
+        );
+        assert_eq!(host.domain.actor_id(), Some(&host_actor));
+        assert_eq!(
+            host.domain
+                .snapshot
+                .as_ref()
+                .context("resumed host has no authoritative snapshot")?
+                .revision,
+            taiko_multiplayer_protocol::RoomRevision(revision_before.0 + 1),
+            "SelectSong must advance the authoritative room revision exactly once"
+        );
+        assert_eq!(
+            host.domain.pending_command_count(),
+            0,
+            "resumed Welcome must reconcile the applied command whose ACK was lost"
+        );
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "post-resume clock evidence",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, _| host.domain.clock_is_ready(),
+        )?;
+
+        host.course_index = 0;
+        guest.course_index = 1;
+        let host_selection = host.highlighted_course_selection()?;
+        let guest_selection = guest.highlighted_course_selection()?;
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        assert!(guest.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "ACK-loss production preparation",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.is_local_ready()
+                    && guest.domain.is_local_ready()
+                    && host.domain.clock_is_ready()
+                    && guest.domain.clock_is_ready()
+                    && host.domain.prepared_match.is_some()
+                    && guest.domain.prepared_match.is_some()
+                    && host.domain.local_player.is_some()
+                    && guest.domain.local_player.is_some()
+            },
+        )?;
+        let host_player_id = host
+            .domain
+            .local_player_id()
+            .context("ACK-loss host has no player identity")?;
+        let guest_player_id = guest
+            .domain
+            .local_player_id()
+            .context("ACK-loss guest has no player identity")?;
+
+        assert!(host.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))?);
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "ACK-loss clients entering Playing",
+            HEADLESS_E2E_STEP_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::Playing
+                    && guest.domain.phase() == OnlinePhase::Playing
+            },
+        )?;
+        let playing_revision = host
+            .domain
+            .snapshot
+            .as_ref()
+            .context("ACK-loss host has no Playing snapshot")?
+            .revision;
+
+        let deadline = Instant::now() + HEADLESS_E2E_MATCH_TIMEOUT;
+        let normal_send_at = HEADLESS_E2E_NOTE_TICK.saturating_sub(HEADLESS_E2E_INPUT_LEAD_TICKS);
+        let mut host_note_submitted = false;
+        let mut guest_note_submitted = false;
+        let mut roll_input_submitted = false;
+        let mut saw_input_reconnecting_with_reset_clock = false;
+        loop {
+            host.tick().context("input ACK-loss host tick failed")?;
+            guest.tick().context("input ACK-loss guest tick failed")?;
+            ensure_headless_client_healthy(&host, "input ACK-loss host")?;
+            ensure_headless_client_healthy(&guest, "input ACK-loss guest")?;
+
+            if !host_note_submitted
+                && host.domain.phase() == OnlinePhase::Playing
+                && host.domain.estimated_server_tick() >= normal_send_at
+            {
+                assert!(host.handle_key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('s'),
+                    KeyModifiers::NONE,
+                ))?);
+                host_note_submitted = true;
+            }
+            if !guest_note_submitted
+                && guest.domain.phase() == OnlinePhase::Playing
+                && guest.domain.estimated_server_tick() >= normal_send_at
+            {
+                assert!(guest.handle_key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                ))?);
+                guest_note_submitted = true;
+            }
+
+            let host_tick = host.domain.estimated_server_tick();
+            if host_note_submitted
+                && guest_note_submitted
+                && !roll_input_submitted
+                && host.domain.pending_input_count() == 0
+                && guest.domain.pending_input_count() == 0
+                && host_tick >= ROLL_INPUT_TICK
+            {
+                if host_tick >= ROLL_END_TICK {
+                    bail!(
+                        "production input ACK-loss was not armed before the drumroll ended \
+                         (tick={host_tick})"
+                    );
+                }
+                proxy.arm_input_ack_loss()?;
+                assert!(host.handle_key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('s'),
+                    KeyModifiers::NONE,
+                ))?);
+                assert_eq!(
+                    host.domain.pending_input_count(),
+                    1,
+                    "the faulted production input must remain pending until authority evidence"
+                );
+                roll_input_submitted = true;
+            }
+
+            let evidence = proxy.evidence()?;
+            if evidence.input_ack_dropped && host.domain.phase() == OnlinePhase::Reconnecting {
+                assert!(
+                    !host.domain.clock_is_ready(),
+                    "input reconnect must discard clock evidence from the old transport"
+                );
+                saw_input_reconnecting_with_reset_clock = true;
+            }
+            if roll_input_submitted
+                && evidence.input_ack_dropped
+                && evidence.input_resume_observed
+                && evidence.input_replay_observed
+                && evidence.input_replay_acknowledged
+                && evidence.input_old_transport_fenced
+                && host.domain.pending_input_count() == 0
+                && host.domain.clock_is_ready()
+                && host.domain.phase() == OnlinePhase::Playing
+            {
+                break;
+            }
+            if host.domain.phase() == OnlinePhase::Results
+                || guest.domain.phase() == OnlinePhase::Results
+            {
+                bail!(
+                    "match finished before production input ACK-loss recovery completed; \
+                     evidence={evidence:?}"
+                );
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "production input ACK-loss resume timed out; evidence={evidence:?}; \
+                     host_note={host_note_submitted}, guest_note={guest_note_submitted}, \
+                     roll={roll_input_submitted}; host [{}]; guest [{}]",
+                    host.summary_lines().join(" | "),
+                    guest.summary_lines().join(" | "),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            saw_input_reconnecting_with_reset_clock,
+            "the input fault never exposed reconnecting state with reset clock evidence"
+        );
+        assert_eq!(host.domain.actor_id(), Some(&host_actor));
+        assert_eq!(
+            host.domain
+                .snapshot
+                .as_ref()
+                .context("resumed Playing host has no snapshot")?
+                .revision,
+            playing_revision,
+            "input replay and live-session replacement must not mutate room revision"
+        );
+        assert_eq!(host.domain.pending_input_count(), 0);
+
+        wait_for_headless_pair(
+            &mut host,
+            &mut guest,
+            "ACK-loss authoritative results",
+            HEADLESS_E2E_MATCH_TIMEOUT,
+            |host, guest| {
+                host.domain.phase() == OnlinePhase::Results
+                    && guest.domain.phase() == OnlinePhase::Results
+            },
+        )?;
+        assert_eq!(host.domain.final_results, guest.domain.final_results);
+        let host_result = host
+            .domain
+            .final_results
+            .get(&host_player_id)
+            .context("ACK-loss host result is missing")?;
+        assert_eq!(host_result.course_id, host_selection.course_id);
+        assert_eq!(host_result.score.great + host_result.score.ok, 1);
+        assert_eq!(host_result.score.miss, 0);
+        assert_eq!(
+            host_result.score.roll_hits, 1,
+            "the authority must score the ACK-lost and replayed roll input exactly once"
+        );
+        let guest_result = host
+            .domain
+            .final_results
+            .get(&guest_player_id)
+            .context("ACK-loss guest result is missing")?;
+        assert_eq!(guest_result.course_id, guest_selection.course_id);
+        assert_eq!(guest_result.score.great + guest_result.score.ok, 1);
+        assert_eq!(guest_result.score.miss, 0);
+        assert_eq!(guest_result.score.roll_hits, 0);
+
+        guest
+            .shutdown()
+            .context("ACK-loss guest graceful LeaveRoom failed")?;
+        host.shutdown()
+            .context("ACK-loss host graceful LeaveRoom failed")?;
+        proxy.shutdown_and_wait()?;
+        server.shutdown_and_wait()
+    }
+
+    #[test]
+    fn live_state_slot_coalesces_to_latest_value() {
+        let (client, peer) = NetworkClient::test_pair();
+        let live = |sequence| LiveStateSnapshot {
+            match_id: taiko_multiplayer_protocol::MatchId(1),
+            state_seq: taiko_multiplayer_protocol::StateSeq(sequence),
+            server_tick: sequence as i64,
+            players: taiko_multiplayer_protocol::BoundedVec::default(),
+        };
+        peer.set_live(live(1));
+        peer.set_live(live(2));
+        assert_eq!(
+            client
+                .take_latest_live()
+                .expect("latest live state")
+                .state_seq,
+            taiko_multiplayer_protocol::StateSeq(2)
+        );
+        assert!(client.take_latest_live().is_none());
+    }
+
+    fn headless_score_snapshot() -> RoomSnapshot {
+        RoomSnapshot {
+            room_code: RoomCode::parse("ABCD").expect("room code"),
+            revision: taiko_multiplayer_protocol::RoomRevision(1),
+            server_now_us: 10,
+            leader_player_id: PlayerId(1),
+            players: vec![taiko_multiplayer_protocol::PlayerSnapshot {
+                player_id: PlayerId(1),
+                name: DisplayName::new("alice").expect("display name"),
+                is_leader: true,
+                connection: taiko_multiplayer_protocol::PlayerConnection::Online,
+                preparation: taiko_multiplayer_protocol::PlayerPreparation::Selecting,
+                last_acked_input_seq: None,
+            }]
+            .try_into()
+            .expect("bounded players"),
+            spectators: taiko_multiplayer_protocol::BoundedVec::default(),
+            stage: taiko_multiplayer_protocol::RoomStage::Lobby,
+        }
+    }
+
+    fn headless_score() -> taiko_multiplayer_protocol::ScoreSnapshot {
+        taiko_multiplayer_protocol::ScoreSnapshot {
+            score: 12_340,
+            combo: 7,
+            max_combo: 8,
+            gauge_ppm: 700_000,
+            pass_threshold_ppm: 600_000,
+            great: 5,
+            ok: 2,
+            miss: 1,
+            roll_hits: 3,
         }
     }
 
     #[test]
-    fn both_see_two_player_snapshot() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+    fn headless_live_summary_is_role_independent_and_changes_for_every_accepted_epoch() {
+        let snapshot = headless_score_snapshot();
+        let mut live_states = HashMap::from([(
+            PlayerId(1),
+            PlayerLiveState {
+                player_id: PlayerId(1),
+                score: headless_score(),
+                finished: false,
+                dnf: false,
+            },
+        )]);
+        let first = headless_score_lines(
+            Some(&snapshot),
+            Some((MatchId(4), StateSeq(9))),
+            &live_states,
+            &HashMap::new(),
+        );
+        assert!(first
+            .iter()
+            .any(|line| line == "Live state: match=4 sequence=9"));
+        assert!(first.iter().any(|line| {
+            line.contains("Live alice (P1): score=12340")
+                && line.contains("gauge_ppm=700000")
+                && line.contains("roll_hits=3")
+                && line.ends_with("status=playing")
+        }));
 
-        // Both should eventually see a snapshot with 2 players
-        host.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    phase: RoomPhase::Lobby,
-                    ..
-                }
-            )
-        });
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    phase: RoomPhase::Lobby,
-                    ..
-                }
-            )
-        });
+        live_states
+            .get_mut(&PlayerId(1))
+            .expect("live player")
+            .score
+            .combo = 8;
+        let second = headless_score_lines(
+            Some(&snapshot),
+            Some((MatchId(4), StateSeq(10))),
+            &live_states,
+            &HashMap::new(),
+        );
+        assert_ne!(
+            first, second,
+            "the headless output diff must observe each accepted live-state epoch"
+        );
     }
 
-    // ── Group 2: Song Selection Sync ─────────────────────────────────
+    #[test]
+    fn headless_final_summary_replaces_live_score_with_authoritative_result() {
+        let snapshot = headless_score_snapshot();
+        let live_states = HashMap::from([(
+            PlayerId(1),
+            PlayerLiveState {
+                player_id: PlayerId(1),
+                score: headless_score(),
+                finished: false,
+                dnf: false,
+            },
+        )]);
+        let final_results = HashMap::from([(
+            PlayerId(1),
+            FinalResult {
+                player_id: PlayerId(1),
+                course_id: CourseId(3),
+                score: headless_score(),
+                finish_tick: 5_000,
+                passed: true,
+                replay_digest: ContentHash::parse("a".repeat(64)).expect("replay digest"),
+                dnf: false,
+            },
+        )]);
+
+        let lines = headless_score_lines(
+            Some(&snapshot),
+            Some((MatchId(4), StateSeq(10))),
+            &live_states,
+            &final_results,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Result alice (P1): PASS course=3 score=12340"));
+        assert!(lines[0].contains("finish_tick=5000"));
+        assert!(lines[0].contains(&"a".repeat(64)));
+    }
 
     #[test]
-    fn host_selects_song_joiner_syncs() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
+    fn headless_selection_wraps_in_both_directions() {
+        assert_eq!(wrapped_index(0, 4, -1), 3);
+        assert_eq!(wrapped_index(3, 4, 1), 0);
+        assert_eq!(wrapped_index(2, 4, -1), 1);
+        assert_eq!(wrapped_index(2, 0, 1), 0);
+    }
 
-        // Wait for both to be in lobby with 2 players
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        // Host selects current song
-        host.send_key(KeyCode::Enter);
-
-        // Both should receive SongSelected with matching title
-        let host_event = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        let joiner_event = joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-
-        match (&host_event, &joiner_event) {
-            (
-                OnlineEvent::SongSelected {
-                    title: t1,
-                    course_index: c1,
-                },
-                OnlineEvent::SongSelected {
-                    title: t2,
-                    course_index: c2,
-                },
-            ) => {
-                assert_eq!(t1, t2, "song titles should match");
-                assert_eq!(c1, c2, "course indices should match");
-            }
-            _ => unreachable!(),
+    #[test]
+    fn headless_course_confirm_applies_changed_selection_in_every_preparation_phase() {
+        use crate::online_session::OnlinePhase;
+        let old = PlayerSelection {
+            course_id: CourseId(1),
+        };
+        let highlighted = PlayerSelection {
+            course_id: CourseId(2),
+        };
+        for phase in [
+            OnlinePhase::SelectingCourse,
+            OnlinePhase::Downloading,
+            OnlinePhase::Verifying,
+            OnlinePhase::Loading,
+            OnlinePhase::Prepared,
+            OnlinePhase::Ready,
+        ] {
+            assert_eq!(
+                headless_course_confirm_action(
+                    phase,
+                    Some(RoomRole::Player),
+                    highlighted,
+                    Some(old),
+                    true,
+                    false,
+                ),
+                HeadlessCourseConfirmAction::SelectCourse,
+                "changed selection must win over start in {phase:?}"
+            );
         }
-    }
-
-    #[test]
-    fn host_changes_course_reselects() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        host.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        // First: host locks song (Enter from BrowsingSongs)
-        host.send_key(KeyCode::Enter);
-        let first = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-
-        // Now in SelectingCourse. Go back to BrowsingSongs with Esc.
-        thread::sleep(Duration::from_millis(200));
-        host.send_key(KeyCode::Esc);
-        thread::sleep(Duration::from_millis(200));
-
-        // Re-lock the same song (Enter again from BrowsingSongs)
-        host.send_key(KeyCode::Enter);
-        let second = host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-
-        match (&first, &second) {
-            (
-                OnlineEvent::SongSelected { title: t1, .. },
-                OnlineEvent::SongSelected { title: t2, .. },
-            ) => {
-                assert_eq!(t1, t2, "re-selection should be the same song");
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // ── Group 3: Ready & Match Flow ──────────────────────────────────
-
-    // Helper: get both players to ready state using the two-phase flow:
-    // Host: Enter (lock song) → Enter (confirm course = auto-ready)
-    // Joiner: auto-enters course selection → Enter (confirm course = auto-ready)
-    fn ready_both(host: &TestClient, joiner: &TestClient) {
-        // Host locks song (Enter from BrowsingSongs → enters SelectingCourse)
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-
-        thread::sleep(Duration::from_millis(200));
-
-        // Host confirms course → auto-ready
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
-
-        thread::sleep(Duration::from_millis(200));
-
-        // Joiner confirms course → auto-ready
-        joiner.send_key(KeyCode::Enter);
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
-    }
-
-    #[test]
-    fn both_ready_triggers_countdown() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        ready_both(&host, &joiner);
-
-        // Both should receive Countdown
-        host.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
-    }
-
-    #[test]
-    fn countdown_leads_to_match_started() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        ready_both(&host, &joiner);
-
-        // Wait for MatchStarted (countdown is ~1ms with test-fast-countdown feature)
-        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
-    }
-
-    #[test]
-    fn single_ready_does_not_start() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let _joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        host.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        // Host locks song and confirms course (auto-ready)
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        thread::sleep(Duration::from_millis(200));
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
-
-        // Joiner does NOT confirm course — should NOT get countdown
-        let got_countdown = host.has_event(Duration::from_millis(500), |e| {
-            matches!(e, OnlineEvent::Countdown { .. })
-        });
-        assert!(
-            !got_countdown,
-            "countdown should not start with only 1 player ready"
+        assert_eq!(
+            headless_course_confirm_action(
+                OnlinePhase::Prepared,
+                Some(RoomRole::Player),
+                highlighted,
+                Some(highlighted),
+                true,
+                false,
+            ),
+            HeadlessCourseConfirmAction::StartMatch
         );
-    }
-
-    // ── Group 4: Gameplay ────────────────────────────────────────────
-
-    #[test]
-    fn playing_phase_accepts_input_without_crash() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        ready_both(&host, &joiner);
-
-        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
-
-        // Send some game inputs (don = 'f', kat = 'd')
-        host.send_char('f');
-        host.send_char('d');
-        joiner.send_char('f');
-        thread::sleep(Duration::from_millis(200));
-
-        // If we got here without panic, the test passes
-    }
-
-    #[test]
-    fn match_runs_stably() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        ready_both(&host, &joiner);
-
-        host.wait_for(T, |e| matches!(e, OnlineEvent::MatchStarted { .. }));
-
-        // Let the match run for a bit
-        thread::sleep(Duration::from_millis(500));
-
-        // Both threads should still be alive
-        assert!(
-            !host.thread.as_ref().unwrap().is_finished(),
-            "host thread should still be running"
+        assert_eq!(
+            headless_course_confirm_action(
+                OnlinePhase::Ready,
+                Some(RoomRole::Player),
+                highlighted,
+                Some(highlighted),
+                false,
+                false,
+            ),
+            HeadlessCourseConfirmAction::None,
+            "a same-selection guest must not issue a command"
         );
-        assert!(
-            !joiner.thread.as_ref().unwrap().is_finished(),
-            "joiner thread should still be running"
+        assert_eq!(
+            headless_course_confirm_action(
+                OnlinePhase::Prepared,
+                Some(RoomRole::Spectator),
+                highlighted,
+                Some(old),
+                true,
+                false,
+            ),
+            HeadlessCourseConfirmAction::None
         );
-    }
-
-    // ── Group 5: Spectator ───────────────────────────────────────────
-
-    #[test]
-    fn spectator_joins_and_sees_snapshots() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-
-        let spec = TestClient::spawn_spectate(&harness, "Spec", &code);
-        let event = spec.wait_for(T, |e| matches!(e, OnlineEvent::RoomJoined { .. }));
-        match event {
-            OnlineEvent::RoomJoined { role, .. } => {
-                assert_eq!(role, taiko_multiplayer_protocol::RoomRole::Spectator);
-            }
-            _ => unreachable!(),
-        }
-        spec.wait_for(T, |e| matches!(e, OnlineEvent::Snapshot { .. }));
-    }
-
-    #[test]
-    fn spectator_sees_song_selection() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let spec = TestClient::spawn_spectate(&harness, "Spec", &code);
-
-        spec.wait_for(T, |e| matches!(e, OnlineEvent::Snapshot { .. }));
-        thread::sleep(Duration::from_millis(200));
-
-        host.send_key(KeyCode::Enter);
-        spec.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-    }
-
-    // ── Group 6: Error Handling ──────────────────────────────────────
-
-    #[test]
-    fn join_nonexistent_room_gets_error() {
-        let harness = TestHarness::new();
-        let client = TestClient::spawn_join(&harness, "Lost", "ZZZZZZ");
-        let event = client.wait_for(T, |e| matches!(e, OnlineEvent::Error { .. }));
-        match event {
-            OnlineEvent::Error { code, .. } => {
-                assert_eq!(code, "room_not_found");
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // ── Group 7: Latency ─────────────────────────────────────────────
-
-    #[test]
-    fn room_creation_completes_within_budget() {
-        let harness = TestHarness::new();
-        let start = Instant::now();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let _code = host.wait_room_code(T);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "room creation took {elapsed:?}, budget 10s"
+        assert_eq!(
+            headless_course_confirm_action(
+                OnlinePhase::SelectingCourse,
+                Some(RoomRole::Player),
+                highlighted,
+                Some(highlighted),
+                false,
+                true,
+            ),
+            HeadlessCourseConfirmAction::SelectCourse,
+            "Enter must explicitly retry a failed same-selection preparation"
         );
     }
 
     #[test]
-    fn song_selection_sync_within_budget() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        let start = Instant::now();
-        host.send_key(KeyCode::Enter);
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "song selection sync took {elapsed:?}, budget 1s"
+    fn headless_ready_key_retries_a_latched_preparation_failure() {
+        assert_eq!(
+            headless_ready_action(Some(RoomRole::Player), true, false, false, false),
+            HeadlessReadyAction::RetryPreparation,
+            "R must retry even though no prepared content exists yet"
         );
-    }
-
-    #[test]
-    fn ready_to_countdown_within_budget() {
-        let harness = TestHarness::new();
-        let host = TestClient::spawn_host(&harness, "Host");
-        let code = host.wait_room_code(T);
-        let joiner = TestClient::spawn_join(&harness, "Joiner", &code);
-
-        joiner.wait_for(T, |e| {
-            matches!(
-                e,
-                OnlineEvent::Snapshot {
-                    player_count: 2,
-                    ..
-                }
-            )
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        // Host locks song + confirms course (auto-ready)
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::SongSelected { .. }));
-        thread::sleep(Duration::from_millis(200));
-
-        host.send_key(KeyCode::Enter);
-        host.wait_for(T, |e| matches!(e, OnlineEvent::Ready));
-        thread::sleep(Duration::from_millis(100));
-
-        let start = Instant::now();
-        // Joiner confirms course (auto-ready) → countdown should follow
-        joiner.send_key(KeyCode::Enter);
-        joiner.wait_for(T, |e| matches!(e, OnlineEvent::Countdown { .. }));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "ready-to-countdown took {elapsed:?}, budget 1s"
+        assert_eq!(
+            headless_ready_action(Some(RoomRole::Player), true, true, true, true),
+            HeadlessReadyAction::RetryPreparation,
+            "a latched failure takes priority over ready toggling"
+        );
+        assert_eq!(
+            headless_ready_action(Some(RoomRole::Player), false, true, false, true),
+            HeadlessReadyAction::SetUnready
+        );
+        assert_eq!(
+            headless_ready_action(Some(RoomRole::Player), false, false, false, true),
+            HeadlessReadyAction::SetReady
+        );
+        assert_eq!(
+            headless_ready_action(Some(RoomRole::Spectator), true, false, false, false),
+            HeadlessReadyAction::None
         );
     }
 }

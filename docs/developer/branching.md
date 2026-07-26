@@ -4,8 +4,11 @@
 
 - Condition evaluation is always external.
 - `rhythm-core` only consumes controls: `TimedControl<BranchControl>`.
-- Deterministic order in controlled step:
-  - `consume_expired -> consume_control -> consume_input -> apply_judge`
+- `TaikoRuntime` advances exactly to each decision boundary. At a boundary it
+  expires objects and applies those judges, evaluates the branch window,
+  applies the resulting control, then processes same-tick inputs and applies
+  their judges. Coarse and fine caller cadence therefore produce the same
+  replay.
 
 ## Control Channel / 控制通道
 
@@ -27,13 +30,19 @@ Decision formula (strict):
 
 Metric mapping:
 
-- `p = (great + ok) / (great + ok + miss) * 100`
+- `p = (2 × great + ok) / (2 × (great + ok + miss)) × 100`
 - `r = roll_hits`
 - `s = score`
 
 Decision window:
 
-- Uses delta score between previous decision point and current decision point.
+- Every metric uses the delta between the previous decision tick and the
+  current decision tick. Multiple decisions on the same tick observe the same
+  window snapshot.
+- With no judged taps in the window, accuracy is `100%`.
+- The player client and authority always derive `Automatic`, which selects the
+  metric from each TJA `p`/`r`/`s` hint. It is not a CLI, preference, UI, or wire
+  option.
 
 Decision time semantics:
 
@@ -56,8 +65,10 @@ fn emit_route(segment_id: u32, tick: Tick, route_id: u8) -> TimedControl<BranchC
 
 `taiko-game` follows strict fail-fast:
 
-- Missing/unsupported hint for selected policy -> error page.
-- Invalid fixed route -> error page.
+- Missing, raw, or otherwise unsupported TJA hints are rejected before play.
+- The engine library retains explicit policy/fixed-route APIs for controlled
+  engine use and tests, but the player client and server have no path that can
+  select them.
 - No silent fallback route rewriting.
 
 ## Determinism / 決定性

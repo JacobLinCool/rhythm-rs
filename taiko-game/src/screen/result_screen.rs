@@ -2,10 +2,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use rhythm_mode_taiko::{TaikoJudgeKind, GREAT_WINDOW_TICKS, MISS_WINDOW_TICKS, OK_WINDOW_TICKS};
+use rhythm_mode_taiko::{
+    TaikoFinalResult, TaikoJudgeKind, GREAT_WINDOW_TICKS, MISS_WINDOW_TICKS, OK_WINDOW_TICKS,
+};
 
 use super::render_gauge_bar_line;
 use crate::app::{App, ResultState, TimingSample};
+use crate::localization::{display_width, truncate_to_width, Localizer, UiMessage, UiText};
 use crate::theme::PerfMetricKind;
 use crate::tui::Frame;
 
@@ -15,148 +18,297 @@ const TIMING_PLOT_RESERVED_COLUMNS: usize = 2;
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some(result) = app.result.as_ref() else {
-        let empty = Paragraph::new(Span::styled("No result", app.theme.error))
-            .block(themed_block(app, "Result"));
+        let empty = Paragraph::new(Span::styled(app.text(UiText::NoResult), app.theme.error))
+            .block(themed_block(app, app.text(UiText::Result)));
         frame.render_widget(empty, area);
         return;
     };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Min(3),
-        ])
+        .constraints(if app.result_details_visible {
+            [
+                Constraint::Length(9),
+                Constraint::Length(5),
+                Constraint::Min(7),
+                Constraint::Length(7),
+            ]
+        } else {
+            [
+                Constraint::Length(9),
+                Constraint::Length(5),
+                Constraint::Min(7),
+                Constraint::Length(3),
+            ]
+        })
         .split(area);
 
-    let pass_fail_style = if result.final_result.passed {
-        app.theme.warning
+    let final_result = &result.final_result;
+    let accuracy = result_accuracy(final_result);
+    let full_combo =
+        final_result.miss == 0 && final_result.great.saturating_add(final_result.ok) > 0;
+    let (early, late, centered) = early_late_counts(&result.timing_samples);
+    let status_style = if final_result.passed {
+        app.theme.success
     } else {
         app.theme.error
     };
-
+    let combo_label = if full_combo {
+        format!("  •  {}", app.text(UiText::FullCombo))
+    } else {
+        String::new()
+    };
     let summary = Paragraph::new(vec![
-        kv_line(app, "Song", format!("{} {}", result.title, result.subtitle)),
-        kv_line(app, "Course", result.course_name.clone()),
-        kv_line(app, "Score", result.final_result.score.to_string()),
-        kv_line(app, "Max Combo", result.final_result.max_combo.to_string()),
-        render_gauge_bar_line(
+        kv_line(
             app,
-            result.final_result.gauge,
-            result.final_result.pass_threshold,
-            layout[0].width.saturating_sub(2),
-            true,
+            app.text(UiText::Song),
+            format!("{} {}", result.title, result.subtitle),
+        ),
+        kv_line(
+            app,
+            app.text(UiText::SelectedCourse),
+            result.course_name.clone(),
         ),
         Line::from(vec![
-            Span::styled("Result: ", app.theme.label),
             Span::styled(
-                if result.final_result.passed {
-                    "PASS"
+                app.text(if final_result.passed {
+                    UiText::Clear
                 } else {
-                    "FAIL"
-                },
-                pass_fail_style,
+                    UiText::Fail
+                }),
+                status_style,
+            ),
+            Span::styled(combo_label, app.theme.warning),
+            Span::styled(
+                format!("  •  {} ", app.text(UiText::Grade)),
+                app.theme.label,
+            ),
+            Span::styled(result_grade(accuracy), app.theme.selection),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{} ", app.text(UiText::Score)), app.theme.label),
+            Span::styled(final_result.score.to_string(), app.theme.value),
+            Span::styled(
+                format!("  {}", personal_best_delta(app, result)),
+                app.theme.warning,
             ),
         ]),
         Line::from(vec![
-            Span::styled("Replay Hash: ", app.theme.label),
-            Span::styled(format!("{:016x}", result.replay_hash), app.theme.metadata),
+            Span::styled(format!("{} ", app.text(UiText::Accuracy)), app.theme.label),
+            Span::styled(format!("{accuracy:.2}%"), app.theme.value),
+            Span::styled(
+                format!("  •  {} ", app.text(UiText::MaxCombo)),
+                app.theme.label,
+            ),
+            Span::styled(final_result.max_combo.to_string(), app.theme.value),
         ]),
+        render_gauge_bar_line(
+            app,
+            final_result.gauge,
+            final_result.pass_threshold,
+            layout[0].width.saturating_sub(2),
+            true,
+        ),
     ])
-    .block(themed_block(app, "Result Summary"))
+    .block(themed_block(app, app.text(UiText::ResultSummary)))
     .wrap(Wrap { trim: true });
     frame.render_widget(summary, layout[0]);
 
     let judge = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("GREAT: ", app.theme.label),
+            Span::styled(format!("{} ", app.text(UiText::Great)), app.theme.label),
             Span::styled(
-                result.final_result.great.to_string(),
+                final_result.great.to_string(),
                 app.theme
                     .judge_style(rhythm_mode_taiko::TaikoJudge::Great { delta_tick: 0 }),
             ),
-            Span::styled(" | OK: ", app.theme.label),
+            Span::styled(format!("  {} ", app.text(UiText::Ok)), app.theme.label),
             Span::styled(
-                result.final_result.ok.to_string(),
+                final_result.ok.to_string(),
                 app.theme
                     .judge_style(rhythm_mode_taiko::TaikoJudge::Ok { delta_tick: 0 }),
             ),
-            Span::styled(" | MISS: ", app.theme.label),
+            Span::styled(format!("  {} ", app.text(UiText::Miss)), app.theme.label),
             Span::styled(
-                result.final_result.miss.to_string(),
+                final_result.miss.to_string(),
                 app.theme
                     .judge_style(rhythm_mode_taiko::TaikoJudge::Miss { delta_tick: 0 }),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Roll Hits: ", app.theme.label),
+            Span::styled(format!("{} ", app.text(UiText::Early)), app.theme.label),
+            Span::styled(early.to_string(), app.theme.value),
+            Span::styled(format!("  {} ", app.text(UiText::Late)), app.theme.label),
+            Span::styled(late.to_string(), app.theme.value),
             Span::styled(
-                result.final_result.roll_hits.to_string(),
-                app.theme
-                    .judge_style(rhythm_mode_taiko::TaikoJudge::RollHit),
+                format!("  {} ", app.text(UiText::Centered)),
+                app.theme.label,
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Branch Controls: ", app.theme.label),
-            Span::styled(result.branch_controls.to_string(), app.theme.route_current),
+            Span::styled(centered.to_string(), app.theme.value),
+            Span::styled(
+                format!("  {} ", app.text(UiText::RollHits)),
+                app.theme.label,
+            ),
+            Span::styled(final_result.roll_hits.to_string(), app.theme.value),
         ]),
     ])
-    .block(themed_block(app, "Judge Stats"))
+    .block(themed_block(app, app.text(UiText::Judgement)))
     .wrap(Wrap { trim: true });
     frame.render_widget(judge, layout[1]);
 
-    let timing = Paragraph::new(timing_lines(app, result, layout[2].width))
-        .block(themed_block(app, "Timing Distribution"))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(timing, layout[2]);
+    frame.render_widget(
+        Paragraph::new(timing_lines(app, result, layout[2].width))
+            .block(themed_block(app, app.text(UiText::TimingDistribution)))
+            .wrap(Wrap { trim: false }),
+        layout[2],
+    );
 
-    let perf = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Tick avg ", app.theme.label),
-            Span::styled(
-                format!("{:.3} ms", result.perf.tick.avg_ms),
-                app.theme.value,
-            ),
-            Span::styled(" | Tick p95 ", app.theme.label),
-            Span::styled(
-                format!("{:.3} ms", result.perf.tick.p95_ms),
-                app.theme
-                    .perf_style(PerfMetricKind::TickP95Ms, result.perf.tick.p95_ms),
-            ),
-            Span::styled(" | TPS ", app.theme.label),
-            Span::styled(
-                format!("{:.1}", result.perf.tps),
-                app.theme.perf_style(PerfMetricKind::Tps, result.perf.tps),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Frame avg ", app.theme.label),
-            Span::styled(
-                format!("{:.3} ms", result.perf.frame.avg_ms),
-                app.theme.value,
-            ),
-            Span::styled(" | Frame p95 ", app.theme.label),
-            Span::styled(
-                format!("{:.3} ms", result.perf.frame.p95_ms),
-                app.theme
-                    .perf_style(PerfMetricKind::FrameP95Ms, result.perf.frame.p95_ms),
-            ),
-            Span::styled(" | FPS ", app.theme.label),
-            Span::styled(
-                format!("{:.1}", result.perf.fps),
-                app.theme.perf_style(PerfMetricKind::Fps, result.perf.fps),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "Press Enter/Don/Esc to go back to Song Menu",
+    if app.result_details_visible {
+        let perf = &result.perf;
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{} ", app.text(UiText::Replay)), app.theme.label),
+                    Span::styled(format!("{:016x}", result.replay_hash), app.theme.metadata),
+                    Span::styled(
+                        format!("  {} ", app.text(UiText::BranchControls)),
+                        app.theme.label,
+                    ),
+                    Span::styled(result.branch_controls.to_string(), app.theme.metadata),
+                ]),
+                perf_line(
+                    app,
+                    "Input dispatch",
+                    perf.input_dispatch.p95_ms,
+                    perf.input_dispatch.p99_ms,
+                    perf.input_dispatch.max_ms,
+                    PerfMetricKind::TickP95Ms,
+                ),
+                perf_line(
+                    app,
+                    "Logic tick",
+                    perf.tick.p95_ms,
+                    perf.tick.p99_ms,
+                    perf.tick.max_ms,
+                    PerfMetricKind::TickP95Ms,
+                ),
+                perf_line(
+                    app,
+                    "Frame",
+                    perf.frame.p95_ms,
+                    perf.frame.p99_ms,
+                    perf.frame.max_ms,
+                    PerfMetricKind::FrameP95Ms,
+                ),
+                Line::from(vec![
+                    Span::styled("Throughput: ", app.theme.label),
+                    Span::styled(
+                        format!("{:.1} ticks/s", perf.tps),
+                        app.theme.perf_style(PerfMetricKind::Tps, perf.tps),
+                    ),
+                    Span::styled("  ", app.theme.metadata),
+                    Span::styled(
+                        format!("{:.1} frames/s", perf.fps),
+                        app.theme.perf_style(PerfMetricKind::Fps, perf.fps),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    app.text(UiText::ResultHideDetails),
+                    app.theme.metadata,
+                )),
+            ])
+            .block(themed_block(app, app.text(UiText::Details)))
+            .wrap(Wrap { trim: true }),
+            layout[3],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                app.text(UiText::ResultShowDetails),
+                app.theme.metadata,
+            ))
+            .block(themed_block(app, app.text(UiText::Next))),
+            layout[3],
+        );
+    }
+}
+
+fn result_accuracy(result: &TaikoFinalResult) -> f64 {
+    let total = result
+        .great
+        .saturating_add(result.ok)
+        .saturating_add(result.miss);
+    if total == 0 {
+        return 0.0;
+    }
+    (f64::from(result.great) + f64::from(result.ok) * 0.5) * 100.0 / f64::from(total)
+}
+
+fn result_grade(accuracy: f64) -> &'static str {
+    if accuracy >= 95.0 {
+        "S"
+    } else if accuracy >= 90.0 {
+        "A"
+    } else if accuracy >= 80.0 {
+        "B"
+    } else if accuracy >= 70.0 {
+        "C"
+    } else {
+        "D"
+    }
+}
+
+fn early_late_counts(samples: &[TimingSample]) -> (usize, usize, usize) {
+    samples.iter().fold((0, 0, 0), |mut counts, sample| {
+        if sample.delta_tick < 0 {
+            counts.0 += 1;
+        } else if sample.delta_tick > 0 {
+            counts.1 += 1;
+        } else {
+            counts.2 += 1;
+        }
+        counts
+    })
+}
+
+fn personal_best_delta(app: &App, result: &ResultState) -> String {
+    match result.previous_best_score {
+        None => app.text(UiText::NewPersonalBest).to_owned(),
+        Some(previous) if result.final_result.score > previous => format!(
+            "{}  +{}",
+            app.text(UiText::NewPersonalBest),
+            result.final_result.score - previous
+        ),
+        Some(previous) if result.final_result.score == previous => {
+            app.text(UiText::PersonalBestMatched).to_owned()
+        }
+        Some(previous) => format!(
+            "{}  -{}",
+            app.text(UiText::PersonalBestDelta),
+            previous.saturating_sub(result.final_result.score)
+        ),
+    }
+}
+
+fn perf_line(
+    app: &App,
+    label: &str,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+    metric: PerfMetricKind,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), app.theme.label),
+        Span::styled(
+            format!("p95 {p95_ms:.3} ms"),
+            app.theme.perf_style(metric, p95_ms),
+        ),
+        Span::styled(
+            format!("  p99 {p99_ms:.3} ms  max {max_ms:.3} ms"),
             app.theme.metadata,
-        )),
+        ),
     ])
-    .block(themed_block(app, "Performance"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(perf, layout[3]);
 }
 
 fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
@@ -189,8 +341,14 @@ fn timing_lines(app: &App, result: &ResultState, area_width: u16) -> Vec<Line<'s
 
     if samples.is_empty() {
         return vec![Line::from(vec![
-            Span::styled("No tap timing samples.", app.theme.text_secondary),
-            Span::styled(" (roll/expired miss are excluded)", app.theme.metadata),
+            Span::styled(
+                app.text(UiText::NoTapTimingSamples),
+                app.theme.text_secondary,
+            ),
+            Span::styled(
+                format!(" {}", app.text(UiText::RollExpiredMissExcluded)),
+                app.theme.metadata,
+            ),
         ])];
     }
 
@@ -200,19 +358,18 @@ fn timing_lines(app: &App, result: &ResultState, area_width: u16) -> Vec<Line<'s
     let range_ms = tick_to_ms(MISS_WINDOW_TICKS);
 
     let mut lines = Vec::with_capacity(rows.len() + 3);
-    let stats_str = format!(
-        "Samples={}  Avg={:+.2}ms  Median={:+.2}ms  P90|delta|={:.2}ms",
-        stats.count,
-        tick_to_ms(stats.avg_tick),
-        tick_to_ms(stats.median_tick),
-        tick_to_ms(stats.p90_abs_tick)
-    );
+    let stats_str = app.localizer().message(UiMessage::TimingStats {
+        count: stats.count,
+        average_ms: tick_to_ms(stats.avg_tick),
+        median_ms: tick_to_ms(stats.median_tick),
+        p90_absolute_ms: tick_to_ms(stats.p90_abs_tick),
+    });
     lines.push(Line::from(vec![Span::styled(
-        format!("{:<width$}", stats_str, width = plot_width),
+        fit_to_display_width(&stats_str, plot_width),
         app.theme.value,
     )]));
     lines.push(Line::from(vec![Span::styled(
-        build_axis_label(plot_width, range_ms),
+        build_axis_label(app.localizer(), plot_width, range_ms),
         app.theme.metadata,
     )]));
 
@@ -371,40 +528,30 @@ fn tick_to_ms(tick: i64) -> f64 {
     tick as f64 / 1_000.0
 }
 
-fn build_axis_label(width: usize, range_ms: f64) -> String {
-    let left_label = format!("Early <-{range_ms:.1}ms");
-    let center_label = "0ms";
-    let right_label = format!("+{range_ms:.1}ms Late");
-    let zero_idx = timing_zero_index(width);
+fn fit_to_display_width(value: &str, width: usize) -> String {
+    let mut fitted = truncate_to_width(value, width);
+    fitted.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(display_width(&fitted)),
+    ));
+    fitted
+}
 
-    let mut buf = vec![' '; width];
+fn build_axis_label(localizer: Localizer, width: usize, range_ms: f64) -> String {
+    let left_label = localizer.message(UiMessage::TimingAxisEarly { range_ms });
+    let center_label = truncate_to_width(localizer.text(UiText::TimingZero), width);
+    let right_label = localizer.message(UiMessage::TimingAxisLate { range_ms });
+    let center_width = display_width(&center_label);
+    let center_start = timing_zero_index(width)
+        .saturating_sub(center_width / 2)
+        .min(width.saturating_sub(center_width));
+    let right_width = width.saturating_sub(center_start + center_width);
 
-    // Left label at position 0
-    for (i, c) in left_label.chars().enumerate() {
-        if i < width {
-            buf[i] = c;
-        }
-    }
+    let left = fit_to_display_width(&left_label, center_start);
+    let right = truncate_to_width(&right_label, right_width);
+    let right_padding = right_width.saturating_sub(display_width(&right));
 
-    // Center label around zero_idx
-    let center_start = zero_idx.saturating_sub(center_label.len() / 2);
-    for (i, c) in center_label.chars().enumerate() {
-        let pos = center_start + i;
-        if pos < width {
-            buf[pos] = c;
-        }
-    }
-
-    // Right label right-aligned
-    let right_start = width.saturating_sub(right_label.len());
-    for (i, c) in right_label.chars().enumerate() {
-        let pos = right_start + i;
-        if pos < width {
-            buf[pos] = c;
-        }
-    }
-
-    buf.into_iter().collect()
+    format!("{left}{center_label}{}{right}", " ".repeat(right_padding))
 }
 
 /// Bin index boundaries for the GREAT/OK zones around center.
@@ -489,4 +636,71 @@ fn colorize_violin_row(
     spans.push(Span::styled(segment, style_for_zone(seg_zone)));
 
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preferences::UiLanguage;
+
+    #[test]
+    fn localized_axis_labels_have_exact_expected_layout() {
+        let cases = [
+            (
+                UiLanguage::English,
+                "Early <-100.0ms   0ms      +100.0ms Late",
+            ),
+            (
+                UiLanguage::TraditionalChinese,
+                "偏早 <-100.0ms    0ms      +100.0ms 偏晚",
+            ),
+            (
+                UiLanguage::Japanese,
+                "早い <-100.0ms    0ms      +100.0ms 遅い",
+            ),
+        ];
+
+        for (language, expected) in cases {
+            let rendered = build_axis_label(Localizer::new(language), 40, 100.0);
+            assert_eq!(rendered, expected, "language={language:?}");
+            assert_eq!(display_width(&rendered), 40, "language={language:?}");
+        }
+    }
+
+    #[test]
+    fn localized_axis_labels_never_overflow_or_split_graphemes() {
+        for language in UiLanguage::ALL {
+            for width in [0, 1, 2, 3, 8, 24, 31, 80] {
+                let rendered = build_axis_label(Localizer::new(language), width, 200.0);
+                assert_eq!(
+                    display_width(&rendered),
+                    width,
+                    "language={language:?}, width={width}, rendered={rendered:?}"
+                );
+                assert!(!rendered.contains('\u{fffd}'));
+            }
+        }
+    }
+
+    #[test]
+    fn localized_timing_stats_fit_exact_display_width() {
+        for language in UiLanguage::ALL {
+            let localizer = Localizer::new(language);
+            let stats = localizer.message(UiMessage::TimingStats {
+                count: 123,
+                average_ms: -1.25,
+                median_ms: 0.5,
+                p90_absolute_ms: 4.75,
+            });
+
+            for width in [1, 24, 40, 80] {
+                let rendered = fit_to_display_width(&stats, width);
+                assert_eq!(
+                    display_width(&rendered),
+                    width,
+                    "language={language:?}, width={width}, rendered={rendered:?}"
+                );
+            }
+        }
+    }
 }

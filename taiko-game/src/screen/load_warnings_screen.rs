@@ -3,6 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::localization::UiText;
 use crate::tui::Frame;
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -18,25 +19,22 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     let summary = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Warnings: ", app.theme.label),
+            Span::styled(format!("{}: ", app.text(UiText::Warnings)), app.theme.label),
             Span::styled(app.load_warnings.len().to_string(), count_style),
         ]),
         Line::from(vec![
-            Span::styled("Keys: ", app.theme.label),
-            Span::styled(
-                "Up/Down scroll, Left/Right page, Esc/Enter/Ctrl+W back, Ctrl+C quit",
-                app.theme.metadata,
-            ),
+            Span::styled(format!("{}: ", app.text(UiText::Keys)), app.theme.label),
+            Span::styled(app.text(UiText::LoadWarningsControls), app.theme.metadata),
         ]),
     ])
-    .block(themed_block(app, "Load Warnings"))
+    .block(themed_block(app, app.text(UiText::LoadWarnings)))
     .style(app.theme.text_primary)
     .wrap(Wrap { trim: true });
     frame.render_widget(summary, chunks[0]);
 
     let lines = if app.load_warnings.is_empty() {
         vec![Line::from(Span::styled(
-            "No load warnings.",
+            app.text(UiText::NoLoadWarnings),
             app.theme.text_secondary,
         ))]
     } else {
@@ -57,7 +55,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let scroll = app.load_warnings_scroll.min(max_scroll);
 
     let body = Paragraph::new(lines)
-        .block(themed_block(app, "Entries"))
+        .block(themed_block(app, app.text(UiText::Entries)))
         .style(app.theme.text_primary)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));

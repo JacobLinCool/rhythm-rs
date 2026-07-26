@@ -13,28 +13,31 @@ name = "taiko"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.103"
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 clap = { version = "4.5.32", features = ["derive"] }
-crossterm = "0.28.1"
-kira = "0.9.6"
-ratatui = "0.29.0"
-rayon = "1.11.0"
+crossterm = "0.29.0"
+kira = "0.11.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 rhythm-chart = { path = "../rhythm-chart", version = "0.1.0" }
 rhythm-core = { path = "../rhythm-core", version = "0.3.0" }
 rhythm-importer-tja = { path = "../rhythm-importer-tja", version = "0.1.0" }
 rhythm-mode-taiko = { path = "../rhythm-mode-taiko", version = "0.1.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
 directories = "6.0.0"
 hex = "0.4.3"
 futures-util = "0.3.31"
 sha2 = "0.10.9"
+taiko-audio = { path = "../taiko-audio", version = "0.1.0" }
 taiko-multiplayer-protocol = { path = "../taiko-multiplayer-protocol", version = "0.1.0" }
 taiko-resource-server = { path = "../taiko-resource-server", version = "0.1.0" }
 taiko-resource-protocol = { path = "../taiko-resource-protocol", version = "0.1.0" }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { version = "0.27.0", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 walkdir = "2.5.0"
 
 [features]

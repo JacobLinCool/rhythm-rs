@@ -12,3 +12,7 @@ description = "Taiko mode plugin for rhythm-core"
 rhythm-core = { path = "../rhythm-core", version = "0.3.0" }
 rhythm-chart = { path = "../rhythm-chart", version = "0.1.0" }
 serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10.9"

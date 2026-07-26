@@ -1,15 +1,28 @@
 mod app;
 mod audio;
+mod audio_sync;
 #[cfg(test)]
 mod bench;
-mod branch;
 mod cli;
-mod headless;
+mod clipboard;
+mod demo_preview;
+mod embedded_server_start;
 mod input;
+mod invite;
+mod latest_background;
+mod library_loading;
 mod loader;
+mod local_multiplayer;
+mod localization;
+mod offline_preparation;
 mod online;
+mod online_bootstrap;
+mod online_preparation;
 mod online_session;
+#[cfg(test)]
+mod online_test_proxy;
 mod perf;
+mod preferences;
 mod resource;
 mod screen;
 mod song_filter;
@@ -35,40 +48,63 @@ fn main() -> Result<()> {
         return match subcommand {
             CliSubcommand::Server(server_args) => taiko_resource_server::run_server(server_args),
             CliSubcommand::Cache(cache_args) => run_cache_command(cache_args),
-            CliSubcommand::Online(online_args) => online::run_online_command(online_args),
         };
     }
 
-    let mut app = App::new(cli.args)?;
+    run_app(App::new(cli.args)?)
+}
 
+pub(crate) fn run_app(mut app: App) -> Result<()> {
+    let run_result = run_app_tui(&mut app);
+    let shutdown_result = app.shutdown();
+    merge_results(run_result, shutdown_result, "application shutdown")
+}
+
+fn run_app_tui(app: &mut App) -> Result<()> {
     let mut tui = Tui::new(app.args.tps, 120)?;
     tui.enter()?;
 
-    loop {
-        if app.should_quit() {
-            break;
-        }
-
-        match tui.next_event()? {
-            UiEvent::Tick => app.handle_tick(),
-            UiEvent::Frame => {
-                let start = Instant::now();
-                tui.draw(|frame| app.render(frame))?;
-                app.record_frame_time(start.elapsed());
+    let run_result = (|| {
+        loop {
+            if app.should_quit() {
+                break;
             }
-            UiEvent::Key(key) => {
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    app.handle_key(key);
+
+            match tui.next_event()? {
+                UiEvent::Tick => app.handle_tick(),
+                UiEvent::Frame => {
+                    let start = Instant::now();
+                    tui.draw(|frame| app.render(frame))?;
+                    app.record_frame_time(start.elapsed());
+                }
+                UiEvent::Key { event, observed_at } => {
+                    if is_physical_key_press(event.kind) {
+                        app.handle_key_at(event, observed_at);
+                    }
+                }
+                UiEvent::Resize(width, height) => {
+                    tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
                 }
             }
-            UiEvent::Resize(width, height) => {
-                tui.resize(ratatui::layout::Rect::new(0, 0, width, height))?;
-            }
         }
-    }
+        Ok(())
+    })();
 
-    tui.exit()?;
-    Ok(())
+    merge_results(run_result, tui.exit(), "terminal shutdown")
+}
+
+fn is_physical_key_press(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
+}
+
+fn merge_results(first: Result<()>, second: Result<()>, second_label: &str) -> Result<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(anyhow::anyhow!(
+            "{first}; {second_label} also failed: {second}"
+        )),
+    }
 }
 
 fn run_cache_command(args: CacheCommandArgs) -> Result<()> {
@@ -132,4 +168,17 @@ fn run_cache_clear(args: CacheClearArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_physical_key_press;
+    use crossterm::event::KeyEventKind;
+
+    #[test]
+    fn gameplay_does_not_turn_os_key_repeat_into_drum_hits() {
+        assert!(is_physical_key_press(KeyEventKind::Press));
+        assert!(!is_physical_key_press(KeyEventKind::Repeat));
+        assert!(!is_physical_key_press(KeyEventKind::Release));
+    }
 }

@@ -8,7 +8,7 @@ Playable terminal Taiko client built on:
 
 Player manual:
 
-- `/Users/jacoblincool/Documents/GitHub/taiko-rs/taiko-game/PLAYER_GUIDE.md`
+- [PLAYER_GUIDE.md](PLAYER_GUIDE.md)
 
 ## Run
 
@@ -25,20 +25,20 @@ cargo run -p taiko-game --release -- server \
 
 cargo run -p taiko-game --release -- \
   --resource-endpoint http://127.0.0.1:4150/
-
-# multiplayer / spectate (same server endpoint)
-cargo run -p taiko-game --release -- \
-  online create --server http://127.0.0.1:4150 --name host
-cargo run -p taiko-game --release -- \
-  online join --server http://127.0.0.1:4150 --room <CODE> --name p2
-cargo run -p taiko-game --release -- \
-  online spectate --server http://127.0.0.1:4150 --room <CODE> --name viewer
 ```
+
+Normal launch opens an in-game selector for Single Player, Local Two Player,
+and Online Multiplayer. Online Host/Create/Join/Spectate are all configured
+inside the TUI. Only an independently operated server uses a CLI subcommand.
+For deployment, TLS/NAT limits, reconnect behavior, and the
+server-authoritative match flow, see the
+[Multiplayer Guide](../docs/multiplayer.md).
 
 ## CLI
 
 ```text
-taiko --songdir <PATH> [--resource-endpoint <URL>] --tps <N> --track-offset <SEC> \
+taiko --songdir <PATH> [--resource-endpoint <URL>] --tps <N> \
+      --calibration-offset-ms <-500..500> \
       --demo <true|false> --songvol <0..100> --sevol <0..100> \
       [--resource-cache-memory-only]
 taiko server --songdir <PATH> [--host <HOST>] [--port <PORT>]
@@ -46,35 +46,48 @@ taiko cache path
 taiko cache list
 taiko cache clear --endpoint <URL>
 taiko cache clear --all
-taiko online create --server <URL> --name <NICK>
-taiko online join --server <URL> --room <CODE> --name <NICK>
-taiko online spectate --server <URL> --room <CODE> --name <NICK>
 ```
 
 When `--resource-endpoint` is set, song list/chart/audio are loaded through HTTP and `--songdir` is ignored by the client.
-Remote mode uses app-data disk cache by default (`charts`/`audio` keyed by content hash). Use `--resource-cache-memory-only` to disable disk cache.
+Remote mode uses an app-data disk cache by default (`charts`/`audio` keyed by
+content hash), with one v3 index and one global 2 GiB/8,192-entry LRU budget
+across endpoints. Cache hits are rehashed and corrupt blobs are discarded and
+downloaded again. Use `--resource-cache-memory-only` to disable disk cache.
+
+In Online Multiplayer, `Host here` starts a loopback authoritative server owned
+by the game and creates a room. `Create` uses an already-running server.
+Joiners and spectators paste the complete invitation containing the server,
+room, and secret token; a room code alone is insufficient. Spectators connect
+without fetching the HTTP song library or match assets. An empty or missing
+offline song directory remains a visible offline error but does not block the
+Online Multiplayer mode.
 
 ## Controls
 
-- Song Menu: type to search/filter, `Backspace/Delete` edit, `Arrow Up/Down` move, `Enter` confirm, `Ctrl+W` open load warnings
-- Load Warnings: `Up/Down` scroll, `Left/Right` page scroll, `Esc`/`Enter`/`Ctrl+W` back
-- Course Menu:
-- `Arrow Up/Down` (or Kat key groups): select course
-- `Tab/Shift+Tab`: focus setting
-- `Arrow Left/Right`: adjust focused setting (Auto Play/Volumes/Note Offset/Music Offset/Scroll; offset step is `5ms` in `[-500ms, +500ms]`; scroll is cyclic and includes `V-Sync (S)`)
-- `Enter`/Don: start
-- Game: Don/Kat hit, `P` pause/resume, `Esc` back to Course Menu
-- Back: `Esc`
-- Quit: `Ctrl+C`
+- Mode menu: `Up/Down` selects a mode, `Enter` confirms, and `S` opens
+  persistent player settings.
+- Settings: `Up/Down` or `Tab/Shift+Tab` moves; `Left/Right` adjusts;
+  selecting a binding and pressing `Enter` captures one new key. The language,
+  volumes, one input-to-chart calibration, scroll speed, preview, online name,
+  and both players' four keys are saved atomically.
+- Song menu: type to filter; `Backspace/Delete` edits; `Up/Down` moves;
+  `Enter` confirms; `Ctrl+W` opens load warnings; `Esc` clears an active
+  filter, then returns to modes once the filter is empty.
+- Course menu: `Up/Down` selects a course; `Tab/Shift+Tab` focuses an
+  adjustment; `Left/Right` changes it; `Enter` starts.
+- Single-player game defaults: `A=Left Kat`, `S=Left Don`, `D=Right Don`,
+  `F=Right Kat`; `P` pauses; `Esc` asks before abandoning the run.
+- Local course selection: P1 `W/S` + `F`; P2 `Up/Down` + `J` or `Enter`.
+- Local game defaults: P1 uses `A/S/D/F`; P2 uses `J/K/L/;`. Both players have
+  four independent physical strikes. `P` is shared pause and `Esc` is a guarded
+  leave action.
+- Results: `Enter` retries/rematches, `Esc` returns to songs, and `D` toggles
+  replay/performance details.
+- Online: choose Host here/Create/Join/Spectate and fill every field in the TUI.
+- Quit: `Ctrl+C`.
 
-Don key group:
-
-- `Space f g h j c v b n m`
-
-Kat key groups:
-
-- Left: `d s a t r e w q x z`
-- Right: `k l ; ' y u i o , . /`
+Local gameplay is stacked vertically: P1 above P2, with a full-width note
+highway for each player.
 
 ## Song Filter (Magic Words)
 
@@ -86,17 +99,27 @@ Search terms are space-separated and combined with AND.
 - bpm: `bpm=180`, `bpm=120-180`, `bpm>=180`, `bpm<=160`
 - mixed: `alice oni=9 bpm>=180`
 
-## Branching
+## Chart and rules policy
 
-Branch conditions are evaluated outside core by `BranchController` and sent through `TimedControl<BranchControl>`.
-Player client uses fixed policy `auto` (follow TJA hint kind `p/r/s`), not selectable in UI.
+Missing or empty `WAVE` means the chart is intentionally silent. The client
+does not guess a same-stem audio file; silent charts remain playable from the
+deterministic monotonic game clock. If the operating system has no audio output,
+the game still reaches the mode menu and explains that only silent content is
+available.
 
-`Scroll Speed` has a special `V-Sync (S)` slot. `S` is computed per selected chart to minimize terminal-grid jitter and is constrained to `1.0 <= S <= 2.0`.
+The player client always uses the official automatic TJA branch policy; branch
+policy is not a player setting. Modern scoring is chart-normalized and gives
+every judged tap the same score value. Big and small notes have identical
+judgement and scoring, Go-Go is visual-only, and there is no combo multiplier.
+The four physical sides remain distinct for bindings, sound, networking, and
+replay identity.
+
+`Scroll Speed` has a special `Velocity Sync (S)` slot. `S` is computed per selected chart to minimize terminal-grid jitter and is constrained to `1.0 <= S <= 2.0`.
 
 Autoplay behavior (Course Menu `Auto Play = ON`):
 
 - auto play also plays Don/Kat hit sound effects
-- roll auto rate defaults to `16 * (bpm / 120)` hits/s
+- roll auto rate is fixed at `16` hits/s across tempo changes, matching the ruleset's roll-score reserve
 
 ## Color Policy
 

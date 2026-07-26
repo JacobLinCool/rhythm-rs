@@ -5,9 +5,11 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use rhythm_mode_taiko::{
     TaikoAction, TaikoDisplayKind, TaikoFrameView, TaikoJudge, LANE_BOTH, LANE_DON, LANE_KAT,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::render_gauge_bar_line;
 use crate::app::App;
+use crate::localization::{display_width, Localizer, UiText};
 use crate::theme::Theme;
 use crate::tui::Frame;
 
@@ -20,19 +22,10 @@ const HIT_X_LEFT_SHIFT: usize = 1;
 pub struct LaneRenderOptions {
     pub scroll_speed: f32,
     pub paused: bool,
+    pub paused_label: &'static str,
+    pub gogo_label: &'static str,
     pub judge_flash: Option<TaikoJudge>,
     pub input_flash: Option<TaikoAction>,
-}
-
-impl LaneRenderOptions {
-    pub fn standard(scroll_speed: f32) -> Self {
-        Self {
-            scroll_speed,
-            paused: false,
-            judge_flash: None,
-            input_flash: None,
-        }
-    }
 }
 
 struct LaneRows<'a> {
@@ -44,8 +37,11 @@ struct LaneRows<'a> {
 
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some(game) = app.game.as_ref() else {
-        let empty = Paragraph::new(Span::styled("Game session missing", app.theme.error))
-            .block(themed_block(app, "Game"));
+        let empty = Paragraph::new(Span::styled(
+            app.text(UiText::GameSessionMissing),
+            app.theme.error,
+        ))
+        .block(themed_block(app, app.text(UiText::Game)));
         frame.render_widget(empty, area);
         return;
     };
@@ -54,20 +50,33 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Min(3),
+            Constraint::Min(7),
+            Constraint::Length(1),
         ])
         .split(area);
 
     let score = &game.last_output.score;
+    let (feedback, feedback_style) = judge_feedback(
+        app.localizer(),
+        &app.theme,
+        game.paused,
+        game.judge_flash.map(|flash| flash.judge),
+    );
+
     let hud = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Score ", app.theme.label),
-            Span::styled(format!("{:>9}", score.score), app.theme.value),
-            Span::styled(" | Combo ", app.theme.label),
-            Span::styled(format!("{:>4}", score.combo), app.theme.value),
-            Span::styled(" | Max ", app.theme.label),
-            Span::styled(format!("{:>4}", score.max_combo), app.theme.value),
+            Span::styled(format!("{}  ", app.text(UiText::Score)), app.theme.label),
+            Span::styled(format!("{:09}", score.score), app.theme.value),
+            Span::styled(
+                format!("      {}  ", app.text(UiText::Combo)),
+                app.theme.label,
+            ),
+            Span::styled(format!("{:04}", score.combo), app.theme.selection),
+            Span::styled(
+                format!("      {}  ", app.text(UiText::BestCombo)),
+                app.theme.label,
+            ),
+            Span::styled(format!("{:04}", score.max_combo), app.theme.value),
         ]),
         render_gauge_bar_line(
             app,
@@ -77,77 +86,115 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             false,
         ),
         Line::from(vec![
-            Span::styled("GREAT ", app.theme.label),
-            Span::styled(
-                format!("{:>4}", score.great),
-                app.theme.judge_style(TaikoJudge::Great { delta_tick: 0 }),
-            ),
-            Span::styled(" | OK ", app.theme.label),
-            Span::styled(
-                format!("{:>4}", score.ok),
-                app.theme.judge_style(TaikoJudge::Ok { delta_tick: 0 }),
-            ),
-            Span::styled(" | MISS ", app.theme.label),
-            Span::styled(
-                format!("{:>4}", score.miss),
-                app.theme.judge_style(TaikoJudge::Miss { delta_tick: 0 }),
-            ),
-            Span::styled(" | Roll Hits ", app.theme.label),
-            Span::styled(
-                format!("{:>4}", score.roll_hits),
-                app.theme.judge_style(TaikoJudge::RollHit),
-            ),
+            Span::styled(feedback, feedback_style),
+            if app.auto_play {
+                Span::styled(
+                    format!("      [{}]", app.text(UiText::AutoPlay)),
+                    app.theme.warning,
+                )
+            } else {
+                Span::raw("")
+            },
         ]),
-        Line::from(vec![
-            Span::styled("Auto: ", app.theme.label),
-            Span::styled(app.auto_play.to_string(), app.theme.value),
-            Span::styled(" | Paused: ", app.theme.label),
-            Span::styled(
-                game.paused.to_string(),
-                if game.paused {
-                    app.theme.warning
-                } else {
-                    app.theme.value
-                },
-            ),
-            Span::styled(" | Replay: ", app.theme.label),
-            Span::styled(
-                format!("{:016x}", game.last_output.replay_hash),
-                app.theme.metadata,
-            ),
-        ]),
+        progress_line(
+            app,
+            game.last_output.now,
+            game.chart_end_tick,
+            game.last_output.frame_view.gogo_active,
+        ),
     ])
-    .block(themed_block_plain(app));
+    .block(themed_block(app, app.text(UiText::LiveScore)));
     frame.render_widget(hud, layout[0]);
 
     render_lane(app, frame, layout[1]);
 
-    let help = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Controls: ", app.theme.label),
-            Span::styled(
-                "Don keys/Space, Kat keys, P=pause, Esc=back, Ctrl+C=quit",
-                app.theme.metadata,
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{} ", app.text(UiText::Don)),
+            app.theme.lane_note_don,
+        ),
+        Span::styled(
+            format!(
+                " {} / {}  ",
+                app.preferences.player_one.left_don.to_ascii_uppercase(),
+                app.preferences.player_one.right_don.to_ascii_uppercase()
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Note offset: ", app.theme.label),
-            Span::styled(app.note_offset_label(), app.theme.value),
-            Span::styled(" | Music offset: ", app.theme.label),
-            Span::styled(app.music_offset_label(), app.theme.value),
-            Span::styled(" | Total: ", app.theme.label),
-            Span::styled(app.total_offset_label(), app.theme.value),
-            Span::styled(" | Scroll: ", app.theme.label),
-            Span::styled(app.scroll_speed_label(), app.theme.value),
-            Span::styled(" | Tick now: ", app.theme.label),
-            Span::styled(
-                format!("{:.3}s", game.last_output.now as f64 / 1_000_000.0),
-                app.theme.value,
+            app.theme.metadata,
+        ),
+        Span::styled(
+            format!("{} ", app.text(UiText::Kat)),
+            app.theme.lane_note_kat,
+        ),
+        Span::styled(
+            format!(
+                " {} / {}  ",
+                app.preferences.player_one.left_kat.to_ascii_uppercase(),
+                app.preferences.player_one.right_kat.to_ascii_uppercase()
             ),
-        ]),
-    ])
-    .block(themed_block(app, "Input"));
+            app.theme.metadata,
+        ),
+        Span::styled(app.text(UiText::GameControlsHelp), app.theme.text_secondary),
+    ]));
     frame.render_widget(help, layout[2]);
+}
+
+fn progress_line(
+    app: &App,
+    now_tick: i64,
+    chart_end_tick: i64,
+    gogo_active: bool,
+) -> Line<'static> {
+    let end = chart_end_tick.max(0);
+    let now = now_tick.clamp(0, end.max(0));
+    let progress = if end == 0 {
+        100.0
+    } else {
+        now as f64 * 100.0 / end as f64
+    };
+    let remaining_us = end.saturating_sub(now);
+    let remaining_seconds = u64::try_from(remaining_us / 1_000_000).unwrap_or_default();
+    let minutes = remaining_seconds / 60;
+    let seconds = remaining_seconds % 60;
+    Line::from(vec![
+        Span::styled(format!("{}  ", app.text(UiText::Progress)), app.theme.label),
+        Span::styled(format!("{progress:>6.2}%"), app.theme.value),
+        Span::styled(
+            format!("    {}  ", app.text(UiText::Remaining)),
+            app.theme.label,
+        ),
+        Span::styled(format!("{minutes:02}:{seconds:02}"), app.theme.value),
+        if gogo_active {
+            Span::styled(
+                format!("    {}", app.text(UiText::GoGoTime)),
+                app.theme.warning,
+            )
+        } else {
+            Span::raw("")
+        },
+    ])
+}
+
+pub(crate) fn judge_feedback(
+    localizer: Localizer,
+    theme: &Theme,
+    paused: bool,
+    judge: Option<TaikoJudge>,
+) -> (&'static str, Style) {
+    if paused {
+        (localizer.text(UiText::PausedResumeFeedback), theme.warning)
+    } else if let Some(judge) = judge {
+        match judge {
+            TaikoJudge::Great { .. } => (localizer.text(UiText::GreatFeedback), theme.judge_great),
+            TaikoJudge::Ok { .. } => (localizer.text(UiText::GoodFeedback), theme.judge_ok),
+            TaikoJudge::Miss { .. } | TaikoJudge::MissExpired => {
+                (localizer.text(UiText::MissFeedback), theme.judge_miss)
+            }
+            TaikoJudge::RollHit => (localizer.text(UiText::DrumrollFeedback), theme.judge_roll),
+            TaikoJudge::Ignored => (localizer.text(UiText::KeepRhythm), theme.metadata),
+        }
+    } else {
+        (localizer.text(UiText::KeepRhythm), theme.metadata)
+    }
 }
 
 fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -163,6 +210,8 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         LaneRenderOptions {
             scroll_speed: app.effective_scroll_speed(),
             paused: game.paused,
+            paused_label: app.text(UiText::PauseLane),
+            gogo_label: app.text(UiText::GoGoLane),
             judge_flash: game.judge_flash.map(|flash| flash.judge),
             input_flash: game.input_flash.map(|flash| flash.action),
         },
@@ -181,9 +230,10 @@ pub fn render_lane_view(
     // Shared row: balloon labels and top-side bar lines.
     // Draw bar lines first, then labels so labels stay visually on top.
     let mut label = vec![Span::styled(" ", theme.text_primary); width];
-    let mut top = vec![Span::styled(" ", theme.text_primary); width];
-    let mut middle = vec![Span::styled(" ", theme.lane_track); width];
-    let mut bottom = vec![Span::styled(" ", theme.text_primary); width];
+    let track_style = theme.lane_track_style(view.gogo_active);
+    let mut top = vec![Span::styled(" ", track_style); width];
+    let mut middle = vec![Span::styled(" ", track_style); width];
+    let mut bottom = vec![Span::styled(" ", track_style); width];
     let mut bar_bottom = vec![Span::styled(" ", theme.text_primary); width];
 
     let base_style = judge_base_style(theme, options.judge_flash);
@@ -206,7 +256,9 @@ pub fn render_lane_view(
     };
     paint_notes(theme, &mut rows, width, hit_x, view, options.scroll_speed);
     if options.paused {
-        paint_centered_label(&mut label, "PAUSED", theme.warning);
+        paint_centered_label(&mut label, options.paused_label, theme.warning);
+    } else if view.gogo_active {
+        paint_centered_label(&mut label, options.gogo_label, theme.warning);
     }
 
     let marker_style = input_marker_style(theme, options.input_flash);
@@ -220,15 +272,23 @@ pub fn render_lane_view(
         marker_style,
     );
 
-    let lane = Paragraph::new(vec![
+    let lane_lines = vec![
         Line::from(label),
         Line::from(top),
         Line::from(middle),
         Line::from(bottom),
         Line::from(bar_bottom),
-    ])
-    .block(themed_block_plain_theme(theme));
-    frame.render_widget(lane, area);
+    ];
+    let block = themed_block_plain_theme(theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lane_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(inner.height.saturating_sub(5) / 2),
+        width: inner.width,
+        height: inner.height.min(5),
+    };
+    frame.render_widget(Paragraph::new(lane_lines), lane_area);
 }
 
 fn paint_bar_lines(
@@ -241,7 +301,7 @@ fn paint_bar_lines(
     style: Style,
 ) {
     for bar_line in &view.bar_lines {
-        let bar_line_scroll_speed = scroll_speed * bar_line.scroll_multiplier();
+        let bar_line_scroll_speed = scroll_speed * bar_line.visual_speed_multiplier();
         let Some(x) = to_x(
             bar_line.tick - view.now,
             width,
@@ -264,7 +324,7 @@ fn paint_notes(
     global_scroll_speed: f32,
 ) {
     for note in &view.notes {
-        let scroll_speed = global_scroll_speed * note.scroll_multiplier();
+        let scroll_speed = global_scroll_speed * note.visual_speed_multiplier();
         match note.kind {
             TaikoDisplayKind::Tap => {
                 let start_x = match to_x(note.start_tick - view.now, width, hit_x, scroll_speed) {
@@ -317,14 +377,21 @@ fn paint_centered_label(label: &mut [Span<'static>], text: &str, style: Style) {
         return;
     }
 
-    let text_chars = text.chars().collect::<Vec<_>>();
-    let start = label.len().saturating_sub(text_chars.len()) / 2;
-    for (idx, ch) in text_chars.into_iter().enumerate() {
-        let col = start + idx;
-        if col >= label.len() {
+    let width = display_width(text);
+    let mut col = label.len().saturating_sub(width) / 2;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if grapheme_width == 0 {
+            continue;
+        }
+        if col.saturating_add(grapheme_width) > label.len() {
             break;
         }
-        label[col] = Span::styled(ch.to_string(), style);
+        label[col] = Span::styled(grapheme.to_owned(), style);
+        for continuation in 1..grapheme_width {
+            label[col + continuation] = Span::raw("");
+        }
+        col += grapheme_width;
     }
 }
 
@@ -426,10 +493,6 @@ fn themed_block<'a>(app: &App, title: &'a str) -> Block<'a> {
         .border_style(app.theme.border)
         .title(title)
         .title_style(app.theme.title)
-}
-
-fn themed_block_plain(app: &App) -> Block<'_> {
-    themed_block_plain_theme(&app.theme)
 }
 
 fn themed_block_plain_theme(theme: &Theme) -> Block<'_> {
@@ -555,11 +618,16 @@ mod tests {
         widgets::Paragraph,
         Terminal,
     };
+    use rhythm_core::BasicEngine;
+    use rhythm_importer_tja::TjaImporter;
+    use rhythm_mode_taiko::TaikoMode;
 
     use super::{
         hit_x_for_width, marker_base_style_for_hit_zone, paint_bar_lines,
-        paint_hit_markers_overlay, paint_hit_zone_base, paint_note_blob, projected_span_x, to_x,
+        paint_hit_markers_overlay, paint_hit_zone_base, paint_note_blob, projected_span_x,
+        render_lane_view, to_x, LaneRenderOptions,
     };
+    use crate::theme::Theme;
 
     #[test]
     fn layering_keeps_marker_on_top_of_note_and_base() {
@@ -725,6 +793,81 @@ mod tests {
     }
 
     #[test]
+    fn nosferatu_equal_bpm_scroll_pairs_project_to_the_same_column() {
+        const NOSFERATU: &[u8] = include_bytes!("../../samples/Nosferatu.tja");
+        const PROJECTION_DELTA: i64 = 100_000;
+
+        let song = TjaImporter
+            .import_song(NOSFERATU)
+            .expect("import Nosferatu");
+        let ura_pairs = [
+            (1_260_000, 300_000),   // 200 BPM × 1.26
+            (630_000, 150_000),     // 400 BPM × 0.63
+            (840_000, 200_000),     // 300 BPM × 0.84
+            (5_040_000, 1_200_000), // 50 BPM × 5.04
+        ];
+        let oni_pairs = [
+            (1_000_000, 300_000),   // 200 BPM × 1.00
+            (500_000, 150_000),     // 400 BPM × 0.50
+            (4_000_000, 1_200_000), // 50 BPM × 4.00
+        ];
+        let width = 120;
+        let hit_x = hit_x_for_width(width);
+
+        for (course_name, expected_speed, expected_pairs) in [
+            ("4", 1_260_000, ura_pairs.as_slice()),
+            ("3", 1_000_000, oni_pairs.as_slice()),
+        ] {
+            let chart = song
+                .courses
+                .iter()
+                .map(|course| &course.chart)
+                .find(|chart| chart.metadata.difficulty_name.as_deref() == Some(course_name))
+                .expect("Nosferatu course");
+            let mut projected_columns = Vec::new();
+
+            for &(scroll_scaled, micros_per_quarter) in expected_pairs {
+                let object = chart
+                    .objects
+                    .iter()
+                    .find(|object| {
+                        let tempo_index = chart
+                            .tempo_map
+                            .partition_point(|tempo| tempo.tick <= object.start_tick);
+                        let tempo =
+                            chart.tempo_map[tempo_index.saturating_sub(1)].micros_per_quarter;
+                        object.scroll_scaled == scroll_scaled && tempo == micros_per_quarter
+                    })
+                    .expect("representative note for BPM × SCROLL pair");
+                let now = object.start_tick - PROJECTION_DELTA;
+                let mut engine = BasicEngine::<TaikoMode>::new_basic(chart).expect("taiko engine");
+                let output = engine.step_to(now, &[]).expect("project note");
+                let note = output
+                    .frame_view
+                    .notes
+                    .iter()
+                    .find(|note| note.id == object.id)
+                    .expect("representative note in frame view");
+
+                assert_eq!(note.visual_speed_scaled, expected_speed);
+                projected_columns.push(
+                    to_x(
+                        note.start_tick - output.frame_view.now,
+                        width,
+                        hit_x,
+                        note.visual_speed_multiplier(),
+                    )
+                    .expect("visible projected note"),
+                );
+            }
+
+            assert!(projected_columns
+                .windows(2)
+                .all(|columns| columns[0] == columns[1]));
+        }
+    }
+
+    #[test]
     fn bar_lines_render_as_background_blocks_on_outer_rows() {
         let width = 40usize;
         let hit_x = hit_x_for_width(width);
@@ -736,11 +879,12 @@ mod tests {
             notes: Vec::new(),
             bar_lines: vec![rhythm_mode_taiko::TaikoFrameBarLine {
                 tick: 1_000_000,
-                scroll_scaled: 1_000_000,
+                visual_speed_scaled: 1_000_000,
             }],
             score: 0,
             combo: 0,
             gauge: 0.0,
+            gogo_active: false,
         };
 
         paint_bar_lines(
@@ -773,11 +917,12 @@ mod tests {
             notes: Vec::new(),
             bar_lines: vec![rhythm_mode_taiko::TaikoFrameBarLine {
                 tick: 1_000_000,
-                scroll_scaled: 1_000_000,
+                visual_speed_scaled: 1_000_000,
             }],
             score: 0,
             combo: 0,
             gauge: 0.0,
+            gogo_active: false,
         };
 
         paint_bar_lines(
@@ -811,16 +956,17 @@ mod tests {
             bar_lines: vec![
                 rhythm_mode_taiko::TaikoFrameBarLine {
                     tick: 500_000,
-                    scroll_scaled: 1_000_000,
+                    visual_speed_scaled: 1_000_000,
                 },
                 rhythm_mode_taiko::TaikoFrameBarLine {
                     tick: 500_000,
-                    scroll_scaled: 2_000_000,
+                    visual_speed_scaled: 2_000_000,
                 },
             ],
             score: 0,
             combo: 0,
             gauge: 0.0,
+            gogo_active: false,
         };
 
         paint_bar_lines(&mut above, &mut below, width, hit_x, &view, 1.0, base_style);
@@ -831,6 +977,52 @@ mod tests {
         assert_eq!(above[base_x].style, base_style);
         assert_eq!(above[fast_x].style, base_style);
         assert_eq!(below[fast_x].style, base_style);
+    }
+
+    #[test]
+    fn gogo_zone_uses_distinct_track_background_and_visible_label() {
+        let theme = Theme::taiko_vivid(crate::theme::ColorMode::Enabled);
+        let view = rhythm_mode_taiko::TaikoFrameView {
+            now: 0,
+            notes: Vec::new(),
+            bar_lines: Vec::new(),
+            score: 0,
+            combo: 0,
+            gauge: 0.0,
+            gogo_active: true,
+        };
+        let backend = TestBackend::new(48, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_lane_view(
+                    &theme,
+                    frame,
+                    frame.area(),
+                    &view,
+                    LaneRenderOptions {
+                        scroll_speed: 1.0,
+                        paused: false,
+                        paused_label: "PAUSED",
+                        gogo_label: "GO-GO!",
+                        judge_flash: None,
+                        input_flash: None,
+                    },
+                );
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("GO-GO!"));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.style().bg == theme.lane_track_gogo.bg));
     }
 
     fn cell(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> &Cell {

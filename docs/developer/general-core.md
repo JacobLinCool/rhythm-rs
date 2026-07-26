@@ -40,7 +40,7 @@ let controls = [TimedControl {
 
 let inputs = [TimedInput {
     tick: 1_000_000,
-    action: TaikoAction::Don,
+    action: TaikoAction::LEFT_DON,
 }];
 
 let frame = engine.step_to_with_controls(1_000_000, &controls, &inputs)?;

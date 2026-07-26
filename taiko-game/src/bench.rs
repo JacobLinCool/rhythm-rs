@@ -1,36 +1,37 @@
 use std::time::{Duration, Instant};
 
 use ratatui::backend::TestBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::Terminal;
 use rhythm_chart::{
     CanonicalChart, ChartMetadata, LaneOrRegion, Object, ObjectKind, TempoChange,
     TimeSignatureChange, TICKS_PER_SECOND,
 };
-use rhythm_core::ControlledEngine;
 use rhythm_importer_tja::TjaImporter;
-use rhythm_mode_taiko::TaikoMode;
+use rhythm_mode_taiko::{ScheduledTaikoInput, TaikoBranchPolicy, TaikoRuntime};
 
 use crate::app::{build_autoplay_inputs, compute_vsync_scroll_speed};
-use crate::branch::BranchController;
-use crate::cli::BranchPolicy;
 use crate::perf::PerfMeter;
+use crate::screen::game_screen::{render_lane_view, LaneRenderOptions};
+use crate::theme::Theme;
 
 #[test]
 #[ignore = "bench_smoke"]
-fn bench_smoke_end_to_end_tui() {
+fn bench_smoke_real_four_lane_gameplay_renderer() {
     let raw = include_bytes!("../samples/Nosferatu.tja");
     let importer = TjaImporter;
     let song = importer.import_song(raw).expect("import song");
     let course = song.courses.first().expect("course");
 
     let chart = &course.chart;
-    let mut engine = ControlledEngine::<TaikoMode>::new_controlled(chart).expect("engine");
-    let mut branch = BranchController::new(BranchPolicy::None, 0, course.branch_decisions.clone());
+    let mut runtime = TaikoRuntime::new(
+        chart,
+        TaikoBranchPolicy::Disabled,
+        course.branch_decisions.clone(),
+    )
+    .expect("runtime");
 
-    let autoplay_inputs = build_autoplay_inputs(chart);
+    let autoplay_inputs = build_autoplay_inputs(chart).expect("bounded autoplay inputs");
     let mut input_cursor = 0usize;
 
     let step_tick = (TICKS_PER_SECOND / 240).max(1);
@@ -49,22 +50,21 @@ fn bench_smoke_end_to_end_tui() {
     let mut perf = PerfMeter::default();
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
+    let theme = Theme::taiko_vivid(Theme::detect());
 
     while now <= end_tick {
         let start = input_cursor;
         while input_cursor < autoplay_inputs.len() && autoplay_inputs[input_cursor].tick <= now {
             input_cursor += 1;
         }
-        let frame_inputs = &autoplay_inputs[start..input_cursor];
-
-        let controls = branch
-            .controls_for_tick(now, engine.score())
-            .expect("controls for tick");
+        let frame_inputs = autoplay_inputs[start..input_cursor]
+            .iter()
+            .copied()
+            .map(ScheduledTaikoInput::unconditional)
+            .collect::<Vec<_>>();
 
         let tick_start = Instant::now();
-        let output = engine
-            .step_to_with_controls(now, &controls, frame_inputs)
-            .expect("step");
+        let output = runtime.advance_to(now, &frame_inputs).expect("step");
         perf.record_tick(tick_start.elapsed());
 
         if now >= next_frame {
@@ -72,43 +72,29 @@ fn bench_smoke_end_to_end_tui() {
             terminal
                 .draw(|frame| {
                     let size = frame.area();
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(1),
-                            Constraint::Length(1),
-                            Constraint::Min(1),
-                        ])
-                        .split(size);
-
-                    frame.render_widget(
-                        Paragraph::new(Line::from(format!(
-                            "score={} combo={} notes={} now={:.3}s",
-                            output.score.score,
-                            output.score.combo,
-                            output.frame_view.notes.len(),
-                            output.now as f64 / 1_000_000.0
-                        ))),
-                        chunks[0],
-                    );
-
-                    frame.render_widget(
-                        Paragraph::new(Line::from(format!(
-                            "routes={} next_decision={}",
-                            branch.current_routes().len(),
-                            branch
-                                .next_decision()
-                                .map_or_else(|| "none".to_owned(), |d| format!("{}", d.segment_id))
-                        ))),
-                        chunks[1],
-                    );
-
-                    frame.render_widget(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Benchmark Frame"),
-                        chunks[2],
-                    );
+                    let lanes = Layout::vertical([
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                        Constraint::Ratio(1, 4),
+                    ])
+                    .split(size);
+                    for lane in lanes.iter().copied() {
+                        render_lane_view(
+                            &theme,
+                            frame,
+                            lane,
+                            &output.frame_view,
+                            LaneRenderOptions {
+                                scroll_speed: 1.0,
+                                paused: false,
+                                paused_label: "PAUSED",
+                                gogo_label: "GO-GO!",
+                                judge_flash: None,
+                                input_flash: None,
+                            },
+                        );
+                    }
                 })
                 .expect("draw");
             perf.record_frame(frame_start.elapsed());
@@ -124,7 +110,7 @@ fn bench_smoke_end_to_end_tui() {
 
     let snapshot = perf.snapshot();
     eprintln!(
-        "bench_smoke: tick_avg={:.3}ms tick_p95={:.3}ms frame_avg={:.3}ms frame_p95={:.3}ms tps={:.1} fps={:.1}",
+        "bench_smoke_real_4p: tick_avg={:.3}ms tick_p95={:.3}ms frame_avg={:.3}ms frame_p95={:.3}ms tps={:.1} fps={:.1}",
         snapshot.tick.avg_ms,
         snapshot.tick.p95_ms,
         snapshot.frame.avg_ms,

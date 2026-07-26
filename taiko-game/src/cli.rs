@@ -1,16 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum BranchPolicy {
-    Auto,
-    Accuracy,
-    Roll,
-    Score,
-    FixedRoute,
-    None,
-}
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Clone, Args)]
 pub struct CliArgs {
@@ -31,9 +21,9 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        global = true,
         default_value_t = false,
-        requires = "resource_endpoint",
-        help = "Use memory-only cache for remote resources (disable app-data disk cache)"
+        help = "Use memory-only cache for remote or multiplayer authority resources (disable app-data disk cache)"
     )]
     pub resource_cache_memory_only: bool,
 
@@ -47,10 +37,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        default_value_t = 0.0,
-        help = "Initial note offset in seconds (positive delays notes; adjustable in Course Menu)"
+        value_name = "MS",
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i32).range(-500..=500),
+        help = "Initial input-to-chart calibration in milliseconds; adjustable in Settings"
     )]
-    pub track_offset: f64,
+    pub calibration_offset_ms: i32,
 
     #[arg(
         long,
@@ -83,8 +76,6 @@ pub enum CliSubcommand {
     Server(taiko_resource_server::ServerArgs),
     /// Inspect or manage remote resource cache.
     Cache(CacheCommandArgs),
-    /// Play online multiplayer or spectate.
-    Online(OnlineCommandArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -124,69 +115,6 @@ pub struct CacheClearArgs {
     pub all: bool,
 }
 
-#[derive(Debug, Clone, Args)]
-pub struct OnlineCommandArgs {
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Run without TUI or audio; log events to stdout and read commands from stdin"
-    )]
-    pub headless: bool,
-
-    #[command(subcommand)]
-    pub action: OnlineAction,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum OnlineAction {
-    /// Create a new private multiplayer room.
-    Create(OnlineCreateArgs),
-    /// Join a multiplayer room as player.
-    Join(OnlineJoinArgs),
-    /// Join a multiplayer room as spectator.
-    Spectate(OnlineSpectateArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OnlineCreateArgs {
-    #[arg(
-        long,
-        value_name = "URL",
-        help = "Server base URL, e.g. https://example.com"
-    )]
-    pub server: String,
-    #[arg(long, value_name = "NICK", help = "Display name")]
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OnlineJoinArgs {
-    #[arg(
-        long,
-        value_name = "URL",
-        help = "Server base URL, e.g. https://example.com"
-    )]
-    pub server: String,
-    #[arg(long, value_name = "CODE", help = "Room code")]
-    pub room: String,
-    #[arg(long, value_name = "NICK", help = "Display name")]
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct OnlineSpectateArgs {
-    #[arg(
-        long,
-        value_name = "URL",
-        help = "Server base URL, e.g. https://example.com"
-    )]
-    pub server: String,
-    #[arg(long, value_name = "CODE", help = "Room code")]
-    pub room: String,
-    #[arg(long, value_name = "NICK", help = "Display name")]
-    pub name: String,
-}
-
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Playable TUI taiko game")]
 pub struct Cli {
@@ -195,4 +123,25 @@ pub struct Cli {
 
     #[command(flatten)]
     pub args: CliArgs,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn player_multiplayer_is_not_a_cli_subcommand() {
+        assert!(Cli::try_parse_from(["taiko", "multiplayer"]).is_err());
+    }
+
+    #[test]
+    fn calibration_offset_is_explicit_milliseconds_with_strict_bounds() {
+        let parsed = Cli::try_parse_from(["taiko", "--calibration-offset-ms", "-125"])
+            .expect("valid calibration");
+        assert_eq!(parsed.args.calibration_offset_ms, -125);
+        assert!(Cli::try_parse_from(["taiko", "--calibration-offset-ms", "501"]).is_err());
+        assert!(Cli::try_parse_from(["taiko", "--track-offset", "0.125"]).is_err());
+    }
 }

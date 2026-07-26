@@ -13,24 +13,28 @@ name = "taiko-resource-server"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.103"
 axum = { version = "0.8.6", features = ["ws"] }
 clap = { version = "4.5.32", features = ["derive"] }
 futures-util = "0.3.31"
 getrandom = "0.3.4"
 hex = "0.4.3"
-rayon = "1.11.0"
+rhythm-chart = { path = "../rhythm-chart", version = "0.1.0" }
+rhythm-core = { path = "../rhythm-core", version = "0.3.0" }
 rhythm-importer-tja = { path = "../rhythm-importer-tja", version = "0.1.0" }
+rhythm-mode-taiko = { path = "../rhythm-mode-taiko", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
+taiko-audio = { path = "../taiko-audio", version = "0.1.0" }
 taiko-multiplayer-protocol = { path = "../taiko-multiplayer-protocol", version = "0.1.0" }
 taiko-resource-protocol = { path = "../taiko-resource-protocol", version = "0.1.0" }
-tokio = { version = "1.47.1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+thiserror.workspace = true
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 walkdir = "2.5.0"
 
 [features]
 test-fast-countdown = []
 
 [dev-dependencies]
-rhythm-mode-taiko = { path = "../rhythm-mode-taiko", version = "0.1.0" }
+tokio-tungstenite = "0.28.0"

@@ -6,9 +6,44 @@ use rhythm_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod branch;
+mod runtime;
+
+pub use branch::{TaikoBranchController, TaikoBranchError, TaikoBranchPolicy};
+pub use runtime::{ScheduledTaikoInput, TaikoInputRoute, TaikoRuntime, TaikoRuntimeBuildError};
+
 pub const LANE_DON: u16 = 0;
 pub const LANE_KAT: u16 = 1;
 pub const LANE_BOTH: u16 = 2;
+
+/// Version of the deterministic taiko judgement, score, gauge, and branch rules.
+pub const TAIKO_RULESET_VERSION: u32 = 2;
+/// Canonical semantic descriptor hashed by [`TAIKO_RULESET_SHA256`].
+///
+/// Any change to judgement, scoring, gauge, branch selection, or runtime
+/// ordering must update this descriptor and its pinned digest together.
+pub const TAIKO_RULESET_DESCRIPTOR: &str = concat!(
+    "taiko-ruleset/v2\n",
+    "input=side(left|right)+zone(don|kat);side-retained-zone-judged\n",
+    "tap=single-correct-zone-resolves;no-side-chord;big-equals-small\n",
+    "judgement-windows-us=great<30000,ok<80000,miss<=110000\n",
+    "score-pool=1000000;tap-great=ceil10(max(pool-reserves,0)/tap-count);",
+    "tap-ok=great/2;rounding-remainder-not-redistributed\n",
+    "roll-hit=100;roll-reserve=floor(duration-us*16*100/1000000);",
+    "balloon-reserve=required-hits*100;zero-required-balloon-uses-roll-reserve\n",
+    "balloon=100-per-hit;completion-no-bonus;",
+    "incomplete=no-miss,no-combo-reset,no-gauge-loss\n",
+    "branch-normalization=unbranched+per-segment-single-route-max(taps,reserve,lowest-id)\n",
+    "score-multipliers=none-for-side+size+combo+gogo;gauge-profile=taiko-table-v2\n",
+    "gogo=presentation-only;active-after-events-at-tick;equal-tick-canonical-order-last-wins\n",
+    "branch-metric=per-decision-window-delta\n",
+    "branch-threshold-scale=10000\n",
+    "runtime=shared-exact-boundary-v1\n",
+    "runtime-order=expire+apply-judges->branch-decision+control->input+apply-judges\n",
+);
+/// SHA-256 of [`TAIKO_RULESET_DESCRIPTOR`].
+pub const TAIKO_RULESET_SHA256: &str =
+    "16cd8a0bf582fc633f18686bffc97b55a4e323ee5613927465bd57b7294b50bc";
 
 pub const FLAG_BIG: u32 = 1 << 0;
 pub const FLAG_BALLOON: u32 = 1 << 1;
@@ -25,7 +60,7 @@ const SCORE_ROUND_UNIT: u64 = 10;
 const FRAME_VIEW_BARLINE_LOOKBACK_TICKS: Tick = 1_000_000;
 const FRAME_VIEW_BARLINE_LOOKAHEAD_TICKS: Tick = 8_000_000;
 
-// Legacy taiko gauge coefficients (difficulty x level).
+// Taiko gauge coefficients (difficulty x level).
 const GAUGE_MISS_FACTOR: [[f32; 11]; 5] = [
     [
         0.0,
@@ -129,9 +164,41 @@ const GAUGE_FULL_THRESHOLD: [[f32; 11]; 5] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TaikoAction {
+#[serde(rename_all = "snake_case")]
+/// Physical half of the drum that produced a strike.
+///
+/// Side is retained for replay and presentation, but does not change chart
+/// lane matching or score.
+pub enum TaikoSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Drum zone used for chart judgement.
+pub enum TaikoZone {
     Don,
     Kat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// One physical taiko strike with no lossy side folding.
+pub struct TaikoAction {
+    pub side: TaikoSide,
+    pub zone: TaikoZone,
+}
+
+impl TaikoAction {
+    pub const LEFT_DON: Self = Self::new(TaikoSide::Left, TaikoZone::Don);
+    pub const RIGHT_DON: Self = Self::new(TaikoSide::Right, TaikoZone::Don);
+    pub const LEFT_KAT: Self = Self::new(TaikoSide::Left, TaikoZone::Kat);
+    pub const RIGHT_KAT: Self = Self::new(TaikoSide::Right, TaikoZone::Kat);
+
+    pub const fn new(side: TaikoSide, zone: TaikoZone) -> Self {
+        Self { side, zone }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -239,24 +306,24 @@ pub struct TaikoFrameNote {
     pub start_tick: Tick,
     pub end_tick: Tick,
     pub remaining_hits: u16,
-    pub scroll_scaled: i32,
+    pub visual_speed_scaled: i32,
 }
 
 impl TaikoFrameNote {
-    pub fn scroll_multiplier(self) -> f32 {
-        self.scroll_scaled as f32 / SCROLL_SCALE as f32
+    pub fn visual_speed_multiplier(self) -> f32 {
+        self.visual_speed_scaled as f32 / SCROLL_SCALE as f32
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaikoFrameBarLine {
     pub tick: Tick,
-    pub scroll_scaled: i32,
+    pub visual_speed_scaled: i32,
 }
 
 impl TaikoFrameBarLine {
-    pub fn scroll_multiplier(self) -> f32 {
-        self.scroll_scaled as f32 / SCROLL_SCALE as f32
+    pub fn visual_speed_multiplier(self) -> f32 {
+        self.visual_speed_scaled as f32 / SCROLL_SCALE as f32
     }
 }
 
@@ -265,6 +332,10 @@ pub struct TaikoFrameView {
     pub now: Tick,
     pub notes: Vec<TaikoFrameNote>,
     pub bar_lines: Vec<TaikoFrameBarLine>,
+    /// Authoritative presentation state after applying every Go-Go event at
+    /// `now`. When multiple Go-Go events share a tick, canonical event order
+    /// is applied and the last event at that tick wins.
+    pub gogo_active: bool,
     pub score: u32,
     pub combo: u32,
     pub gauge: f32,
@@ -301,7 +372,7 @@ struct TaikoNoteState {
     required_hits: u16,
     hits: u16,
     resolved: bool,
-    scroll_scaled: i32,
+    visual_speed_scaled: i32,
     branch_segment_idx: Option<u16>,
     branch_route_id: u8,
 }
@@ -324,16 +395,23 @@ struct GaugeProfile {
     ok_score_gain: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NormalizationProfile {
+    tap_count: u64,
+    reserve_score: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TaikoBarLineState {
     tick: Tick,
-    scroll_scaled: i32,
+    visual_speed_scaled: i32,
 }
 
 #[derive(Debug, Clone)]
 pub struct TaikoCompiled {
     notes: Vec<TaikoNoteState>,
     bar_lines: Vec<TaikoBarLineState>,
+    gogo_transitions: Vec<(Tick, bool)>,
     active: Vec<usize>,
     cursor: usize,
     gauge_profile: GaugeProfile,
@@ -376,6 +454,13 @@ impl Mode for TaikoMode {
                 "too many branch segments for taiko mode".to_owned(),
             ));
         }
+
+        let reference_micros_per_quarter = tempo_micros_per_quarter_at_tick(&chart.tempo_map, 0)
+            .ok_or_else(|| {
+                CompileError::Unsupported(
+                    "taiko visual projection requires a non-empty valid tempo map".to_owned(),
+                )
+            })?;
 
         let mut segment_index = HashMap::with_capacity(chart.branch_segments.len());
         let mut segment_enabled = Vec::with_capacity(chart.branch_segments.len());
@@ -465,7 +550,12 @@ impl Mode for TaikoMode {
                 required_hits: object.required_hits,
                 hits: 0,
                 resolved: false,
-                scroll_scaled: object.scroll_scaled,
+                visual_speed_scaled: visual_speed_scaled_at_tick(
+                    object.scroll_scaled,
+                    object.start_tick,
+                    reference_micros_per_quarter,
+                    &chart.tempo_map,
+                )?,
                 branch_segment_idx,
                 branch_route_id: object.branch_route_id,
             });
@@ -475,21 +565,43 @@ impl Mode for TaikoMode {
             .events
             .iter()
             .filter_map(|event| match event.kind {
-                ChartEventKind::BarLine { scroll_scaled } => Some(TaikoBarLineState {
-                    tick: event.tick,
-                    scroll_scaled,
-                }),
+                ChartEventKind::BarLine { scroll_scaled } => Some((event.tick, scroll_scaled)),
                 _ => None,
             })
-            .collect::<Vec<_>>();
+            .map(|(tick, scroll_scaled)| {
+                Ok(TaikoBarLineState {
+                    tick,
+                    visual_speed_scaled: visual_speed_scaled_at_tick(
+                        scroll_scaled,
+                        tick,
+                        reference_micros_per_quarter,
+                        &chart.tempo_map,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, CompileError>>()?;
         bar_lines.sort_by_key(|bar_line| bar_line.tick);
         bar_lines.dedup_by_key(|bar_line| bar_line.tick);
+
+        // Canonical chart validation guarantees nondecreasing event ticks.
+        // Filtering in-place preserves canonical order for equal-tick events,
+        // which is the authoritative tie-break used by `gogo_active_at`.
+        let gogo_transitions = chart
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ChartEventKind::GogoStart => Some((event.tick, true)),
+                ChartEventKind::GogoEnd => Some((event.tick, false)),
+                ChartEventKind::BarLine { .. } | ChartEventKind::Marker(_) => None,
+            })
+            .collect();
 
         let gauge_profile = gauge_profile_for_chart(chart, &notes)?;
 
         Ok(TaikoCompiled {
             notes,
             bar_lines,
+            gogo_transitions,
             active: Vec::with_capacity(128),
             cursor: 0,
             gauge_profile,
@@ -622,9 +734,6 @@ impl Mode for TaikoMode {
                     }
                     TaikoNoteKind::Balloon => {
                         if now > note.end_tick {
-                            if note.required_hits > 0 && note.hits < note.required_hits {
-                                out.push(TaikoJudge::MissExpired);
-                            }
                             note.resolved = true;
                             true
                         } else {
@@ -706,6 +815,7 @@ impl Mode for TaikoMode {
             now,
             notes,
             bar_lines: frame_bar_lines(compiled, now),
+            gogo_active: gogo_active_at(compiled, now),
             score: score.score,
             combo: score.combo,
             gauge: score.gauge,
@@ -807,8 +917,8 @@ fn activate_notes(compiled: &mut TaikoCompiled, until_tick: Tick) {
 
 fn lane_matches(lane: u16, action: TaikoAction) -> bool {
     match lane {
-        LANE_DON => matches!(action, TaikoAction::Don),
-        LANE_KAT => matches!(action, TaikoAction::Kat),
+        LANE_DON => matches!(action.zone, TaikoZone::Don),
+        LANE_KAT => matches!(action.zone, TaikoZone::Kat),
         LANE_BOTH => true,
         _ => false,
     }
@@ -841,7 +951,7 @@ fn to_frame_note(note: &TaikoNoteState) -> TaikoFrameNote {
         start_tick: note.start_tick,
         end_tick: note.end_tick,
         remaining_hits: note.required_hits.saturating_sub(note.hits),
-        scroll_scaled: note.scroll_scaled,
+        visual_speed_scaled: note.visual_speed_scaled,
     }
 }
 
@@ -858,9 +968,60 @@ fn frame_bar_lines(compiled: &TaikoCompiled, now: Tick) -> Vec<TaikoFrameBarLine
         .iter()
         .map(|bar_line| TaikoFrameBarLine {
             tick: bar_line.tick,
-            scroll_scaled: bar_line.scroll_scaled,
+            visual_speed_scaled: bar_line.visual_speed_scaled,
         })
         .collect()
+}
+
+fn gogo_active_at(compiled: &TaikoCompiled, now: Tick) -> bool {
+    let applied = compiled
+        .gogo_transitions
+        .partition_point(|(tick, _)| *tick <= now);
+    applied
+        .checked_sub(1)
+        .map(|index| compiled.gogo_transitions[index].1)
+        .unwrap_or(false)
+}
+
+fn visual_speed_scaled_at_tick(
+    scroll_scaled: i32,
+    tick: Tick,
+    reference_micros_per_quarter: u32,
+    tempo_map: &[rhythm_chart::TempoChange],
+) -> Result<i32, CompileError> {
+    let micros_per_quarter =
+        tempo_micros_per_quarter_at_tick(tempo_map, tick).ok_or_else(|| {
+            CompileError::Unsupported(format!(
+                "taiko visual projection has no valid tempo at tick {tick}"
+            ))
+        })?;
+
+    let numerator = i128::from(scroll_scaled) * i128::from(reference_micros_per_quarter);
+    let denominator = i128::from(micros_per_quarter);
+    let rounded = if numerator >= 0 {
+        (numerator + denominator / 2) / denominator
+    } else {
+        (numerator - denominator / 2) / denominator
+    };
+
+    i32::try_from(rounded).map_err(|_| {
+        CompileError::Unsupported(format!(
+            "taiko visual speed is outside the fixed-point range at tick {tick}"
+        ))
+    })
+}
+
+fn tempo_micros_per_quarter_at_tick(
+    tempo_map: &[rhythm_chart::TempoChange],
+    tick: Tick,
+) -> Option<u32> {
+    let tempo_idx = tempo_map.partition_point(|tempo| tempo.tick <= tick);
+    let tempo = if tempo_idx == 0 {
+        tempo_map.first()
+    } else {
+        tempo_map.get(tempo_idx - 1)
+    }?;
+    (tempo.micros_per_quarter > 0).then_some(tempo.micros_per_quarter)
 }
 
 fn gauge_profile_for_chart(
@@ -896,12 +1057,11 @@ fn gauge_profile_for_chart(
         )));
     }
 
-    let total_tap_notes = notes
-        .iter()
-        .filter(|note| matches!(note.kind, TaikoNoteKind::Tap))
-        .count()
-        .max(1) as u32;
-    let great_score_gain = tap_great_score_gain(notes);
+    let normalization = normalization_profile(notes, &chart.branch_segments)?;
+    let total_tap_notes = u32::try_from(normalization.tap_count.max(1)).map_err(|_| {
+        CompileError::Unsupported("taiko normalization tap count exceeds u32".to_owned())
+    })?;
+    let great_score_gain = tap_great_score_gain(normalization);
     let ok_score_gain = great_score_gain / 2;
 
     Ok(GaugeProfile {
@@ -915,52 +1075,122 @@ fn gauge_profile_for_chart(
     })
 }
 
-fn tap_great_score_gain(notes: &[TaikoNoteState]) -> u32 {
-    let tap_count = notes
-        .iter()
-        .filter(|note| matches!(note.kind, TaikoNoteKind::Tap))
-        .count() as u64;
-    if tap_count == 0 {
+/// Returns the chart-wide constant score for every Great tap.
+///
+/// Roll and balloon reserves are removed from the one-million-point pool,
+/// then the remaining per-tap share is rounded upward to the next ten points.
+/// That rounded value is used for every tap; a rounding remainder is never
+/// assigned to particular notes, keeping note identity, size, and combo out of
+/// scoring.
+fn tap_great_score_gain(profile: NormalizationProfile) -> u32 {
+    if profile.tap_count == 0 {
         return 0;
     }
 
-    let mut balloon_reserve = 0_u64;
-    let mut roll_reserve = 0_u64;
-    for note in notes {
-        let duration_ticks = note.end_tick.saturating_sub(note.start_tick).max(0) as u64;
-        match note.kind {
-            TaikoNoteKind::Balloon => {
-                let hits = u64::from(note.required_hits);
-                let reserve = if hits > 0 {
-                    hits.saturating_mul(u64::from(ROLL_HIT_SCORE))
-                } else {
-                    duration_ticks
-                        .saturating_mul(ROLL_HITS_PER_SECOND)
-                        .saturating_mul(u64::from(ROLL_HIT_SCORE))
-                        / 1_000_000
-                };
-                balloon_reserve = balloon_reserve.saturating_add(reserve);
-            }
-            TaikoNoteKind::Roll => {
-                let reserve = duration_ticks
-                    .saturating_mul(ROLL_HITS_PER_SECOND)
-                    .saturating_mul(u64::from(ROLL_HIT_SCORE))
-                    / 1_000_000;
-                roll_reserve = roll_reserve.saturating_add(reserve);
-            }
-            TaikoNoteKind::Tap => {}
-        }
-    }
-
-    let reserved_total = balloon_reserve.saturating_add(roll_reserve);
-    let distributable = BASE_SCORE_POOL.saturating_sub(reserved_total);
+    let distributable = BASE_SCORE_POOL.saturating_sub(profile.reserve_score);
     if distributable == 0 {
         return 0;
     }
 
-    let denominator = tap_count.saturating_mul(SCORE_ROUND_UNIT);
+    let denominator = profile.tap_count.saturating_mul(SCORE_ROUND_UNIT);
     let rounded = ceil_div_u64(distributable, denominator).saturating_mul(SCORE_ROUND_UNIT);
     rounded.min(u64::from(u32::MAX)) as u32
+}
+
+/// Builds one deterministic, playable normalization path.
+///
+/// Unbranched notes always contribute. For each branch segment, exactly one
+/// route contributes: the route with the most tap notes, then the largest
+/// roll/balloon reserve, then the lowest route id. Since route choice is
+/// independent per segment, these selected routes can coexist in one play.
+fn normalization_profile(
+    notes: &[TaikoNoteState],
+    segments: &[rhythm_chart::BranchSegment],
+) -> Result<NormalizationProfile, CompileError> {
+    let mut unbranched = NormalizationProfile::default();
+    let mut routes = segments
+        .iter()
+        .map(|segment| vec![NormalizationProfile::default(); usize::from(segment.route_count)])
+        .collect::<Vec<_>>();
+
+    for note in notes {
+        let contribution = normalization_contribution(note);
+        if let Some(segment_idx) = note.branch_segment_idx.map(usize::from) {
+            let route = routes
+                .get_mut(segment_idx)
+                .and_then(|segment_routes| {
+                    segment_routes.get_mut(usize::from(note.branch_route_id))
+                })
+                .ok_or_else(|| {
+                    CompileError::Unsupported(format!(
+                        "taiko note {} references invalid branch route {}",
+                        note.id, note.branch_route_id
+                    ))
+                })?;
+            *route = combine_normalization_profiles(*route, contribution);
+        } else {
+            unbranched = combine_normalization_profiles(unbranched, contribution);
+        }
+    }
+
+    let mut selected = unbranched;
+    for segment_routes in routes {
+        let Some(mut best) = segment_routes.first().copied() else {
+            return Err(CompileError::Unsupported(
+                "taiko branch segment has no playable route".to_owned(),
+            ));
+        };
+        for candidate in segment_routes.into_iter().skip(1) {
+            if (candidate.tap_count, candidate.reserve_score) > (best.tap_count, best.reserve_score)
+            {
+                best = candidate;
+            }
+        }
+        selected = combine_normalization_profiles(selected, best);
+    }
+    Ok(selected)
+}
+
+fn normalization_contribution(note: &TaikoNoteState) -> NormalizationProfile {
+    let duration_ticks = note.end_tick.saturating_sub(note.start_tick).max(0) as u64;
+    match note.kind {
+        TaikoNoteKind::Tap => NormalizationProfile {
+            tap_count: 1,
+            reserve_score: 0,
+        },
+        TaikoNoteKind::Roll => NormalizationProfile {
+            tap_count: 0,
+            reserve_score: duration_ticks
+                .saturating_mul(ROLL_HITS_PER_SECOND)
+                .saturating_mul(u64::from(ROLL_HIT_SCORE))
+                / 1_000_000,
+        },
+        TaikoNoteKind::Balloon => {
+            let hits = u64::from(note.required_hits);
+            let reserve_score = if hits > 0 {
+                hits.saturating_mul(u64::from(ROLL_HIT_SCORE))
+            } else {
+                duration_ticks
+                    .saturating_mul(ROLL_HITS_PER_SECOND)
+                    .saturating_mul(u64::from(ROLL_HIT_SCORE))
+                    / 1_000_000
+            };
+            NormalizationProfile {
+                tap_count: 0,
+                reserve_score,
+            }
+        }
+    }
+}
+
+fn combine_normalization_profiles(
+    lhs: NormalizationProfile,
+    rhs: NormalizationProfile,
+) -> NormalizationProfile {
+    NormalizationProfile {
+        tap_count: lhs.tap_count.saturating_add(rhs.tap_count),
+        reserve_score: lhs.reserve_score.saturating_add(rhs.reserve_score),
+    }
 }
 
 fn ceil_div_u64(numer: u64, denom: u64) -> u64 {
@@ -1015,6 +1245,19 @@ mod tests {
         Object, TempoChange, TimeSignatureChange, SCROLL_SCALE,
     };
     use rhythm_core::{BasicEngine, ControlledEngine};
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn ruleset_fingerprint_pins_shared_exact_boundary_ordering() {
+        assert!(TAIKO_RULESET_DESCRIPTOR.contains("runtime=shared-exact-boundary-v1"));
+        assert!(TAIKO_RULESET_DESCRIPTOR.contains(
+            "runtime-order=expire+apply-judges->branch-decision+control->input+apply-judges"
+        ));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(TAIKO_RULESET_DESCRIPTOR.as_bytes())),
+            TAIKO_RULESET_SHA256
+        );
+    }
 
     fn taiko_metadata(difficulty_name: &str, difficulty_level: u8) -> ChartMetadata {
         ChartMetadata {
@@ -1078,6 +1321,22 @@ mod tests {
                 },
             ],
             events: Vec::new(),
+        }
+    }
+
+    fn tap(id: u32, tick: Tick, lane: u16, flags: u32) -> Object {
+        Object {
+            id,
+            kind: ObjectKind::Tap,
+            start_tick: tick,
+            end_tick: tick,
+            lane_or_region: LaneOrRegion::Lane(lane),
+            flags,
+            required_hits: 0,
+            slide_to: None,
+            scroll_scaled: SCROLL_SCALE,
+            branch_segment_id: None,
+            branch_route_id: 0,
         }
     }
 
@@ -1157,11 +1416,11 @@ mod tests {
         let replay = [
             TimedInput {
                 tick: 1_000_000,
-                action: TaikoAction::Don,
+                action: TaikoAction::LEFT_DON,
             },
             TimedInput {
                 tick: 2_000_000,
-                action: TaikoAction::Kat,
+                action: TaikoAction::LEFT_KAT,
             },
         ];
 
@@ -1177,7 +1436,7 @@ mod tests {
         let result = engine.finalize();
         assert_eq!(result.great, 2);
         assert_eq!(result.miss, 0);
-        assert_ne!(engine.replay_hash(), 0);
+        assert_eq!(engine.replay_hash(), 15_682_095_833_350_770_139);
     }
 
     #[test]
@@ -1190,7 +1449,7 @@ mod tests {
                 1_050_000,
                 &[TimedInput {
                     tick: 1_000_000,
-                    action: TaikoAction::Don,
+                    action: TaikoAction::LEFT_DON,
                 }],
             )
             .expect("step");
@@ -1199,6 +1458,152 @@ mod tests {
             output.judges.first().copied(),
             Some(TaikoJudge::Great { delta_tick: 0 })
         );
+    }
+
+    #[test]
+    fn all_four_physical_inputs_preserve_side_and_judge_by_zone() {
+        let mut chart = chart();
+        chart.objects = vec![
+            tap(1, 1_000_000, LANE_DON, 0),
+            tap(2, 2_000_000, LANE_DON, 0),
+            tap(3, 3_000_000, LANE_KAT, 0),
+            tap(4, 4_000_000, LANE_KAT, 0),
+        ];
+        let replay = [
+            TimedInput {
+                tick: 1_000_000,
+                action: TaikoAction::LEFT_DON,
+            },
+            TimedInput {
+                tick: 2_000_000,
+                action: TaikoAction::RIGHT_DON,
+            },
+            TimedInput {
+                tick: 3_000_000,
+                action: TaikoAction::LEFT_KAT,
+            },
+            TimedInput {
+                tick: 4_000_000,
+                action: TaikoAction::RIGHT_KAT,
+            },
+        ];
+
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        for input in replay {
+            let output = engine.step_to(input.tick, &[input]).expect("step");
+            assert!(matches!(
+                output.judges.as_slice(),
+                [TaikoJudge::Great { delta_tick: 0 }]
+            ));
+        }
+
+        let result = engine.finalize();
+        assert_eq!(result.great, 4);
+        assert_eq!(result.miss, 0);
+        assert_eq!(result.max_combo, 4);
+    }
+
+    #[test]
+    fn side_changes_replay_identity_without_changing_judgement_or_score() {
+        let mut chart = chart();
+        chart.objects = vec![tap(1, 1_000_000, LANE_DON, 0)];
+        let mut left = BasicEngine::<TaikoMode>::new_basic(&chart).expect("left engine");
+        let mut right = BasicEngine::<TaikoMode>::new_basic(&chart).expect("right engine");
+
+        let left_output = left
+            .step_to(
+                1_000_000,
+                &[TimedInput {
+                    tick: 1_000_000,
+                    action: TaikoAction::LEFT_DON,
+                }],
+            )
+            .expect("left step");
+        let right_output = right
+            .step_to(
+                1_000_000,
+                &[TimedInput {
+                    tick: 1_000_000,
+                    action: TaikoAction::RIGHT_DON,
+                }],
+            )
+            .expect("right step");
+
+        assert_eq!(left_output.judges, right_output.judges);
+        assert_eq!(left.finalize(), right.finalize());
+        assert_ne!(left.replay_hash(), right.replay_hash());
+    }
+
+    #[test]
+    fn big_and_small_taps_have_equal_score_and_never_require_a_side_chord() {
+        let mut chart = chart();
+        chart.objects = vec![
+            tap(1, 1_000_000, LANE_DON, 0),
+            tap(2, 2_000_000, LANE_DON, FLAG_BIG),
+        ];
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+
+        let first = engine
+            .step_to(
+                1_000_000,
+                &[TimedInput {
+                    tick: 1_000_000,
+                    action: TaikoAction::LEFT_DON,
+                }],
+            )
+            .expect("small tap");
+        let small_gain = first.frame_view.score;
+        assert!(small_gain > 0);
+
+        let second = engine
+            .step_to(
+                2_000_000,
+                &[
+                    TimedInput {
+                        tick: 2_000_000,
+                        action: TaikoAction::RIGHT_DON,
+                    },
+                    TimedInput {
+                        tick: 2_000_000,
+                        action: TaikoAction::LEFT_DON,
+                    },
+                ],
+            )
+            .expect("big tap");
+
+        assert!(matches!(
+            second.judges.as_slice(),
+            [TaikoJudge::Great { delta_tick: 0 }, TaikoJudge::Ignored]
+        ));
+        assert_eq!(second.frame_view.score - small_gain, small_gain);
+        assert_eq!(second.frame_view.combo, 2);
+    }
+
+    #[test]
+    fn successive_greats_have_no_combo_score_bonus() {
+        let mut chart = chart();
+        chart.objects = vec![
+            tap(1, 1_000_000, LANE_DON, 0),
+            tap(2, 2_000_000, LANE_DON, 0),
+            tap(3, 3_000_000, LANE_DON, 0),
+        ];
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        let mut scores = Vec::new();
+        for tick in [1_000_000, 2_000_000, 3_000_000] {
+            let output = engine
+                .step_to(
+                    tick,
+                    &[TimedInput {
+                        tick,
+                        action: TaikoAction::LEFT_DON,
+                    }],
+                )
+                .expect("tap");
+            scores.push(output.frame_view.score);
+        }
+
+        assert_eq!(scores[1] - scores[0], scores[0]);
+        assert_eq!(scores[2] - scores[1], scores[0]);
     }
 
     #[test]
@@ -1223,7 +1628,7 @@ mod tests {
             if tick == 1_000_000 || tick == 1_500_000 {
                 inputs.push(TimedInput {
                     tick,
-                    action: TaikoAction::Don,
+                    action: TaikoAction::LEFT_DON,
                 });
             }
 
@@ -1241,7 +1646,7 @@ mod tests {
     fn branch_control_on_start_tick_is_effective() {
         let mut chart = branch_chart();
         chart.objects = vec![Object {
-            id: 10,
+            id: 1,
             kind: ObjectKind::Tap,
             start_tick: 1_000_000,
             end_tick: 1_000_000,
@@ -1265,7 +1670,7 @@ mod tests {
         }];
         let inputs = vec![TimedInput {
             tick: 1_000_000,
-            action: TaikoAction::Don,
+            action: TaikoAction::LEFT_DON,
         }];
 
         let _ = engine
@@ -1316,12 +1721,173 @@ mod tests {
             .frame_view
             .bar_lines
             .iter()
-            .map(|bar_line| (bar_line.tick, bar_line.scroll_scaled))
+            .map(|bar_line| (bar_line.tick, bar_line.visual_speed_scaled))
             .collect::<Vec<_>>();
 
         assert_eq!(
             bar_lines,
             vec![(500_000, SCROLL_SCALE), (1_000_000, SCROLL_SCALE)]
+        );
+    }
+
+    #[test]
+    fn gogo_frame_state_applies_events_at_the_exact_tick_in_canonical_order() {
+        let mut chart = chart();
+        chart.events = vec![
+            ChartEvent {
+                tick: 500_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            // At equal ticks canonical vector order is authoritative: the
+            // second transition wins.
+            ChartEvent {
+                tick: 800_000,
+                kind: ChartEventKind::GogoEnd,
+            },
+            ChartEvent {
+                tick: 800_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            ChartEvent {
+                tick: 900_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            ChartEvent {
+                tick: 900_000,
+                kind: ChartEventKind::GogoEnd,
+            },
+        ];
+
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        for (tick, expected) in [
+            (499_999, false),
+            (500_000, true),
+            (799_999, true),
+            (800_000, true),
+            (899_999, true),
+            (900_000, false),
+        ] {
+            let output = engine.step_to(tick, &[]).expect("step");
+            assert_eq!(
+                output.frame_view.gogo_active, expected,
+                "unexpected Go-Go state at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn gogo_events_do_not_change_judgement_or_score() {
+        let plain_chart = chart();
+        let mut gogo_chart = plain_chart.clone();
+        gogo_chart.events = vec![
+            ChartEvent {
+                tick: 900_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            ChartEvent {
+                tick: 2_100_000,
+                kind: ChartEventKind::GogoEnd,
+            },
+        ];
+        let replay = [
+            TimedInput {
+                tick: 1_000_000,
+                action: TaikoAction::RIGHT_DON,
+            },
+            TimedInput {
+                tick: 2_000_000,
+                action: TaikoAction::LEFT_KAT,
+            },
+        ];
+
+        let mut plain = BasicEngine::<TaikoMode>::new_basic(&plain_chart).expect("plain engine");
+        let mut gogo = BasicEngine::<TaikoMode>::new_basic(&gogo_chart).expect("gogo engine");
+        for input in replay {
+            let plain_output = plain.step_to(input.tick, &[input]).expect("plain step");
+            let gogo_output = gogo.step_to(input.tick, &[input]).expect("gogo step");
+            assert_eq!(plain_output.judges, gogo_output.judges);
+            assert_eq!(plain_output.frame_view.score, gogo_output.frame_view.score);
+            assert_eq!(plain_output.frame_view.combo, gogo_output.frame_view.combo);
+        }
+
+        assert_eq!(plain.finalize(), gogo.finalize());
+        assert_eq!(plain.replay_hash(), gogo.replay_hash());
+    }
+
+    #[test]
+    fn visual_speed_combines_tempo_and_scroll_multiplier() {
+        let mut chart = chart();
+        chart.tempo_map = vec![
+            TempoChange {
+                tick: 0,
+                micros_per_quarter: 300_000,
+            },
+            TempoChange {
+                tick: 2_000_000,
+                micros_per_quarter: 150_000,
+            },
+            TempoChange {
+                tick: 3_000_000,
+                micros_per_quarter: 1_200_000,
+            },
+        ];
+        chart.objects[0].start_tick = 1_000_000;
+        chart.objects[0].end_tick = 1_000_000;
+        chart.objects[0].scroll_scaled = 1_260_000;
+        chart.objects[1].start_tick = 2_000_000;
+        chart.objects[1].end_tick = 2_000_000;
+        chart.objects[1].scroll_scaled = 630_000;
+        chart.objects.push(Object {
+            id: 3,
+            kind: ObjectKind::Tap,
+            start_tick: 3_000_000,
+            end_tick: 3_000_000,
+            lane_or_region: LaneOrRegion::Lane(LANE_DON),
+            flags: 0,
+            required_hits: 0,
+            slide_to: None,
+            scroll_scaled: 5_040_000,
+            branch_segment_id: None,
+            branch_route_id: 0,
+        });
+        chart.events = vec![
+            ChartEvent {
+                tick: 1_000_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: 1_260_000,
+                },
+            },
+            ChartEvent {
+                tick: 2_000_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: 630_000,
+                },
+            },
+            ChartEvent {
+                tick: 3_000_000,
+                kind: ChartEventKind::BarLine {
+                    scroll_scaled: 5_040_000,
+                },
+            },
+        ];
+
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        let output = engine.step_to(500_000, &[]).expect("step");
+
+        assert_eq!(output.frame_view.notes.len(), 3);
+        assert!(output
+            .frame_view
+            .notes
+            .iter()
+            .all(|note| note.visual_speed_scaled == 1_260_000));
+        assert_eq!(
+            output
+                .frame_view
+                .bar_lines
+                .iter()
+                .map(|bar_line| bar_line.visual_speed_scaled)
+                .collect::<Vec<_>>(),
+            vec![1_260_000, 1_260_000, 1_260_000]
         );
     }
 
@@ -1380,9 +1946,9 @@ mod tests {
         for i in 0..object_count {
             let tick = 100_000 + i as i64 * 50_000;
             let action = if i % 2 == 0 {
-                TaikoAction::Don
+                TaikoAction::LEFT_DON
             } else {
-                TaikoAction::Kat
+                TaikoAction::LEFT_KAT
             };
             engine
                 .step_to(tick, &[TimedInput { tick, action }])
@@ -1459,7 +2025,7 @@ mod tests {
             }];
             let inputs = [TimedInput {
                 tick,
-                action: TaikoAction::Don,
+                action: TaikoAction::LEFT_DON,
             }];
 
             let _ = engine
@@ -1484,17 +2050,17 @@ mod tests {
     }
 
     #[test]
-    fn great_ok_boundaries_match_legacy_strict_less_than() {
+    fn great_ok_boundaries_use_strict_less_than() {
         let chart = chart();
         let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
 
         let great_edge = TimedInput {
             tick: 1_000_000 + GREAT_WINDOW_TICKS,
-            action: TaikoAction::Don,
+            action: TaikoAction::LEFT_DON,
         };
         let ok_edge = TimedInput {
             tick: 2_000_000 + OK_WINDOW_TICKS,
-            action: TaikoAction::Kat,
+            action: TaikoAction::LEFT_KAT,
         };
 
         engine
@@ -1613,7 +2179,7 @@ mod tests {
         let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
         let input = TimedInput {
             tick: 1_000_000,
-            action: TaikoAction::Don,
+            action: TaikoAction::LEFT_DON,
         };
         engine.step_to(input.tick, &[input]).expect("step");
 
@@ -1621,6 +2187,250 @@ mod tests {
         assert_eq!(result.great, 1);
         assert_eq!(result.ok, 0);
         assert_eq!(result.score, 997_700);
+    }
+
+    #[test]
+    fn branch_normalization_uses_one_playable_route_per_segment() {
+        let mut chart = chart();
+        chart.branch_segments = vec![
+            BranchSegment {
+                id: 7,
+                default_route_id: 0,
+                route_count: 3,
+                decision_hint: None,
+            },
+            BranchSegment {
+                id: 8,
+                default_route_id: 0,
+                route_count: 3,
+                decision_hint: None,
+            },
+        ];
+        chart.lanes.push(Lane {
+            id: LANE_BOTH,
+            name: "both".to_owned(),
+            role: LaneRole::Generic,
+        });
+
+        let branch_tap = |id, tick, segment_id, route_id| {
+            let mut object = tap(id, tick, LANE_DON, 0);
+            object.branch_segment_id = Some(segment_id);
+            object.branch_route_id = route_id;
+            object
+        };
+        let branch_balloon = |id, hits, route_id| Object {
+            id,
+            kind: ObjectKind::Roll,
+            start_tick: 2_100_000,
+            end_tick: 2_600_000,
+            lane_or_region: LaneOrRegion::Lane(LANE_BOTH),
+            flags: FLAG_BALLOON,
+            required_hits: hits,
+            slide_to: None,
+            scroll_scaled: SCROLL_SCALE,
+            branch_segment_id: Some(8),
+            branch_route_id: route_id,
+        };
+        chart.objects = vec![
+            tap(1, 100_000, LANE_DON, 0),
+            branch_tap(2, 1_000_000, 7, 0),
+            branch_tap(3, 1_000_000, 7, 1),
+            branch_tap(5, 1_000_000, 7, 2),
+            branch_tap(4, 1_100_000, 7, 1),
+            branch_tap(6, 1_100_000, 7, 2),
+            branch_tap(7, 1_200_000, 7, 2),
+            branch_tap(8, 2_000_000, 8, 0),
+            branch_tap(10, 2_000_000, 8, 1),
+            branch_tap(12, 2_000_000, 8, 2),
+            branch_balloon(9, 2, 0),
+            branch_balloon(11, 5, 1),
+            branch_balloon(13, 3, 2),
+        ];
+
+        let compiled = TaikoMode::compile(&chart).expect("compile branch normalization chart");
+
+        // One actual path contains the unbranched tap, route 2's three taps in
+        // segment 7, and route 1's tap + 500-point balloon reserve in segment
+        // 8: five taps and 500 reserved points. Summing N/E/M would instead
+        // dilute both score and gauge across ten impossible simultaneous taps.
+        assert_eq!(compiled.gauge_profile.total_tap_notes, 5);
+        assert_eq!(compiled.gauge_profile.great_score_gain, 199_900);
+        let expected_gauge_gain = (1.0 / 5.0) / GAUGE_FULL_THRESHOLD[2][5];
+        let score = TaikoMode::init_score(&compiled);
+        assert!((score.great_gauge_gain - expected_gauge_gain).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tap_pool_rounds_each_equal_share_up_to_ten_without_remainder_distribution() {
+        let mut chart = chart();
+        chart.objects = vec![
+            tap(1, 1_000_000, LANE_DON, 0),
+            tap(2, 2_000_000, LANE_DON, FLAG_BIG),
+            tap(3, 3_000_000, LANE_KAT, 0),
+        ];
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        for input in [
+            TimedInput {
+                tick: 1_000_000,
+                action: TaikoAction::LEFT_DON,
+            },
+            TimedInput {
+                tick: 2_000_000,
+                action: TaikoAction::RIGHT_DON,
+            },
+            TimedInput {
+                tick: 3_000_000,
+                action: TaikoAction::LEFT_KAT,
+            },
+        ] {
+            engine.step_to(input.tick, &[input]).expect("step");
+        }
+
+        // ceil((1_000_000 / 3) / 10) * 10 = 333_340. The 20-point
+        // chart-total overshoot is the deterministic rounding consequence,
+        // not a note-specific remainder or combo bonus.
+        assert_eq!(engine.finalize().score, 1_000_020);
+    }
+
+    #[test]
+    fn roll_and_balloon_hits_each_score_one_hundred_points() {
+        let mut chart = chart();
+        chart.lanes.push(Lane {
+            id: LANE_BOTH,
+            name: "both".to_owned(),
+            role: LaneRole::Generic,
+        });
+        chart.objects = vec![
+            Object {
+                id: 1,
+                kind: ObjectKind::Roll,
+                start_tick: 1_000_000,
+                end_tick: 2_000_000,
+                lane_or_region: LaneOrRegion::Lane(LANE_BOTH),
+                flags: 0,
+                required_hits: 0,
+                slide_to: None,
+                scroll_scaled: SCROLL_SCALE,
+                branch_segment_id: None,
+                branch_route_id: 0,
+            },
+            Object {
+                id: 2,
+                kind: ObjectKind::Roll,
+                start_tick: 3_000_000,
+                end_tick: 4_000_000,
+                lane_or_region: LaneOrRegion::Lane(LANE_BOTH),
+                flags: FLAG_BALLOON | FLAG_BIG,
+                required_hits: 2,
+                slide_to: None,
+                scroll_scaled: SCROLL_SCALE,
+                branch_segment_id: None,
+                branch_route_id: 0,
+            },
+        ];
+        chart.events = vec![
+            ChartEvent {
+                tick: 2_900_000,
+                kind: ChartEventKind::GogoStart,
+            },
+            ChartEvent {
+                tick: 4_100_000,
+                kind: ChartEventKind::GogoEnd,
+            },
+        ];
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        for input in [
+            TimedInput {
+                tick: 1_100_000,
+                action: TaikoAction::LEFT_DON,
+            },
+            TimedInput {
+                tick: 1_200_000,
+                action: TaikoAction::RIGHT_KAT,
+            },
+            TimedInput {
+                tick: 3_100_000,
+                action: TaikoAction::LEFT_KAT,
+            },
+            TimedInput {
+                tick: 3_200_000,
+                action: TaikoAction::RIGHT_DON,
+            },
+        ] {
+            let before = engine.score().score;
+            let output = engine.step_to(input.tick, &[input]).expect("step");
+            assert_eq!(output.judges, vec![TaikoJudge::RollHit]);
+            assert_eq!(output.frame_view.score - before, ROLL_HIT_SCORE);
+        }
+
+        let result = engine.finalize();
+        assert_eq!(result.score, 400);
+        assert_eq!(result.roll_hits, 4);
+    }
+
+    #[test]
+    fn incomplete_balloon_expires_without_miss_combo_or_gauge_penalty() {
+        let mut chart = chart();
+        chart.lanes.push(Lane {
+            id: LANE_BOTH,
+            name: "both".to_owned(),
+            role: LaneRole::Generic,
+        });
+        chart.objects = vec![
+            tap(1, 1_000_000, LANE_DON, 0),
+            Object {
+                id: 2,
+                kind: ObjectKind::Roll,
+                start_tick: 2_000_000,
+                end_tick: 3_000_000,
+                lane_or_region: LaneOrRegion::Lane(LANE_BOTH),
+                flags: FLAG_BALLOON | FLAG_BIG,
+                required_hits: 3,
+                slide_to: None,
+                scroll_scaled: SCROLL_SCALE,
+                branch_segment_id: None,
+                branch_route_id: 0,
+            },
+        ];
+        chart.events = vec![ChartEvent {
+            tick: 1_500_000,
+            kind: ChartEventKind::GogoStart,
+        }];
+
+        let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
+        engine
+            .step_to(
+                1_000_000,
+                &[TimedInput {
+                    tick: 1_000_000,
+                    action: TaikoAction::LEFT_DON,
+                }],
+            )
+            .expect("tap");
+        let after_tap = engine.score().clone();
+        let balloon = engine
+            .step_to(
+                2_100_000,
+                &[TimedInput {
+                    tick: 2_100_000,
+                    action: TaikoAction::RIGHT_KAT,
+                }],
+            )
+            .expect("balloon hit");
+        assert_eq!(balloon.judges, vec![TaikoJudge::RollHit]);
+        assert_eq!(engine.score().score, after_tap.score + ROLL_HIT_SCORE);
+        assert_eq!(engine.score().combo, after_tap.combo);
+        assert_eq!(engine.score().gauge, after_tap.gauge);
+
+        let expired = engine.step_to(3_000_001, &[]).expect("expire balloon");
+        assert!(
+            expired.judges.is_empty(),
+            "an incomplete balloon is not a tap miss"
+        );
+        assert_eq!(engine.score().combo, after_tap.combo);
+        assert_eq!(engine.score().gauge, after_tap.gauge);
+        assert_eq!(engine.score().miss, 0);
+        assert_eq!(engine.score().roll_hits, 1);
     }
 
     #[test]
@@ -1661,7 +2471,7 @@ mod tests {
         let mut engine = BasicEngine::<TaikoMode>::new_basic(&chart).expect("engine");
         let input = TimedInput {
             tick: 1_000_000 + GREAT_WINDOW_TICKS,
-            action: TaikoAction::Don,
+            action: TaikoAction::LEFT_DON,
         };
         engine.step_to(input.tick, &[input]).expect("step");
 

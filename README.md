@@ -11,6 +11,8 @@ Deterministic, headless rhythm game engine in Rust.
 - `rhythm-mode-radial`: radial/touch/slide rules/scoring plugin.
 - `rhythm-importer-tja`: `.tja` importer adapter (`TjaImporter`) backed by crates.io `tja`.
 - `taiko-game`: playable TUI taiko game using `rhythm-core` + `rhythm-mode-taiko`.
+- `taiko-audio`: shared fail-closed audio validation and decoded-frame model used
+  by the game and resource server.
 - `taiko-multiplayer-protocol`: shared websocket payload schema for taiko multiplayer/spectate.
 - `taiko-resource-protocol`: shared HTTP payload schema for remote resource delivery.
 - `taiko-resource-server`: HTTP+WS server that exposes song list/chart/audio resources and multiplayer rooms for `taiko-game`.
@@ -18,14 +20,14 @@ Deterministic, headless rhythm game engine in Rust.
 ## Quick start
 
 ```bash
-cargo run -p taiko-game  --release -- --songdir ./taiko-game/songs
+cargo run -p taiko-game --release -- --songdir ./taiko-game/songs
 
-# or run with remote resources
+# The game opens a mode menu:
+# Single Player / Local Two Player / Online Multiplayer
+
+# Optional: run a dedicated server for remote resources and online rooms.
 cargo run -p taiko-game --release -- server --songdir ./taiko-game/songs
 cargo run -p taiko-game --release -- --resource-endpoint http://127.0.0.1:4150/
-cargo run -p taiko-game --release -- online create --server http://127.0.0.1:4150 --name host
-cargo run -p taiko-game --release -- online join --server http://127.0.0.1:4150 --room <CODE> --name p2
-cargo run -p taiko-game --release -- online spectate --server http://127.0.0.1:4150 --room <CODE> --name viewer
 
 # inspect/clean remote cache
 cargo run -p taiko-game -- cache list
@@ -39,6 +41,13 @@ cargo run -p taiko-game -- cache clear --all
 - [Chart Importers](docs/developer/chart-importers.md)
 - [Custom Chart Spec](docs/developer/custom-chart-spec.md)
 - [Remote Resource Server](docs/remote-resource-server.md)
+- [Multiplayer Guide](docs/multiplayer.md)
+- [Multiplayer Protocol v2](docs/developer/multiplayer-protocol-v2.md)
+- [Multiplayer Data and Sync Design Review](docs/developer/multiplayer-data-sync-review.md)
+- [Multiplayer Reliability Testing](docs/developer/multiplayer-testing.md)
+- [Game Mode Architecture](docs/developer/game-mode-architecture.md)
+- [Player UI Localization](docs/developer/localization.md)
+- [TUI Usability Audit](docs/developer/usability-audit.md)
 
 ## Quality gates
 

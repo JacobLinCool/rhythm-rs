@@ -1,5 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
-use rhythm_mode_taiko::{TaikoAction, TaikoJudge};
+use rhythm_mode_taiko::{TaikoAction, TaikoJudge, TaikoZone};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -17,7 +17,6 @@ pub enum PerfMetricKind {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
-    pub mode: ColorMode,
     pub text_primary: Style,
     pub text_secondary: Style,
     pub border: Style,
@@ -29,12 +28,12 @@ pub struct Theme {
     pub warning: Style,
     pub error: Style,
     pub success: Style,
-    pub route_current: Style,
     pub judge_great: Style,
     pub judge_ok: Style,
     pub judge_miss: Style,
     pub judge_roll: Style,
     pub lane_track: Style,
+    pub lane_track_gogo: Style,
     pub lane_bar_line: Style,
     pub lane_note_don: Style,
     pub lane_note_kat: Style,
@@ -60,7 +59,6 @@ impl Theme {
     pub fn taiko_vivid(mode: ColorMode) -> Self {
         match mode {
             ColorMode::Enabled => Self {
-                mode,
                 text_primary: Style::default().fg(Color::White),
                 text_secondary: Style::default().fg(Color::DarkGray),
                 border: Style::default().fg(Color::Blue),
@@ -82,9 +80,6 @@ impl Theme {
                 success: Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
-                route_current: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
                 judge_great: Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -98,6 +93,7 @@ impl Theme {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 lane_track: Style::default().bg(Color::DarkGray),
+                lane_track_gogo: Style::default().bg(Color::Rgb(76, 38, 0)),
                 lane_bar_line: Style::default().bg(Color::DarkGray),
                 lane_note_don: Style::default()
                     .fg(Color::White)
@@ -148,7 +144,6 @@ impl Theme {
                     .add_modifier(Modifier::BOLD),
             },
             ColorMode::Disabled => Self {
-                mode,
                 text_primary: Style::default().fg(Color::Reset),
                 text_secondary: Style::default()
                     .fg(Color::Reset)
@@ -174,9 +169,6 @@ impl Theme {
                 success: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::BOLD),
-                route_current: Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::BOLD),
                 judge_great: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::BOLD),
@@ -192,6 +184,9 @@ impl Theme {
                 lane_track: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM),
+                lane_track_gogo: Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::DIM | Modifier::REVERSED),
                 lane_bar_line: Style::default()
                     .fg(Color::Reset)
                     .add_modifier(Modifier::DIM | Modifier::REVERSED),
@@ -255,14 +250,22 @@ impl Theme {
     }
 
     pub fn marker_flash_style(&self, action: TaikoAction) -> Style {
-        match action {
-            TaikoAction::Don => self.marker_flash_don,
-            TaikoAction::Kat => self.marker_flash_kat,
+        match action.zone {
+            TaikoZone::Don => self.marker_flash_don,
+            TaikoZone::Kat => self.marker_flash_kat,
         }
     }
 
     pub fn hit_zone_base_style(&self) -> Style {
         self.hit_zone_base
+    }
+
+    pub fn lane_track_style(&self, gogo_active: bool) -> Style {
+        if gogo_active {
+            self.lane_track_gogo
+        } else {
+            self.lane_track
+        }
     }
 
     pub fn gauge_style(&self, gauge: f32, pass_threshold: f32) -> Style {

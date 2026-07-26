@@ -2,12 +2,18 @@ pub mod course_menu;
 pub mod error_screen;
 pub mod game_screen;
 pub mod load_warnings_screen;
+pub mod local_course;
+pub mod local_game;
+pub mod local_result;
+pub mod mode_select;
 pub mod mp_connect;
+pub mod offline_preparation;
 pub mod online_course;
 pub mod online_lobby;
 pub mod online_match;
 pub mod online_result;
 pub mod result_screen;
+pub mod settings;
 pub mod song_menu;
 
 use std::sync::OnceLock;
@@ -16,92 +22,330 @@ use std::time::Instant;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{App, Page};
-use crate::theme::ColorMode;
+use crate::app::{App, LeaveTarget, Page};
+use crate::localization::{truncate_to_width, UiMessage, UiText};
 use crate::tui::Frame;
 
 const GAUGE_BAR_MIN_WIDTH: usize = 12;
 const GAUGE_BAR_MAX_WIDTH: usize = 60;
 const GAUGE_FIXED_COLUMNS: usize = 24;
+pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
+pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 24;
+pub(crate) const MIN_LOCAL_GAME_HEIGHT: u16 = 27;
+
+pub(crate) const fn minimum_terminal_size(page: Page) -> (u16, u16) {
+    let height = match page {
+        Page::LocalGame => MIN_LOCAL_GAME_HEIGHT,
+        _ => MIN_TERMINAL_HEIGHT,
+    };
+    (MIN_TERMINAL_WIDTH, height)
+}
+
+pub(crate) const fn terminal_is_too_small(page: Page, area: Rect) -> bool {
+    let (required_width, required_height) = minimum_terminal_size(page);
+    area.width < required_width || area.height < required_height
+}
+
+pub(crate) fn render_terminal_guard(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let (required_width, required_height) = minimum_terminal_size(app.page);
+    let message = vec![
+        Line::from(Span::styled(
+            app.text(UiText::TerminalTooSmall),
+            app.theme.error,
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            app.localizer().message(UiMessage::CurrentTerminalSize {
+                width: area.width,
+                height: area.height,
+            }),
+            app.theme.value,
+        )),
+        Line::from(Span::styled(
+            app.localizer().message(UiMessage::RequiredTerminalSize {
+                width: required_width,
+                height: required_height,
+            }),
+            app.theme.metadata,
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            app.text(UiText::ResizeTerminal),
+            app.theme.text_primary,
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(message)
+            .centered()
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(app.theme.error)
+                    .title(format!(" {} ", app.text(UiText::TaikoBrand))),
+            ),
+        area,
+    );
+}
+
+pub(crate) fn render_leave_confirmation(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    target: LeaveTarget,
+) {
+    let width = area.width.saturating_sub(4).min(66);
+    let height = 7.min(area.height.saturating_sub(2));
+    let modal = centered_rect(area, width, height);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                app.text(UiText::LeaveThisMatch),
+                app.theme.warning,
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}: ", app.text(UiText::Destination)),
+                    app.theme.label,
+                ),
+                Span::styled(app.text(target.destination_key()), app.theme.value),
+            ]),
+            Line::from(Span::styled(
+                app.text(UiText::LeaveConfirmHint),
+                app.theme.metadata,
+            )),
+        ])
+        .centered()
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(app.theme.warning)
+                .title(app.text(UiText::ConfirmLeave)),
+        ),
+        modal,
+    );
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
 
 pub fn render_topbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let chunks =
         Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).split(area);
 
-    let left = match app.page {
-        Page::SongMenu => format!(
-            "Taiko on Terminal | Song Menu | songs={}/{} | auto={} | tps={}",
-            app.visible_song_count(),
-            app.songs.len(),
-            app.auto_play,
-            app.args.tps
+    let (left, right, right_style) = match app.page {
+        Page::ModeSelect => (
+            app.text(UiText::TopModeSelect).to_owned(),
+            app.text(UiText::TopModeSelectHelp).to_owned(),
+            app.theme.metadata,
         ),
-        Page::LoadWarnings => "Taiko on Terminal | Load Warnings".to_owned(),
+        Page::Settings => (
+            app.text(UiText::TopSettings).to_owned(),
+            app.text(UiText::TopSettingsHelp).to_owned(),
+            app.theme.metadata,
+        ),
+        Page::SongMenu => (
+            format!(
+                "{} // {} // {}",
+                app.text(UiText::TaikoBrand),
+                app.active_mode
+                    .map_or(app.text(UiText::Offline), |mode| {
+                        app.text(mode.label_key())
+                    })
+                    .to_uppercase(),
+                app.text(UiText::SongSelect)
+            ),
+            app.localizer().message(UiMessage::SongCount {
+                visible: app.visible_song_count(),
+                total: app.songs.len(),
+            }),
+            app.theme.metadata,
+        ),
+        Page::LoadWarnings => (
+            app.text(UiText::TopLoadWarnings).to_owned(),
+            app.text(UiText::EscBack).to_owned(),
+            app.theme.metadata,
+        ),
         Page::CourseMenu => {
             let title = app
                 .selected_song()
-                .map_or("<none>", |song| song.title.as_str());
-            format!("Taiko on Terminal | Course Menu | {title}")
+                .map_or(app.text(UiText::None), |song| song.title.as_str());
+            (
+                format!("♪ {title} // {}", app.text(UiText::SelectCourse)),
+                if app.auto_play {
+                    app.text(UiText::AutoPlay).to_owned()
+                } else {
+                    app.text(UiText::ManualPlay).to_owned()
+                },
+                if app.auto_play {
+                    app.theme.warning
+                } else {
+                    app.theme.metadata
+                },
+            )
         }
+        Page::OfflinePreparation => (
+            app.text(UiText::TopPreparingMatch).to_owned(),
+            app.text(UiText::PreparingMatchHelp).to_owned(),
+            app.theme.warning,
+        ),
         Page::Game => {
             if let Some(game) = app.game.as_ref() {
-                let now_sec = game.last_output.now as f64 / 1_000_000.0;
-                if game.paused {
-                    format!(
-                        "Taiko on Terminal | {} | t={now_sec:.2}s | PAUSED",
-                        game.course_name
-                    )
+                let title = app
+                    .songs
+                    .get(game.song_index)
+                    .map_or(app.text(UiText::UnknownSong), |song| song.title.as_str());
+                let (status, status_style) = if game.paused {
+                    (app.text(UiText::Paused).to_owned(), app.theme.warning)
+                } else if app.auto_play {
+                    (app.text(UiText::AutoPlay).to_owned(), app.theme.warning)
                 } else {
-                    format!("Taiko on Terminal | {} | t={now_sec:.2}s", game.course_name)
-                }
+                    (app.text(UiText::GameHelp).to_owned(), app.theme.metadata)
+                };
+                (
+                    format!("♪ {title}  //  {}", game.course_name.to_uppercase()),
+                    status,
+                    status_style,
+                )
             } else {
-                "Taiko on Terminal | Game".to_owned()
+                (
+                    app.text(UiText::TopPlay).to_owned(),
+                    String::new(),
+                    app.theme.metadata,
+                )
             }
         }
-        Page::Result => "Taiko on Terminal | Result".to_owned(),
-        Page::Error => "Taiko on Terminal | Error".to_owned(),
-        Page::MultiplayerConnect => "Taiko on Terminal | Multiplayer".to_owned(),
+        Page::Result => (
+            app.text(UiText::TopResult).to_owned(),
+            app.text(UiText::ResultHelp).to_owned(),
+            app.theme.metadata,
+        ),
+        Page::LocalCourseSelect => (
+            app.text(UiText::TopLocalCourses).to_owned(),
+            "P1 W/S/F  •  P2 ↑/↓/J".to_owned(),
+            app.theme.metadata,
+        ),
+        Page::LocalGame => {
+            let paused = app.local_game.as_ref().is_some_and(|game| game.paused);
+            (
+                app.text(UiText::TopLocalVersus).to_owned(),
+                if paused {
+                    app.text(UiText::Paused).to_owned()
+                } else {
+                    format!(
+                        "P1 {}  •  P2 {}",
+                        binding_summary(app.preferences.player_one),
+                        binding_summary(app.preferences.player_two),
+                    )
+                },
+                if paused {
+                    app.theme.warning
+                } else {
+                    app.theme.metadata
+                },
+            )
+        }
+        Page::LocalResult => (
+            app.text(UiText::TopLocalResult).to_owned(),
+            app.text(UiText::LocalResultHelp).to_owned(),
+            app.theme.metadata,
+        ),
+        Page::Error => (
+            app.text(UiText::TopError).to_owned(),
+            app.error_state.as_ref().map_or_else(
+                || app.text(UiText::ErrorDefaultHelp).to_owned(),
+                |state| {
+                    let destination = app.text(state.recovery.label_key()).to_uppercase();
+                    app.localizer().message(UiMessage::ErrorTopbar {
+                        has_retry: state.retry.is_some(),
+                        destination: &destination,
+                    })
+                },
+            ),
+            app.theme.error,
+        ),
+        Page::MultiplayerConnect => (
+            app.text(UiText::TopOnline).to_owned(),
+            app.text(UiText::OnlineModes).to_owned(),
+            app.theme.metadata,
+        ),
         Page::OnlineLobby => {
             let room = app
                 .online
                 .as_ref()
-                .and_then(|o| o.room_code.as_deref())
+                .and_then(|online| online.room_code())
+                .map(taiko_multiplayer_protocol::RoomCode::as_str)
                 .unwrap_or("...");
-            format!("Taiko on Terminal | Online Lobby | Room: {room}")
-        }
-        Page::OnlineCourseSelect => "Taiko on Terminal | Online | Select Course".to_owned(),
-        Page::OnlineMatch => "Taiko on Terminal | Online | Playing".to_owned(),
-        Page::OnlineResult => "Taiko on Terminal | Online | Result".to_owned(),
-    };
-
-    let right = {
-        let snapshot = app.perf_meter.snapshot();
-        let color_mode = match app.theme.mode {
-            ColorMode::Enabled => "color:on",
-            ColorMode::Disabled => "color:off",
-        };
-        if snapshot.tick.avg_ms <= f64::EPSILON {
-            format!("branch=auto auto-play={} {}", app.auto_play, color_mode)
-        } else {
-            format!(
-                "tick {:.2}/{:.2} ms frame {:.2}/{:.2} ms {}",
-                snapshot.tick.avg_ms,
-                snapshot.tick.p95_ms,
-                snapshot.frame.avg_ms,
-                snapshot.frame.p95_ms,
-                color_mode
+            (
+                app.text(UiText::TopOnlineLobby).to_owned(),
+                app.localizer().message(UiMessage::RoomCode { room }),
+                app.theme.selection,
             )
         }
+        Page::OnlineCourseSelect => (
+            app.text(UiText::TopOnlineCourse).to_owned(),
+            app.online
+                .as_ref()
+                .map_or(app.text(UiText::Waiting), |online| {
+                    app.localizer().online_phase(online.phase())
+                })
+                .to_uppercase(),
+            app.theme.metadata,
+        ),
+        Page::OnlineMatch => (
+            app.text(UiText::TopOnlineMatch).to_owned(),
+            app.online
+                .as_ref()
+                .map_or(app.text(UiText::Waiting), |online| {
+                    app.localizer().online_phase(online.phase())
+                })
+                .to_uppercase(),
+            app.theme.selection,
+        ),
+        Page::OnlineResult => (
+            app.text(UiText::TopOnlineResult).to_owned(),
+            app.online
+                .as_ref()
+                .map_or(app.text(UiText::Result), |online| {
+                    app.localizer().online_phase(online.phase())
+                })
+                .to_uppercase(),
+            app.theme.metadata,
+        ),
     };
 
-    let left_widget = Paragraph::new(Line::from(Span::styled(left, app.theme.text_secondary)));
-    frame.render_widget(left_widget, chunks[0]);
+    let left = truncate_to_width(&left, usize::from(chunks[0].width));
+    let right = truncate_to_width(&right, usize::from(chunks[1].width));
 
-    let right_widget =
-        Paragraph::new(Line::from(Span::styled(right, app.theme.text_secondary))).right_aligned();
-    frame.render_widget(right_widget, chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(left, app.theme.title))),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(right, right_style))).right_aligned(),
+        chunks[1],
+    );
+}
+
+fn binding_summary(bindings: crate::preferences::DrumBindings) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        bindings.left_kat.to_ascii_uppercase(),
+        bindings.left_don.to_ascii_uppercase(),
+        bindings.right_don.to_ascii_uppercase(),
+        bindings.right_kat.to_ascii_uppercase(),
+    )
 }
 
 pub(crate) fn render_gauge_bar_line(
@@ -120,7 +364,10 @@ pub(crate) fn render_gauge_bar_line(
     let full_idx = bar_width.saturating_sub(1);
 
     let mut spans = Vec::with_capacity(bar_width + 10);
-    spans.push(Span::styled("Gauge [", app.theme.label));
+    spans.push(Span::styled(
+        format!("{}  [", app.text(UiText::Soul)),
+        app.theme.label,
+    ));
 
     for idx in 0..bar_width {
         let mut symbol = if idx < fill_count { "=" } else { "-" };
@@ -160,13 +407,13 @@ pub(crate) fn render_gauge_bar_line(
 
         let (status, status_style) = if gauge >= 1.0 {
             (
-                "FULL",
+                app.text(UiText::Full),
                 gauge_fill_style(app, gauge, pass_threshold, full_blink_on),
             )
         } else if gauge >= pass_threshold {
-            ("PASS", app.theme.warning)
+            (app.text(UiText::Pass), app.theme.warning)
         } else {
-            ("FAIL", app.theme.error)
+            (app.text(UiText::Fail), app.theme.error)
         };
         spans.push(Span::styled(status, status_style));
     }
@@ -207,7 +454,10 @@ fn threshold_index(bar_width: usize, threshold: f32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::gauge_bar_width;
+    use ratatui::layout::Rect;
+
+    use super::{gauge_bar_width, terminal_is_too_small};
+    use crate::app::Page;
 
     #[test]
     fn gauge_bar_width_is_clamped() {
@@ -215,5 +465,25 @@ mod tests {
         assert_eq!(gauge_bar_width(36), 12);
         assert_eq!(gauge_bar_width(54), 30);
         assert_eq!(gauge_bar_width(200), 60);
+    }
+
+    #[test]
+    fn terminal_guard_uses_page_specific_playable_minimums() {
+        assert!(!terminal_is_too_small(
+            Page::SongMenu,
+            Rect::new(0, 0, 80, 24)
+        ));
+        assert!(terminal_is_too_small(
+            Page::SongMenu,
+            Rect::new(0, 0, 79, 24)
+        ));
+        assert!(terminal_is_too_small(
+            Page::LocalGame,
+            Rect::new(0, 0, 80, 24)
+        ));
+        assert!(!terminal_is_too_small(
+            Page::LocalGame,
+            Rect::new(0, 0, 80, 27)
+        ));
     }
 }
