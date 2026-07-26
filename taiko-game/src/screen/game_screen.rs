@@ -28,7 +28,6 @@ pub struct LaneRenderOptions {
     pub scroll_speed: f32,
     pub paused: bool,
     pub paused_label: &'static str,
-    pub gogo_label: &'static str,
     pub judge_flash: Option<TaikoJudge>,
     pub input_flash: Option<TaikoAction>,
 }
@@ -255,7 +254,6 @@ fn render_lane(app: &App, frame: &mut Frame<'_>, area: Rect) {
             scroll_speed: app.effective_scroll_speed(),
             paused: game.paused,
             paused_label: app.text(UiText::PauseLane),
-            gogo_label: app.text(UiText::GoGoLane),
             judge_flash: game.judge_flash.map(|flash| flash.judge),
             input_flash: game.input_flash.map(|flash| flash.action),
         },
@@ -309,12 +307,6 @@ pub fn render_lane_view(
         paint_centered_label(
             &mut label,
             options.paused_label,
-            theme.lane_track.patch(theme.warning),
-        );
-    } else if view.gogo_active {
-        paint_centered_label(
-            &mut label,
-            options.gogo_label,
             theme.lane_track.patch(theme.warning),
         );
     }
@@ -1092,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn gogo_label_stays_on_the_first_core_track_row() {
+    fn gogo_lane_does_not_render_a_text_label() {
         let theme = Theme::taiko_vivid(ColorMode::Enabled);
         let buffer = render_empty_lane(&theme, 0, true);
         let text = buffer
@@ -1100,15 +1092,10 @@ mod tests {
             .iter()
             .map(Cell::symbol)
             .collect::<String>();
-        assert!(text.contains("GO-GO!"));
-
-        let label_cell = (1..buffer.area.width.saturating_sub(1))
+        assert!(!text.contains("GO-GO!"));
+        assert!((1..buffer.area.width.saturating_sub(1))
             .map(|x| cell(&buffer, x, 2))
-            .find(|cell| cell.symbol() == "G")
-            .expect("rendered GO-GO label");
-        assert_eq!(label_cell.style().fg, theme.warning.fg);
-        assert_eq!(label_cell.style().bg, theme.lane_track.bg);
-        assert!(label_cell.style().add_modifier.contains(Modifier::BOLD));
+            .all(|cell| cell.symbol() == " "));
     }
 
     #[test]
@@ -1160,7 +1147,6 @@ mod tests {
                         scroll_speed: 1.0,
                         paused: false,
                         paused_label: "PAUSED",
-                        gogo_label: "GO-GO!",
                         judge_flash: None,
                         input_flash: None,
                     },

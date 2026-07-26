@@ -256,7 +256,6 @@ fn render_local_player(app: &App, frame: &mut Frame<'_>, area: Rect, player: &Pl
             scroll_speed: app.effective_scroll_speed(),
             paused: false,
             paused_label: app.text(UiText::PauseLane),
-            gogo_label: app.text(UiText::GoGoLane),
             judge_flash: runtime.judge_flash.map(|flash| flash.judge),
             input_flash: runtime.input_flash.map(|flash| flash.action),
         },

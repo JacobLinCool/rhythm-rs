@@ -89,7 +89,6 @@ fn bench_smoke_real_four_lane_gameplay_renderer() {
                                 scroll_speed: 1.0,
                                 paused: false,
                                 paused_label: "PAUSED",
-                                gogo_label: "GO-GO!",
                                 judge_flash: None,
                                 input_flash: None,
                             },

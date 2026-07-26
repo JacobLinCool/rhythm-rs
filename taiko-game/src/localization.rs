@@ -1163,11 +1163,6 @@ define_ui_text! {
         zh_hant: "已暫停",
         ja: "一時停止"
     },
-    GoGoLane => {
-        en: "GO-GO!",
-        zh_hant: "燃燒！",
-        ja: "ゴーゴー！"
-    },
     GameControlsHelp => {
         en: "•  P PAUSE  •  ESC LEAVE",
         zh_hant: "•  P 暫停  •  ESC 離開",

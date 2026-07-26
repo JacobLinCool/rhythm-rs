@@ -97,7 +97,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) -> Option<DrumSurfac
                 scroll_speed: app.effective_scroll_speed(),
                 paused: game.paused,
                 paused_label: app.text(UiText::PauseLane),
-                gogo_label: app.text(UiText::GoGoLane),
                 judge_flash: player.judge_flash.map(|(judge, _)| judge),
                 input_flash: player.input_flash.map(|(action, _)| action),
             },
