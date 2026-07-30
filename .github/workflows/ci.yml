@@ -6,26 +6,49 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  checks:
-    runs-on: ubuntu-latest
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Install Linux audio build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
+      - name: Install Linux build and lint dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev shellcheck
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check shell scripts
+        run: shellcheck install.sh scripts/package-release.sh scripts/test-install.sh
+
+      - name: Test installer and release packaging
+        run: sh scripts/test-install.sh
 
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
-      - name: Bench smoke
-        run: cargo test -p rhythm-mode-taiko --release bench_smoke_large_chart -- --ignored
+      - name: Chart bench smoke
+        run: cargo test --locked -p rhythm-mode-taiko --release bench_smoke_large_chart -- --ignored
+
+      - name: Renderer bench smoke
+        run: cargo test --locked -p taiko-game --release bench::bench_smoke -- --ignored

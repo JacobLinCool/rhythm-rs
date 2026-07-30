@@ -1,6 +1,33 @@
-# rhythm-rs
+# Taiko on Terminal
 
 Deterministic, headless rhythm game engine in Rust.
+
+## Install the latest preview
+
+On macOS (Apple silicon or Intel) or x86-64 Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh | sh
+```
+
+The installer downloads the matching archive from the
+[latest preview release](https://github.com/JacobLinCool/rhythm-rs/releases/tag/latest),
+verifies it against `SHA256SUMS`, and installs `taiko` into
+`$HOME/.local/bin`. It does not edit shell startup files. To choose another
+user-writable destination:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh |
+  TAIKO_INSTALL_DIR="$HOME/bin" sh
+```
+
+The preview release also provides a Windows x86-64 archive for manual
+installation. Because `curl | sh` executes remote code, users who want to
+inspect the installer first can download
+[`install.sh`](https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh),
+review it, and then run it locally.
 
 ## Workspace crates
 
@@ -94,13 +121,14 @@ trust, and stop it when play is finished.
 - [Controller Input Architecture](docs/developer/controller-input-architecture.md)
 - [Player UI Localization](docs/developer/localization.md)
 - [TUI Usability Audit](docs/developer/usability-audit.md)
+- [Preview Releases and Installer](docs/developer/releasing.md)
 
 ## Quality gates
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo test -p rhythm-mode-taiko --release -- --ignored bench_smoke
-cargo test -p taiko-game --release -- --ignored bench_smoke
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo test --locked -p rhythm-mode-taiko --release bench_smoke_large_chart -- --ignored
+cargo test --locked -p taiko-game --release bench::bench_smoke -- --ignored
 ```

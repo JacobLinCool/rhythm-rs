@@ -1,111 +1,225 @@
-name: Release
+name: Latest Preview
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: latest-preview
+  cancel-in-progress: false
 
 jobs:
-  quality_gate:
-    runs-on: ubuntu-latest
+  quality:
+    name: Release quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build and lint dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev shellcheck
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check shell scripts
+        run: shellcheck install.sh scripts/package-release.sh scripts/test-install.sh
+
+      - name: Test installer and release packaging
+        run: sh scripts/test-install.sh
 
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
-      - name: Bench smoke
-        run: cargo test -p rhythm-mode-taiko --release bench_smoke_large_chart -- --ignored
+      - name: Chart bench smoke
+        run: cargo test --locked -p rhythm-mode-taiko --release bench_smoke_large_chart -- --ignored
 
-  create_release:
-    needs: quality_gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: marvinpinto/action-automatic-releases@latest
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: true
-          automatic_release_tag: "latest"
-          title: "Dev Build"
+      - name: Renderer bench smoke
+        run: cargo test --locked -p taiko-game --release bench::bench_smoke -- --ignored
 
-  publish_crate:
-    needs: quality_gate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build
-        run: cargo build --release
-
-      - uses: katyo/publish-crates@v2
-        with:
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          ignore-unpublished-changes: true
-
-  release_assets:
-    needs: [quality_gate, create_release]
-    runs-on: ${{ matrix.os }}
+  build:
+    name: Build ${{ matrix.target }}
+    needs: quality
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - build: linux-x64
-            os: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact_name: "taiko-linux-amd64"
-          - build: macos-x64
-            os: macos-latest
+            binary: taiko
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-            artifact_name: "taiko-darwin-amd64"
-          - build: macos-arm64
-            os: macos-latest
+            binary: taiko
+          - runner: macos-15
             target: aarch64-apple-darwin
-            artifact_name: "taiko-darwin-arm64"
-          - build: windows-x64
-            os: windows-latest
+            binary: taiko
+          - runner: windows-2025
             target: x86_64-pc-windows-msvc
-            artifact_name: "taiko-windows-amd64"
+            binary: taiko.exe
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux audio build dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build Taiko on Terminal
+        run: cargo build --locked --release -p taiko-game --target ${{ matrix.target }}
 
-      - name: Upload to Release
-        uses: svenstaro/upload-release-action@v2
-        if: matrix.os != 'windows-latest'
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/taiko
-          asset_name: ${{ matrix.artifact_name }}
-          tag: latest
+      - name: Package release archive
+        shell: bash
+        run: |
+          bash scripts/package-release.sh \
+            "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            dist
 
-      - name: Upload to Release (Windows)
-        uses: svenstaro/upload-release-action@v2
-        if: matrix.os == 'windows-latest'
+      - name: Attest release archive
+        uses: actions/attest@v4
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/taiko.exe
-          asset_name: ${{ matrix.artifact_name }}.exe
-          tag: latest
+          subject-path: dist/taiko-${{ matrix.target }}.tar.gz
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/taiko-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish latest preview
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download release archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum taiko-*.tar.gz > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+
+      - name: Attest checksum manifest
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Ensure latest preview release exists
+        run: |
+          if ! gh release view latest > /dev/null 2>&1; then
+            git tag --force latest "$GITHUB_SHA"
+            git push --force origin refs/tags/latest
+            gh release create latest \
+              --verify-tag \
+              --target "$GITHUB_SHA" \
+              --title "Taiko on Terminal — Latest Preview" \
+              --notes "The first preview publication is in progress." \
+              --prerelease \
+              --latest=false
+          fi
+
+      - name: Upload release archives
+        run: |
+          gh release upload latest \
+            dist/taiko-aarch64-apple-darwin.tar.gz \
+            dist/taiko-x86_64-apple-darwin.tar.gz \
+            dist/taiko-x86_64-pc-windows-msvc.tar.gz \
+            dist/taiko-x86_64-unknown-linux-gnu.tar.gz \
+            --clobber
+
+      - name: Update latest preview tag
+        run: |
+          git tag --force latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
+
+      - name: Upload checksum manifest last
+        run: gh release upload latest dist/SHA256SUMS --clobber
+
+      - name: Finalize latest preview release
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          notes_file="${RUNNER_TEMP}/taiko-preview-notes.md"
+          {
+            printf '%s\n\n' "Automated preview build from \`${GITHUB_SHA}\`."
+            printf '%s\n\n' "This mutable prerelease follows the current \`main\` branch."
+            printf '%s\n' 'Install on macOS or x86_64 Linux:'
+            printf '%s\n\n' \
+              '```sh' \
+              "curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh" \
+              '```'
+            printf '%s\n' "Every archive is listed in \`SHA256SUMS\` and has GitHub build provenance."
+          } > "$notes_file"
+
+          gh release edit latest \
+            --target "$GITHUB_SHA" \
+            --title "Taiko on Terminal — Latest Preview (${short_sha})" \
+            --notes-file "$notes_file" \
+            --prerelease \
+            --latest=false
+
+      - name: Remove non-canonical release assets
+        run: |
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            taiko-aarch64-apple-darwin.tar.gz \
+            taiko-x86_64-apple-darwin.tar.gz \
+            taiko-x86_64-pc-windows-msvc.tar.gz \
+            taiko-x86_64-unknown-linux-gnu.tar.gz)"
+
+          gh release view latest --json assets --jq '.assets[].name' |
+            while IFS= read -r asset_name; do
+              if ! printf '%s\n' "$expected_assets" | grep --fixed-strings --line-regexp --quiet "$asset_name"; then
+                gh release delete-asset latest "$asset_name" --yes
+              fi
+            done
