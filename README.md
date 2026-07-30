@@ -7,8 +7,7 @@ Deterministic, headless rhythm game engine in Rust.
 On macOS (Apple silicon or Intel) or x86-64 Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh | sh
 ```
 
 The installer downloads the matching archive from the
@@ -18,9 +17,7 @@ verifies it against `SHA256SUMS`, and installs `taiko` into
 user-writable destination:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh |
-  TAIKO_INSTALL_DIR="$HOME/bin" sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/JacobLinCool/rhythm-rs/main/install.sh | TAIKO_INSTALL_DIR="$HOME/bin" sh
 ```
 
 The preview release also provides a Windows x86-64 archive for manual
