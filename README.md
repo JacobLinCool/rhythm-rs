@@ -1,6 +1,7 @@
-# Taiko on Terminal
+# rhythm-rs
 
 Deterministic, headless rhythm game engine in Rust.
+Taiko on Terminal is the first playable app built on the engine.
 
 ## Install the latest preview
 
