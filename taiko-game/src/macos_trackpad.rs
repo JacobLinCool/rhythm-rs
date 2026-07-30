@@ -5,7 +5,9 @@ use rhythm_mode_taiko::TaikoAction;
 
 use crate::controller::ControllerSlot;
 
+#[cfg(any(target_os = "macos", test))]
 const MAX_CONTACTS_PER_FRAME: usize = 32;
+#[cfg(target_os = "macos")]
 const TRACKPAD_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +65,7 @@ impl MacTrackpad {
             .map_or_else(|| Ok(MacTrackpadDrain::default()), imp::Backend::drain)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn diagnostics(&self) -> (u64, u64, u64) {
         self.backend
             .as_ref()
@@ -85,6 +87,7 @@ impl Drop for MacTrackpad {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy)]
 struct TrackpadContact {
     identity: i32,
@@ -92,18 +95,21 @@ struct TrackpadContact {
     touching: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingHit {
     slot: ControllerSlot,
     action: TaikoAction,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct ReducedFrame {
     hits: [Option<PendingHit>; MAX_CONTACTS_PER_FRAME],
     len: usize,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ReducedFrame {
     fn new() -> Self {
         Self {
@@ -125,6 +131,7 @@ impl ReducedFrame {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct ContactReducer {
     active_identities: [i32; MAX_CONTACTS_PER_FRAME],
@@ -133,6 +140,7 @@ struct ContactReducer {
     suppress_until_neutral: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ContactReducer {
     fn new() -> Self {
         Self {
@@ -188,6 +196,7 @@ impl ContactReducer {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn action_for_normalized_x(normalized_x: f32) -> Option<TaikoAction> {
     if !normalized_x.is_finite() {
         return None;
@@ -861,11 +870,6 @@ mod imp {
 
         pub(super) fn drain(&mut self) -> Result<MacTrackpadDrain> {
             Ok(MacTrackpadDrain::default())
-        }
-
-        #[cfg(test)]
-        pub(super) fn diagnostics(&self) -> (u64, u64, u64) {
-            (0, 0, 0)
         }
 
         pub(super) fn shutdown(&mut self) -> Result<()> {

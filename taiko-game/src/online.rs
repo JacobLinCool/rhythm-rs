@@ -222,14 +222,14 @@ impl ConnectionHealthTracker {
             ServerMessage::MembershipGranted(_) => {
                 self.affiliated_at.get_or_insert(observed_at);
             }
-            ServerMessage::HeartbeatAck(_) => {
+            ServerMessage::HeartbeatAck(_)
                 if self.affiliated_at.is_some_and(|affiliated_at| {
                     observed_at
                         .checked_duration_since(affiliated_at)
                         .is_some_and(|duration| duration >= STABLE_CONNECTION_WINDOW)
-                }) {
-                    self.stable = true;
-                }
+                }) =>
+            {
+                self.stable = true;
             }
             _ => {}
         }
